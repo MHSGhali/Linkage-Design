@@ -8,6 +8,7 @@
 #include "../src/solver.h"
 #include "../src/export.h"
 #include "../src/ui.h"
+#include "../src/cam.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -253,7 +254,7 @@ static void test_connector_tracing(void) {
     for (int i = 0; i < 3; i++) {
         m.links[0].accumulated_angle_rad = angles[i];
         solver_solve_at_current_angle(&m, params);
-        mechanism_trace_step(&m);
+        mechanism_trace_step(&m, 0.1 * (double)i);
     }
 
     check_true("traced connector recorded one point per step", m.connectors[a].path_count == 3);
@@ -286,7 +287,7 @@ static void test_mechanism_clone_is_independent_deep_copy(void) {
     mechanism_toggle_driven(&m, 0, 45.0);
     mechanism_set_traced(&m, b, true);
     solver_freeze(&m);
-    mechanism_trace_step(&m);
+    mechanism_trace_step(&m, 0.5);
 
     Mechanism clone;
     mechanism_clone(&m, &clone);
@@ -690,6 +691,7 @@ static UiState blank_ui_state(void) {
     s.selected_link_rigid = true;
     s.selected_link_can_drive = false;
     s.all_selected_traced = false;
+    s.drawing_cam = false;
     s.has_selection = false;
     s.can_undo = false;
     s.can_redo = false;
@@ -702,7 +704,7 @@ static void test_toolbar_layout_is_well_formed(void) {
     Toolbar t;
     ui_init(&t);
 
-    check_true("toolbar has every requested button", t.count == 13);
+    check_true("toolbar has every requested button", t.count == 14);
 
     bool all_inside = true, no_overlap = true, all_have_labels = true;
     for (int i = 0; i < t.count; i++) {
@@ -864,6 +866,495 @@ static void test_toolbar_disables_editing_while_running(void) {
     check_true("RUN reads RUN again when stopped", strcmp(button_for(&t, UI_RUN)->label, "RUN") == 0);
 }
 
+
+/* --------------------------------------------------------------------------
+ * Cams (src/cam.c) -- the profile, and the follower it drives.
+ * ----------------------------------------------------------------------- */
+
+static Cam make_test_cam(void) {
+    Cam c;
+    cam_set_defaults(&c, 60.0);
+    c.roller_radius = 6.0;
+    cam_fill_motion_law(&c, 60.0, 40.0, 90.0, 60.0, 90.0);
+    return c;
+}
+
+static void test_cam_profile_is_continuous_and_smooth(void) {
+    Cam c = make_test_cam();
+    double rise = 90.0 * M_PI / 180.0;
+    double high = 60.0 * M_PI / 180.0;
+    double fall = 90.0 * M_PI / 180.0;
+    double eps = 1e-7;
+
+    check_close("cam starts at the base radius", cam_pitch_radius(&c, 0.0), 60.0, 1e-9);
+    check_close("cam base radius is reported", c.base_radius, 60.0, 1e-9);
+    check_close("cam lift is reported", c.lift, 40.0, 0.05);
+    check_close("cam reaches base+lift at the top of the rise",
+                cam_pitch_radius(&c, rise), 100.0, 0.05);
+    check_close("cam holds base+lift through the high dwell",
+                cam_pitch_radius(&c, rise + high / 2.0), 100.0, 1e-9);
+    check_close("cam returns to the base radius after the fall",
+                cam_pitch_radius(&c, rise + high + fall), 60.0, 0.05);
+    check_close("cam holds the base radius through the low dwell",
+                cam_pitch_radius(&c, rise + high + fall + 0.1), 60.0, 1e-9);
+
+    /* Continuity across every segment join. */
+    double joins[3] = { rise, rise + high, rise + high + fall };
+    for (int i = 0; i < 3; i++) {
+        double before = cam_pitch_radius(&c, joins[i] - eps);
+        double after = cam_pitch_radius(&c, joins[i] + eps);
+        check_close("cam radius is continuous across a segment join", after, before, 1e-4);
+    }
+
+    /* Cycloidal motion is chosen so the follower's velocity vanishes at both
+     * ends of every segment: no step in velocity, so no jerk spike. */
+    check_close("follower velocity is zero at the start of the rise",
+                cam_pitch_radius_deriv(&c, 0.0), 0.0, 0.5);
+    check_close("follower velocity is zero at the top of the rise",
+                cam_pitch_radius_deriv(&c, rise - eps), 0.0, 0.5);
+    check_close("follower velocity is zero at the start of the fall",
+                cam_pitch_radius_deriv(&c, rise + high + eps), 0.0, 0.5);
+    check_close("follower velocity is zero at the end of the fall",
+                cam_pitch_radius_deriv(&c, rise + high + fall - eps), 0.0, 0.5);
+
+    check_true("cam radius never dips below the base radius",
+               cam_pitch_radius(&c, 1.234) >= 60.0 - 1e-6);
+
+    /* phi wraps, so a full turn lands back on the same profile. */
+    check_close("cam profile is periodic over one turn",
+                cam_pitch_radius(&c, 0.7 + 2.0 * M_PI), cam_pitch_radius(&c, 0.7), 1e-12);
+}
+
+static void test_zero_lift_cam_is_a_circle(void) {
+    Cam c = make_test_cam();
+    cam_fill_motion_law(&c, 60.0, 0.0, 90.0, 60.0, 90.0);
+
+    bool constant = true;
+    for (int i = 0; i < 64; i++) {
+        double phi = 2.0 * M_PI * (double)i / 64.0;
+        if (fabs(cam_pitch_radius(&c, phi) - 60.0) > 1e-9) constant = false;
+    }
+    check_true("a zero-lift cam's pitch curve is a circle of the base radius", constant);
+
+    /* The physical surface is the pitch curve inset by the roller radius, so
+     * for a circle it is a smaller concentric circle -- the cleanest check
+     * that the offset direction and magnitude are right. */
+    Vec2 pts[128];
+    cam_sample_surface(&c, pts, 128);
+    bool inset_ok = true;
+    for (int i = 0; i < 128; i++) {
+        if (fabs(vec2_len(pts[i]) - (60.0 - 6.0)) > 1e-6) inset_ok = false;
+    }
+    check_true("its surface is inset by exactly the roller radius", inset_ok);
+    check_true("a gentle cam does not undercut", !cam_is_undercut(&c));
+}
+
+static void test_undercut_detection(void) {
+    Cam sane = make_test_cam();
+    check_true("a well-proportioned cam is not flagged as undercut", !cam_is_undercut(&sane));
+
+    /* A big lift crammed into a narrow rise makes a tight concave flank; a
+     * roller larger than that radius of curvature cannot reach into it, and
+     * the inward offset folds back on itself. */
+    Cam sharp = make_test_cam();
+    sharp.roller_radius = 25.0;
+    cam_fill_motion_law(&sharp, 20.0, 80.0, 15.0, 60.0, 15.0);
+    check_true("an oversized roller on a steep flank is flagged as undercut",
+               cam_is_undercut(&sharp));
+}
+
+/* Cam turning about O with a translating follower on the radial axis. */
+static void build_cam_rig(Mechanism *m, int *centre, int *follower, double speed_deg_s) {
+    mechanism_init(m);
+    *centre = mechanism_add_connector(m, (Vec2){ 0, 0 }, true);
+    int tip = mechanism_add_connector(m, (Vec2){ 100, 0 }, false);
+    *follower = mechanism_add_connector(m, (Vec2){ 0, -60 }, false);
+
+    int body[2] = { *centre, tip };
+    mechanism_add_link(m, body, 2);
+    mechanism_toggle_driven(m, 0, speed_deg_s);
+    mechanism_add_cam(m, 0, *centre, *follower);
+}
+
+static void test_follower_tracks_the_cam_profile(void) {
+    /* The strongest statement the cam feature can make: driven at a sane
+     * speed with its default return spring, the follower's position along its
+     * axis IS the profile the motion law describes, all the way round. */
+    Mechanism m;
+    int centre, follower;
+    build_cam_rig(&m, &centre, &follower, 90.0);
+
+    SolverParams params = solver_default_params();
+    solver_freeze(&m);
+
+    double axis_angle = atan2(m.cams[0].axis_dir.y, m.cams[0].axis_dir.x);
+    double worst = 0.0;
+    bool ever_off_axis = false;
+    bool ever_lifted = false;
+
+    /* 90 deg/s, so four seconds is one full revolution. */
+    double dt = 1.0 / 240.0;
+    for (int step = 0; step < 960; step++) {
+        solver_advance(&m, dt, params);
+
+        const Cam *c = &m.cams[0];
+        Vec2 d = vec2_sub(m.connectors[follower].pos, m.connectors[centre].pos);
+        double s = vec2_dot(d, c->axis_dir);
+        double expected = cam_pitch_radius(c, axis_angle - mechanism_cam_angle(&m, 0));
+        double err = fabs(s - expected);
+        if (err > worst) worst = err;
+        if (fabs(vec2_dot(d, vec2_perp(c->axis_dir))) > 1e-6) ever_off_axis = true;
+        if (!c->in_contact) ever_lifted = true;
+    }
+
+    check_true("follower position matches the cam profile through a full turn", worst < 0.5);
+    check_true("follower never leaves its guide axis", !ever_off_axis);
+    check_true("a stiff spring keeps the follower on the cam throughout", !ever_lifted);
+
+    mechanism_free(&m);
+}
+
+static void test_follower_lifts_off_when_the_spring_cannot_keep_up(void) {
+    /* Contact is one-sided: the cam pushes but never pulls. Spin it fast
+     * enough, with a weak enough return spring, and the profile falls away
+     * faster than the spring can push the follower down -- real cam float.
+     * This is what makes the liftoff model more than decoration. */
+    Mechanism m;
+    int centre, follower;
+    build_cam_rig(&m, &centre, &follower, 720.0);
+    m.cams[0].spring_k = 50.0;
+
+    SolverParams params = solver_default_params();
+    solver_freeze(&m);
+
+    bool lifted = false, recontacted_after_lift = false;
+    bool ever_inside_profile = false;
+    double axis_angle = atan2(m.cams[0].axis_dir.y, m.cams[0].axis_dir.x);
+
+    double dt = 1.0 / 480.0;
+    for (int step = 0; step < 1440; step++) {
+        solver_advance(&m, dt, params);
+        const Cam *c = &m.cams[0];
+        if (!c->in_contact) lifted = true;
+        else if (lifted) recontacted_after_lift = true;
+
+        /* Whatever else happens, the follower must never sink into the cam. */
+        Vec2 d = vec2_sub(m.connectors[follower].pos, m.connectors[centre].pos);
+        double s = vec2_dot(d, c->axis_dir);
+        double surface = cam_pitch_radius(c, axis_angle - mechanism_cam_angle(&m, 0));
+        if (s < surface - 0.5) ever_inside_profile = true;
+    }
+
+    check_true("a weak spring lets the follower leave the cam on a fast fall", lifted);
+    check_true("the follower comes back down onto the cam", recontacted_after_lift);
+    check_true("the follower never penetrates the cam surface", !ever_inside_profile);
+
+    mechanism_free(&m);
+}
+
+static void test_cam_cascades_on_delete(void) {
+    Mechanism m;
+    int centre, follower;
+    build_cam_rig(&m, &centre, &follower, 90.0);
+    check_true("cam was created", m.cam_count == 1 && m.cams[0].alive);
+
+    mechanism_delete_connector(&m, follower);
+    check_true("deleting the follower deletes the cam", !m.cams[0].alive);
+
+    mechanism_free(&m);
+}
+
+/* --------------------------------------------------------------------------
+ * Trace timestamps -- what the x/y-versus-time plot is drawn from.
+ * ----------------------------------------------------------------------- */
+
+static void test_trace_records_sample_times(void) {
+    Mechanism m;
+    int o2, o4, a, b;
+    build_four_bar(&m, &o2, &o4, &a, &b);
+    mechanism_set_traced(&m, b, true);
+    solver_freeze(&m);
+
+    double t = 0.0, dt = 0.05;
+    for (int i = 0; i < 5; i++) {
+        t += dt;
+        mechanism_trace_step(&m, t);
+    }
+
+    check_true("a timestamp is recorded per trace sample", m.connectors[b].path_count == 5);
+
+    bool increasing = true, matches = true;
+    for (int i = 0; i < m.connectors[b].path_count; i++) {
+        if (fabs(m.connectors[b].path_time[i] - dt * (double)(i + 1)) > 1e-9) matches = false;
+        if (i > 0 && m.connectors[b].path_time[i] <= m.connectors[b].path_time[i - 1]) increasing = false;
+    }
+    check_true("trace timestamps are strictly increasing", increasing);
+    check_true("trace timestamps match the accumulated simulation time", matches);
+
+    /* Undo snapshots the whole mechanism, so the timestamps have to survive
+     * a clone as their own allocation. */
+    Mechanism clone;
+    mechanism_clone(&m, &clone);
+    mechanism_trace_step(&m, 99.0);
+    check_true("clone keeps its own timestamp array", clone.connectors[b].path_count == 5);
+    check_close("clone's timestamps are unaffected by later tracing",
+                clone.connectors[b].path_time[4], 0.25, 1e-9);
+
+    mechanism_free(&clone);
+    mechanism_free(&m);
+}
+
+
+static void test_drawn_outline_becomes_the_profile(void) {
+    /* Draw a plain circle of radius 80. The roller rides ON that surface, so
+     * the pitch curve -- the roller centre's path -- must come back as a
+     * circle one roller radius larger, and the surface the cam draws and
+     * exports must be the circle that was drawn. */
+    Cam c;
+    cam_set_defaults(&c, 60.0);
+    c.roller_radius = 10.0;
+
+    Vec2 drawn[120];
+    for (int i = 0; i < 120; i++) {
+        double a = 2.0 * M_PI * (double)i / 120.0;
+        drawn[i] = (Vec2){ 80.0 * cos(a), 80.0 * sin(a) };
+    }
+    check_true("a drawn circle is accepted as a profile",
+               cam_set_from_drawn_outline(&c, drawn, 120));
+
+    bool pitch_ok = true, surface_ok = true;
+    for (int i = 0; i < 64; i++) {
+        double phi = 2.0 * M_PI * (double)i / 64.0;
+        if (fabs(cam_pitch_radius(&c, phi) - 90.0) > 0.6) pitch_ok = false;
+    }
+    check_true("the pitch curve sits one roller radius outside what was drawn", pitch_ok);
+
+    Vec2 surface[128];
+    cam_sample_surface(&c, surface, 128);
+    for (int i = 0; i < 128; i++) {
+        if (fabs(vec2_len(surface[i]) - 80.0) > 0.6) surface_ok = false;
+    }
+    check_true("the cam's surface comes back as the circle that was drawn", surface_ok);
+}
+
+static void test_drawn_lobe_is_reproduced(void) {
+    /* A genuinely non-circular outline: a base circle with one bump. The
+     * profile has to follow it, not average it away. */
+    Cam c;
+    cam_set_defaults(&c, 60.0);
+    c.roller_radius = 4.0;
+
+    Vec2 drawn[240];
+    for (int i = 0; i < 240; i++) {
+        double a = 2.0 * M_PI * (double)i / 240.0;
+        /* A smooth bump centred on a = pi/2, 60 wide at the base. */
+        double bump = 0.0;
+        double da = a - M_PI / 2.0;
+        if (fabs(da) < 0.5) bump = 30.0 * (1.0 + cos(da * M_PI / 0.5)) / 2.0;
+        double r = 70.0 + bump;
+        drawn[i] = (Vec2){ r * cos(a), r * sin(a) };
+    }
+    check_true("a lobed outline is accepted", cam_set_from_drawn_outline(&c, drawn, 240));
+
+    double at_bump = cam_pitch_radius(&c, M_PI / 2.0);
+    double away = cam_pitch_radius(&c, -M_PI / 2.0);
+    check_close("the drawn lobe's height is reproduced", at_bump - away, 30.0, 2.0);
+    check_true("the lobe is where it was drawn", at_bump > away + 20.0);
+    check_close("the base circle away from the lobe is reproduced", away, 74.0, 1.5);
+}
+
+static void test_degenerate_drawings_are_rejected(void) {
+    Cam c;
+    cam_set_defaults(&c, 60.0);
+    double before = c.base_radius;
+
+    Vec2 tiny[3] = { { 0, 0 }, { 0.4, 0 }, { 0, 0.4 } };
+    check_true("a scribble too small to read is rejected", !cam_set_from_drawn_outline(&c, tiny, 3));
+
+    Vec2 two[2] = { { 0, 0 }, { 50, 0 } };
+    check_true("a stroke with too few points is rejected", !cam_set_from_drawn_outline(&c, two, 2));
+
+    check_close("a rejected drawing leaves the existing profile alone", c.base_radius, before, 1e-9);
+}
+
+static void test_roller_shrinks_to_fit_a_drawn_shape(void) {
+    /* A hand-drawn outline routinely has concave stretches tighter than the
+     * roller that was guessed for it. Rather than producing a profile that is
+     * nothing like the drawing, the roller is reduced until it fits -- which
+     * is what a cam designer would do. */
+    Cam c;
+    cam_set_defaults(&c, 60.0);
+    c.roller_radius = 20.0;
+
+    Vec2 drawn[240];
+    for (int i = 0; i < 240; i++) {
+        double a = 2.0 * M_PI * (double)i / 240.0;
+        double r = 55.0 + 18.0 * sin(3.0 * a); /* deep valleys, tight radii */
+        drawn[i] = (Vec2){ r * cos(a), r * sin(a) };
+    }
+    check_true("a deeply lobed outline is accepted", cam_set_from_drawn_outline(&c, drawn, 240));
+    check_true("the roller was shrunk to fit the drawn shape", c.roller_radius < 20.0);
+    check_true("the shrunken cam no longer undercuts", !cam_is_undercut(&c));
+    check_true("the roller stays a usable size", c.roller_radius > 0.5);
+
+    /* A gentle outline should leave the roller alone. */
+    Cam gentle;
+    cam_set_defaults(&gentle, 60.0);
+    gentle.roller_radius = 5.0;
+    Vec2 circle[120];
+    for (int i = 0; i < 120; i++) {
+        double a = 2.0 * M_PI * (double)i / 120.0;
+        circle[i] = (Vec2){ 80.0 * cos(a), 80.0 * sin(a) };
+    }
+    check_true("a circle is accepted", cam_set_from_drawn_outline(&gentle, circle, 120));
+    check_close("a shape the roller already fits keeps its roller",
+                gentle.roller_radius, 5.0, 1e-9);
+}
+
+static void test_cam_angle_wrap_does_not_fling_the_follower(void) {
+    /* The cam's rotation is read from an atan2, so it wraps by a full turn
+     * once per revolution. Read literally that looks like the cam spinning
+     * 360 degrees in one frame, which used to hurl the follower off the cam;
+     * this pins the fix. Three lobes put a steep flank at the wrap point,
+     * which is what makes the bug bite. */
+    Mechanism m;
+    int centre, follower;
+    build_cam_rig(&m, &centre, &follower, 90.0);
+
+    Vec2 drawn[240];
+    for (int i = 0; i < 240; i++) {
+        double a = 2.0 * M_PI * (double)i / 240.0;
+        double r = 55.0 + 18.0 * sin(3.0 * a);
+        drawn[i] = (Vec2){ r * cos(a), r * sin(a) };
+    }
+    cam_set_from_drawn_outline(&m.cams[0], drawn, 240);
+    double axis_angle = atan2(m.cams[0].axis_dir.y, m.cams[0].axis_dir.x);
+    m.connectors[follower].pos =
+        vec2_add(m.connectors[centre].pos,
+                  vec2_scale(m.cams[0].axis_dir, cam_pitch_radius(&m.cams[0], axis_angle)));
+
+    SolverParams params = solver_default_params();
+    solver_freeze(&m);
+
+    double ceiling = m.cams[0].base_radius + m.cams[0].lift + 5.0;
+    double highest = 0.0;
+    /* Three full revolutions, so the wrap is crossed several times. */
+    for (int step = 0; step < 2880; step++) {
+        solver_advance(&m, 1.0 / 240.0, params);
+        double s_pos = vec2_dot(vec2_sub(m.connectors[follower].pos, m.connectors[centre].pos),
+                                 m.cams[0].axis_dir);
+        if (s_pos > highest) highest = s_pos;
+    }
+    check_true("the follower never gets flung past the cam's outer radius",
+               highest < ceiling);
+
+    mechanism_free(&m);
+}
+
+static void test_lift_and_timing_adjustments(void) {
+    Cam c = make_test_cam();  /* base 60, lift 40 */
+    double base = c.base_radius;
+
+    cam_scale_lift(&c, 2.0);
+    check_close("scaling the lift leaves the base circle put", c.base_radius, base, 1e-6);
+    check_close("scaling the lift doubles it", c.lift, 80.0, 0.1);
+
+    cam_scale_lift(&c, 0.5);
+    check_close("scaling back restores the lift", c.lift, 40.0, 0.1);
+
+    /* Timing: the same profile, rotated. The peak must move with it. */
+    double peak_before = -1.0, peak_at = 0.0;
+    for (int i = 0; i < 360; i++) {
+        double phi = 2.0 * M_PI * (double)i / 360.0;
+        double r = cam_pitch_radius(&c, phi);
+        if (r > peak_before) { peak_before = r; peak_at = phi; }
+    }
+    cam_rotate_profile(&c, M_PI / 2.0);
+    double peak_after = -1.0, peak_at_after = 0.0;
+    for (int i = 0; i < 360; i++) {
+        double phi = 2.0 * M_PI * (double)i / 360.0;
+        double r = cam_pitch_radius(&c, phi);
+        if (r > peak_after) { peak_after = r; peak_at_after = phi; }
+    }
+    check_close("shifting the timing keeps the profile's shape", peak_after, peak_before, 0.2);
+    check_close("shifting the timing moves the lobe round by that much",
+                peak_at_after - peak_at, M_PI / 2.0, 0.1);
+}
+
+static void test_follower_tracks_a_drawn_cam(void) {
+    /* The end-to-end statement for drawn cams: whatever outline you draw, the
+     * follower rides exactly on it. */
+    Mechanism m;
+    int centre, follower;
+    build_cam_rig(&m, &centre, &follower, 90.0);
+
+    Vec2 drawn[240];
+    for (int i = 0; i < 240; i++) {
+        double a = 2.0 * M_PI * (double)i / 240.0;
+        double r = 55.0 + 18.0 * sin(3.0 * a); /* a three-lobed cam */
+        drawn[i] = (Vec2){ r * cos(a), r * sin(a) };
+    }
+    check_true("three-lobed drawing accepted",
+               cam_set_from_drawn_outline(&m.cams[0], drawn, 240));
+
+    /* Seat the follower on the profile, as the app does after drawing. */
+    double axis_angle = atan2(m.cams[0].axis_dir.y, m.cams[0].axis_dir.x);
+    m.connectors[follower].pos =
+        vec2_add(m.connectors[centre].pos,
+                  vec2_scale(m.cams[0].axis_dir, cam_pitch_radius(&m.cams[0], axis_angle)));
+
+    SolverParams params = solver_default_params();
+    solver_freeze(&m);
+
+    /* Count how many times the follower rises past the profile's midpoint:
+     * for a three-lobed cam that is exactly three per revolution. Counting
+     * level crossings rather than local maxima keeps the check immune to
+     * sample-level wobble. */
+    double mid = m.cams[0].base_radius + m.cams[0].lift * 0.5;
+    double worst = 0.0;
+    int lobes_seen = 0;
+    /* Seed the crossing state from where the follower actually starts (on a
+     * lobe, as it happens), so the first sample isn't miscounted as a rise. */
+    bool above = vec2_dot(vec2_sub(m.connectors[follower].pos, m.connectors[centre].pos),
+                           m.cams[0].axis_dir) > mid;
+    for (int step = 0; step < 960; step++) {   /* 90 deg/s -> exactly one turn */
+        solver_advance(&m, 1.0 / 240.0, params);
+        const Cam *c = &m.cams[0];
+        double s_pos = vec2_dot(vec2_sub(m.connectors[follower].pos, m.connectors[centre].pos), c->axis_dir);
+        double expected = cam_pitch_radius(c, axis_angle - mechanism_cam_angle(&m, 0));
+        double err = fabs(s_pos - expected);
+        if (err > worst) worst = err;
+        if (!above && s_pos > mid) { lobes_seen++; above = true; }
+        else if (above && s_pos < mid) { above = false; }
+    }
+    check_true("follower rides the drawn profile through a full turn", worst < 0.6);
+    check_true("a three-lobed cam lifts the follower three times a turn",
+               lobes_seen == 3);
+
+    mechanism_free(&m);
+}
+
+static void test_cam_button_enablement(void) {
+    Toolbar t;
+    ui_init(&t);
+
+    /* The cam tool takes no selection at all -- that was the whole problem
+     * with the old version -- so it is offered whenever you can edit. */
+    UiState s = blank_ui_state();
+    ui_apply_state(&t, s);
+    check_true("CAM needs no selection to be available", button_for(&t, UI_CAM)->enabled);
+    check_true("CAM is unlit until the tool is armed", !button_for(&t, UI_CAM)->active);
+
+    s.drawing_cam = true;
+    ui_apply_state(&t, s);
+    check_true("CAM is lit while the drawing tool is armed", button_for(&t, UI_CAM)->active);
+
+    s.editing = false;
+    s.running = true;
+    ui_apply_state(&t, s);
+    check_true("CAM is disabled while running", !button_for(&t, UI_CAM)->enabled);
+}
+
 int main(void) {
     test_four_bar_reduces_to_closed_form();
     test_ternary_link_rigidity();
@@ -885,6 +1376,21 @@ int main(void) {
     test_toolbar_hit_testing();
     test_toolbar_enablement_rules();
     test_toolbar_disables_editing_while_running();
+    test_cam_profile_is_continuous_and_smooth();
+    test_zero_lift_cam_is_a_circle();
+    test_undercut_detection();
+    test_follower_tracks_the_cam_profile();
+    test_follower_lifts_off_when_the_spring_cannot_keep_up();
+    test_cam_cascades_on_delete();
+    test_drawn_outline_becomes_the_profile();
+    test_drawn_lobe_is_reproduced();
+    test_degenerate_drawings_are_rejected();
+    test_roller_shrinks_to_fit_a_drawn_shape();
+    test_cam_angle_wrap_does_not_fling_the_follower();
+    test_lift_and_timing_adjustments();
+    test_follower_tracks_a_drawn_cam();
+    test_trace_records_sample_times();
+    test_cam_button_enablement();
 
     if (failures == 0) {
         printf("\nAll tests passed.\n");

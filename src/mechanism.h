@@ -3,13 +3,17 @@
 
 #include <stdbool.h>
 #include "vec2.h"
+#include "cam.h"
 
 /* A joint. is_anchor connectors are fixed to ground and never move. When
  * traced, its position is recorded into `path` once per simulation frame
- * (see mechanism_trace_step), so its trajectory can be drawn. `prev_pos` is
- * this connector's position on the previous simulation frame, used only for
- * Verlet-style gravity integration on free (non-anchor, non-driven)
- * connectors (see solver_advance); reset to `pos` on every solver_freeze. */
+ * (see mechanism_trace_step), so its trajectory can be drawn. `path_time`
+ * holds the simulation time of each of those samples -- frames are not
+ * uniform in duration, so plotting position against time needs the actual
+ * timestamps, not the sample index. `prev_pos` is this connector's position
+ * on the previous simulation frame, used only for Verlet-style gravity
+ * integration on free (non-anchor, non-driven) connectors (see
+ * solver_advance); reset to `pos` on every solver_freeze. */
 typedef struct {
     Vec2 pos;
     Vec2 prev_pos;
@@ -17,6 +21,7 @@ typedef struct {
     bool selected;
     bool traced;
     Vec2 *path;
+    double *path_time;
     int path_count, path_capacity;
     bool alive; /* tombstone on delete; ids (array indices) stay stable */
 } Connector;
@@ -55,6 +60,8 @@ typedef struct {
     int connector_count, connector_capacity;
     Link *links;
     int link_count, link_capacity;
+    Cam *cams;
+    int cam_count, cam_capacity;
 } Mechanism;
 
 /* Condensed upper-triangular pair index for i<j among k items (0-indexed). */
@@ -112,9 +119,26 @@ void mechanism_set_traced(Mechanism *m, int connector_id, bool traced);
  * trace begins fresh. */
 void mechanism_clear_traces(Mechanism *m);
 
-/* Appends the current position of every traced, alive connector to its
- * path. Call once per simulation frame, after resolving positions. */
-void mechanism_trace_step(Mechanism *m);
+/* Appends the current position of every traced, alive connector to its path,
+ * stamped with `sim_time` (seconds since the run started). Call once per
+ * simulation frame, after resolving positions. */
+void mechanism_trace_step(Mechanism *m, double sim_time);
+
+/* Adds a disc cam turning with `body_link_id` about `center_connector_id`
+ * (which must be one of that link's connectors), driving the roller follower
+ * at `follower_connector_id` along the radial axis through the two. Profile
+ * parameters get defaults sized from the current centre-to-follower distance.
+ * Returns the new cam's id, or -1 on invalid input. */
+int mechanism_add_cam(Mechanism *m, int body_link_id, int center_connector_id, int follower_connector_id);
+
+void mechanism_delete_cam(Mechanism *m, int cam_id);
+
+/* The cam whose drawn surface passes within `dist_thresh` of p, or -1. */
+int mechanism_pick_cam(const Mechanism *m, Vec2 p, double dist_thresh);
+
+/* Cam i's current rotation in radians: how far its body link has turned since
+ * solver_freeze captured the reference orientation. Zero before a run. */
+double mechanism_cam_angle(const Mechanism *m, int cam_id);
 
 /* Nearest alive connector within `radius` of p, or -1 if none. */
 int mechanism_pick_connector(const Mechanism *m, Vec2 p, double radius);

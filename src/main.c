@@ -11,7 +11,9 @@
 #include "ui.h"
 
 #define CANVAS_W 900
-#define WIN_H 700
+#define CANVAS_H 700
+#define PLOT_H 200
+#define WIN_H (CANVAS_H + PLOT_H)
 #define WIN_W (UI_TOOLBAR_W + CANVAS_W)
 
 #define CONNECTOR_HIT_RADIUS 10.0
@@ -23,6 +25,11 @@
 #define ZOOM_MAX 10.0
 #define ZOOM_STEP 1.1
 #define DEFAULT_GRAVITY_MAGNITUDE 400.0 /* world-units/s^2; a qualitative default, not physically calibrated */
+#define CAM_HIT_DIST 6.0
+#define CAM_LIFT_SCALE 1.12          /* per +/- press */
+#define CAM_TIMING_STEP (5.0 * M_PI / 180.0)
+#define CAM_STROKE_MIN_SPACING 3.0   /* world units between recorded points */
+#define CAM_DEFAULT_RADIUS 90.0      /* a click, rather than a drawn outline */
 
 /* World<->screen mapping: screen = world*zoom + pan. All Mechanism/mouse
  * positions are handled in world space; only rendering and raw SDL mouse
@@ -42,7 +49,8 @@ typedef enum {
     DRAG_NONE,
     DRAG_MOVE_CONNECTORS,
     DRAG_PENDING_EMPTY,
-    DRAG_BOX_SELECT
+    DRAG_BOX_SELECT,
+    DRAG_DRAW_CAM
 } DragMode;
 
 /* Bounded stacks of full mechanism snapshots (mechanism_clone). Simple and
@@ -67,6 +75,13 @@ typedef struct {
     DragMode drag_mode;
     Vec2 drag_start, drag_last, drag_current;
 
+    /* CAM is a drawing tool: arm it, then drag out the cam's outline. The
+     * stroke is collected in world space and handed to the cam as its
+     * profile on mouse-up. */
+    bool cam_draw_armed;
+    Vec2 *cam_stroke;
+    int cam_stroke_count, cam_stroke_capacity;
+
     Vec2 *pre_run_positions;
     int pre_run_count;
 
@@ -80,12 +95,28 @@ typedef struct {
     Vec2 view_pan;
     double view_zoom;
 
+    /* Seconds since the run started, stamped onto every trace sample so the
+     * plot has a real time axis (frames are not uniform in length). */
+    double sim_time;
+
     Toolbar toolbar;
 } App;
 
 static void clear_selection(Mechanism *m) {
     for (int i = 0; i < m->connector_count; i++) m->connectors[i].selected = false;
     for (int i = 0; i < m->link_count; i++) m->links[i].selected = false;
+    for (int i = 0; i < m->cam_count; i++) m->cams[i].selected = false;
+}
+
+static int find_single_selected_cam(const Mechanism *m) {
+    int found = -1;
+    for (int i = 0; i < m->cam_count; i++) {
+        if (m->cams[i].alive && m->cams[i].selected) {
+            if (found >= 0) return -1;
+            found = i;
+        }
+    }
+    return found;
 }
 
 static int find_single_selected_link(const Mechanism *m) {
@@ -129,6 +160,9 @@ static bool has_selection(const Mechanism *m) {
     }
     for (int i = 0; i < m->link_count; i++) {
         if (m->links[i].alive && m->links[i].selected) return true;
+    }
+    for (int i = 0; i < m->cam_count; i++) {
+        if (m->cams[i].alive && m->cams[i].selected) return true;
     }
     return false;
 }
@@ -267,6 +301,142 @@ static void app_toggle_motor(App *a) {
     }
 }
 
+/* Records a point of the cam outline being drawn, thinning out samples that
+ * are too close together to matter. */
+static void stroke_push(App *a, Vec2 p) {
+    if (a->cam_stroke_count > 0 &&
+        vec2_dist(a->cam_stroke[a->cam_stroke_count - 1], p) < CAM_STROKE_MIN_SPACING) {
+        return;
+    }
+    if (a->cam_stroke_count >= a->cam_stroke_capacity) {
+        int cap = (a->cam_stroke_capacity == 0) ? 64 : a->cam_stroke_capacity * 2;
+        a->cam_stroke = realloc(a->cam_stroke, (size_t)cap * sizeof(Vec2));
+        a->cam_stroke_capacity = cap;
+    }
+    a->cam_stroke[a->cam_stroke_count++] = p;
+}
+
+/* Area centroid of the drawn outline (the shoelace centroid, which is far
+ * steadier than the mean of the points when the stroke is drawn unevenly).
+ * Falls back to the mean for a degenerate, zero-area scribble. */
+static Vec2 outline_centroid(const Vec2 *pts, int n) {
+    double area = 0.0, cx = 0.0, cy = 0.0;
+    for (int i = 0; i < n; i++) {
+        Vec2 a = pts[i], b = pts[(i + 1) % n];
+        double cross = a.x * b.y - b.x * a.y;
+        area += cross;
+        cx += (a.x + b.x) * cross;
+        cy += (a.y + b.y) * cross;
+    }
+    if (fabs(area) > 1e-9) {
+        return (Vec2){ cx / (3.0 * area), cy / (3.0 * area) };
+    }
+    Vec2 mean = { 0.0, 0.0 };
+    for (int i = 0; i < n; i++) mean = vec2_add(mean, pts[i]);
+    return vec2_scale(mean, 1.0 / (double)n);
+}
+
+/* Builds a complete, running cam in one go: the centre (grounded), a short
+ * shaft marker driven by a motor so the disc actually turns, the roller
+ * follower on its guide axis, and the cam itself. Creating the whole rig at
+ * once is the point -- there is nothing to select and nothing to assemble by
+ * hand. `outline` may be NULL, in which case a default profile is used. */
+static void app_create_cam(App *a, const Vec2 *outline, int n, Vec2 fallback_centre) {
+    bool drawn = (outline != NULL && n >= 3);
+    Vec2 centre = drawn ? outline_centroid(outline, n) : fallback_centre;
+
+    double radius_hint = CAM_DEFAULT_RADIUS;
+    if (drawn) {
+        double sum = 0.0;
+        for (int i = 0; i < n; i++) sum += vec2_dist(outline[i], centre);
+        radius_hint = sum / (double)n;
+        if (radius_hint < 10.0) drawn = false; /* too small to read a profile from */
+    }
+
+    push_undo(a);
+    clear_selection(&a->mech);
+
+    int centre_id = mechanism_add_connector(&a->mech, centre, true);
+    /* The shaft marker sits inside the disc, so it reads as a keyway showing
+     * the cam's rotation rather than as stray geometry. */
+    double shaft = fmax(8.0, radius_hint * 0.45);
+    int shaft_id = mechanism_add_connector(&a->mech, vec2_add(centre, (Vec2){ shaft, 0.0 }), false);
+    int ids[2] = { centre_id, shaft_id };
+    int link_id = mechanism_add_link(&a->mech, ids, 2);
+    mechanism_toggle_driven(&a->mech, link_id, DEFAULT_MOTOR_SPEED_DEG_S);
+
+    /* The follower starts straight above the centre; its guide axis is the
+     * line through the two, so dragging it elsewhere before running aims the
+     * cam at a different angle. */
+    int follower_id = mechanism_add_connector(&a->mech,
+                                               vec2_add(centre, (Vec2){ 0.0, -radius_hint }), false);
+
+    int cam_id = mechanism_add_cam(&a->mech, link_id, centre_id, follower_id);
+    if (cam_id < 0) {
+        discard_last_undo(a);
+        printf("Could not create a cam there.\n");
+        return;
+    }
+    Cam *cam = &a->mech.cams[cam_id];
+
+    if (drawn) {
+        Vec2 *local = malloc((size_t)n * sizeof(Vec2));
+        for (int i = 0; i < n; i++) local[i] = vec2_sub(outline[i], centre);
+        if (!cam_set_from_drawn_outline(cam, local, n)) {
+            printf("Couldn't read a profile from that outline -- using a default cam. "
+                    "Try drawing a single loop right around the centre.\n");
+        }
+        free(local);
+    }
+
+    /* Seat the follower exactly on the profile so it starts in contact. */
+    cam->spring_preload = cam->base_radius * 0.25;
+    double phi = atan2(cam->axis_dir.y, cam->axis_dir.x);
+    a->mech.connectors[follower_id].pos =
+        vec2_add(centre, vec2_scale(cam->axis_dir, cam_pitch_radius(cam, phi)));
+
+    /* It is seated on the profile, so show it as touching straight away
+     * rather than flashing the airborne colour until the first frame. */
+    cam->in_contact = true;
+    cam->selected = true;
+    printf("Cam added: base radius %.1f, lift %.1f. Press R to run. "
+            "Select the cam to reshape it: +/- lift, [ and ] timing.\n",
+            cam->base_radius, cam->lift);
+    if (cam_is_undercut(cam)) {
+        printf("Warning: this cam undercuts -- it has a concave notch tighter than "
+                "the roller, so it could not be cut to give this motion.\n");
+    }
+}
+
+static void app_toggle_cam_draw(App *a) {
+    a->cam_draw_armed = !a->cam_draw_armed;
+    a->cam_stroke_count = 0;
+    if (a->cam_draw_armed) {
+        printf("Cam tool armed: drag on the canvas to draw the cam's outline "
+                "(or click once for a default cam). Escape cancels.\n");
+    }
+}
+
+static void app_adjust_cam_lift(App *a, double factor) {
+    int cid = find_single_selected_cam(&a->mech);
+    if (cid < 0) return;
+    push_undo(a);
+    Cam *c = &a->mech.cams[cid];
+    cam_scale_lift(c, factor);
+    printf("Cam lift: %.1f\n", c->lift);
+    if (cam_is_undercut(c)) printf("Warning: this cam now undercuts.\n");
+}
+
+/* Rotating the profile against the shaft is cam timing: same motion, earlier
+ * or later in the turn. */
+static void app_adjust_cam_timing(App *a, double delta_rad) {
+    int cid = find_single_selected_cam(&a->mech);
+    if (cid < 0) return;
+    push_undo(a);
+    cam_rotate_profile(&a->mech.cams[cid], delta_rad);
+    printf("Cam timing shifted by %.0f deg.\n", delta_rad * 180.0 / M_PI);
+}
+
 static void app_toggle_vary(App *a) {
     int lid = find_single_selected_link(&a->mech);
     if (lid < 0) {
@@ -306,6 +476,9 @@ static void app_delete_selection(App *a) {
     push_undo(a);
     for (int i = 0; i < a->mech.link_count; i++) {
         if (a->mech.links[i].alive && a->mech.links[i].selected) mechanism_delete_link(&a->mech, i);
+    }
+    for (int i = 0; i < a->mech.cam_count; i++) {
+        if (a->mech.cams[i].alive && a->mech.cams[i].selected) mechanism_delete_cam(&a->mech, i);
     }
     for (int i = 0; i < a->mech.connector_count; i++) {
         if (a->mech.connectors[i].alive && a->mech.connectors[i].selected) {
@@ -358,6 +531,7 @@ static void app_start_run(App *a) {
                 "Use the GRAVITY button (or G) to control gravity yourself.\n");
     }
 
+    a->sim_time = 0.0;
     solver_freeze(&a->mech);
     mechanism_clear_traces(&a->mech);
     a->drag_mode = DRAG_NONE;
@@ -391,6 +565,7 @@ static void app_dispatch(App *a, UiAction action) {
     case UI_ANCHOR:  app_toggle_anchor(a); break;
     case UI_LINK:    app_link_selected(a); break;
     case UI_MOTOR:   app_toggle_motor(a); break;
+    case UI_CAM:     app_toggle_cam_draw(a); break;
     case UI_VARY:    app_toggle_vary(a); break;
     case UI_TRACE:   app_toggle_trace(a); break;
     case UI_DELETE:  app_delete_selection(a); break;
@@ -432,6 +607,7 @@ static UiState app_ui_state(const App *a) {
         s.selected_link_can_drive = false;
     }
 
+    s.drawing_cam = a->cam_draw_armed;
     s.can_undo = (a->undo_count > 0);
     s.can_redo = (a->redo_count > 0);
     Vec2 g = effective_gravity(a);
@@ -444,10 +620,47 @@ static void draw_mechanism(SDL_Renderer *ren, const Mechanism *m, DragMode drag_
     for (int i = 0; i < m->connector_count; i++) {
         const Connector *c = &m->connectors[i];
         if (!c->alive || !c->traced || c->path_count < 2) continue;
+        Uint8 tr, tg, tb;
+        render_trace_color(i, &tr, &tg, &tb);
         for (int k = 1; k < c->path_count; k++) {
             render_line(ren, world_to_screen(c->path[k - 1], view_pan, view_zoom),
-                        world_to_screen(c->path[k], view_pan, view_zoom), 80, 200, 220, 255);
+                        world_to_screen(c->path[k], view_pan, view_zoom), tr, tg, tb, 255);
         }
+    }
+
+    for (int ci = 0; ci < m->cam_count; ci++) {
+        const Cam *cam = &m->cams[ci];
+        if (!cam->alive || cam->center_connector_id < 0) continue;
+        if (!m->connectors[cam->center_connector_id].alive) continue;
+
+        Vec2 centre = world_to_screen(m->connectors[cam->center_connector_id].pos, view_pan, view_zoom);
+        double angle = mechanism_cam_angle(m, ci);
+
+        Uint8 r, g, b;
+        if (cam->selected) { r = 255; g = 225; b = 70; }
+        else { r = 175; g = 150; b = 200; }
+        render_cam(ren, cam, centre, angle, view_zoom, r, g, b, 255);
+
+        /* The guide axis the follower slides along, and the roller riding the
+         * profile. The roller changes colour the moment it leaves the cam, so
+         * float is visible rather than something you have to infer. */
+        Vec2 axis_far = vec2_add(m->connectors[cam->center_connector_id].pos,
+                                  vec2_scale(cam->axis_dir, cam->base_radius + cam->lift * 2.0 + 40.0));
+        render_line(ren, centre, world_to_screen(axis_far, view_pan, view_zoom), 90, 85, 105, 255);
+
+        if (cam->follower_connector_id >= 0 && m->connectors[cam->follower_connector_id].alive) {
+            Vec2 f = world_to_screen(m->connectors[cam->follower_connector_id].pos, view_pan, view_zoom);
+            if (cam->in_contact) render_circle(ren, f, cam->roller_radius * view_zoom, 120, 215, 140, 255);
+            else render_circle(ren, f, cam->roller_radius * view_zoom, 235, 110, 90, 255);
+        }
+
+        /* Base radius and lift, in the same seven-segment numerals the link
+         * lengths use. */
+        double dh = 10.0 * view_zoom;
+        render_number(ren, (Vec2){ centre.x + 6.0, centre.y + 8.0 }, 0.0, dh,
+                      cam->base_radius, 160, 150, 185, 255);
+        render_number(ren, (Vec2){ centre.x + 6.0, centre.y + 8.0 + dh * 1.5 }, 0.0, dh,
+                      cam->lift, 160, 150, 185, 255);
     }
 
     for (int li = 0; li < m->link_count; li++) {
@@ -499,7 +712,7 @@ static void draw_mechanism(SDL_Renderer *ren, const Mechanism *m, DragMode drag_
         Uint8 r, g, b;
         if (c->selected) { r = 255; g = 225; b = 70; }
         else if (c->is_anchor) { r = 230; g = 160; b = 60; }
-        else if (c->traced) { r = 80; g = 200; b = 220; }
+        else if (c->traced) { render_trace_color(i, &r, &g, &b); }
         else { r = 220; g = 220; b = 220; }
         Vec2 sp = world_to_screen(c->pos, view_pan, view_zoom);
         render_circle(ren, sp, 5.0 * view_zoom, r, g, b, 255);
@@ -518,6 +731,10 @@ static void draw_mechanism(SDL_Renderer *ren, const Mechanism *m, DragMode drag_
 }
 
 int main(void) {
+    /* Line-buffer stdout so the running commentary still appears in order
+     * when it is redirected to a file, not just when it goes to a terminal. */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         return 1;
@@ -548,6 +765,10 @@ int main(void) {
     printf("    J: place a connector at the centre of the view\n");
     printf("    L: link selected connectors     A: toggle anchor on selected connectors\n");
     printf("    M: toggle motor on selected link (needs exactly one anchor)   +/-: motor speed\n");
+    printf("    K: cam tool -- then DRAG on the canvas to draw the cam's outline (or\n");
+    printf("       click once for a default cam). The centre, motor and roller follower\n");
+    printf("       are all created for you. Click a cam's outline to select it:\n");
+    printf("       +/- resize its lift, [ and ] shift its timing.\n");
     printf("    V: toggle selected link's length between fixed and variable (green = variable)\n");
     printf("    T: toggle path tracing on selected connectors\n");
     printf("    E: export mechanism to a Blender Python script\n");
@@ -575,6 +796,11 @@ int main(void) {
     app.jammed = false;
     app.view_pan = (Vec2){ UI_TOOLBAR_W, 0 };
     app.view_zoom = 1.0;
+    app.sim_time = 0.0;
+    app.cam_draw_armed = false;
+    app.cam_stroke = NULL;
+    app.cam_stroke_count = 0;
+    app.cam_stroke_capacity = 0;
     ui_init(&app.toolbar);
 
     Uint32 last_ticks = SDL_GetTicks();
@@ -605,6 +831,8 @@ int main(void) {
                         app.drag_current = p;
                     } else if (app.drag_mode == DRAG_BOX_SELECT) {
                         app.drag_current = p;
+                    } else if (app.drag_mode == DRAG_DRAW_CAM) {
+                        stroke_push(&app, p);
                     }
                 }
             } else if (ev.type == SDL_MOUSEBUTTONDOWN && ev.button.button == SDL_BUTTON_LEFT &&
@@ -638,12 +866,20 @@ int main(void) {
                     app_toggle_anchor(&app);
                 } else if (k == SDLK_m) {
                     app_toggle_motor(&app);
+                } else if (k == SDLK_k) {
+                    app_toggle_cam_draw(&app);
+                } else if (k == SDLK_LEFTBRACKET) {
+                    app_adjust_cam_timing(&app, -CAM_TIMING_STEP);
+                } else if (k == SDLK_RIGHTBRACKET) {
+                    app_adjust_cam_timing(&app, CAM_TIMING_STEP);
                 } else if (k == SDLK_v) {
                     app_toggle_vary(&app);
                 } else if (k == SDLK_EQUALS || k == SDLK_KP_PLUS) {
-                    app_adjust_motor_speed(&app, MOTOR_SPEED_STEP_DEG_S);
+                    if (find_single_selected_cam(&app.mech) >= 0) app_adjust_cam_lift(&app, CAM_LIFT_SCALE);
+                    else app_adjust_motor_speed(&app, MOTOR_SPEED_STEP_DEG_S);
                 } else if (k == SDLK_MINUS || k == SDLK_KP_MINUS) {
-                    app_adjust_motor_speed(&app, -MOTOR_SPEED_STEP_DEG_S);
+                    if (find_single_selected_cam(&app.mech) >= 0) app_adjust_cam_lift(&app, 1.0 / CAM_LIFT_SCALE);
+                    else app_adjust_motor_speed(&app, -MOTOR_SPEED_STEP_DEG_S);
                 } else if (k == SDLK_t) {
                     app_toggle_trace(&app);
                 } else if (k == SDLK_e) {
@@ -651,7 +887,13 @@ int main(void) {
                 } else if (k == SDLK_DELETE || k == SDLK_BACKSPACE) {
                     app_delete_selection(&app);
                 } else if (k == SDLK_ESCAPE) {
-                    clear_selection(&app.mech);
+                    if (app.cam_draw_armed) {
+                        app.cam_draw_armed = false;
+                        app.cam_stroke_count = 0;
+                        printf("Cam tool cancelled.\n");
+                    } else {
+                        clear_selection(&app.mech);
+                    }
                 } else if (k == SDLK_r) {
                     app_start_run(&app);
                 }
@@ -673,6 +915,13 @@ int main(void) {
                     app.view_pan.y = screen_mouse.y - world_before.y * new_zoom;
                     app.view_zoom = new_zoom;
                 }
+            } else if (app.state == APP_EDIT && ev.type == SDL_MOUSEBUTTONDOWN && ev.button.button == SDL_BUTTON_LEFT &&
+                        app.cam_draw_armed) {
+                Vec2 p = screen_to_world((Vec2){ (double)ev.button.x, (double)ev.button.y }, app.view_pan, app.view_zoom);
+                app.drag_mode = DRAG_DRAW_CAM;
+                app.drag_start = p;
+                app.cam_stroke_count = 0;
+                stroke_push(&app, p);
             } else if (app.state == APP_EDIT && ev.type == SDL_MOUSEBUTTONDOWN && ev.button.button == SDL_BUTTON_LEFT) {
                 Vec2 p = screen_to_world((Vec2){ (double)ev.button.x, (double)ev.button.y }, app.view_pan, app.view_zoom);
                 bool shift = (SDL_GetModState() & KMOD_SHIFT) != 0;
@@ -692,9 +941,15 @@ int main(void) {
                     }
                 } else {
                     int hit_link = mechanism_pick_link_edge(&app.mech, p, LINK_EDGE_HIT_DIST / app.view_zoom);
+                    int hit_cam = (hit_link >= 0) ? -1
+                                    : mechanism_pick_cam(&app.mech, p, CAM_HIT_DIST / app.view_zoom);
                     if (hit_link >= 0) {
                         clear_selection(&app.mech);
                         app.mech.links[hit_link].selected = true;
+                        app.drag_mode = DRAG_NONE;
+                    } else if (hit_cam >= 0) {
+                        clear_selection(&app.mech);
+                        app.mech.cams[hit_cam].selected = true;
                         app.drag_mode = DRAG_NONE;
                     } else {
                         app.drag_mode = DRAG_PENDING_EMPTY;
@@ -702,6 +957,18 @@ int main(void) {
                         app.drag_current = p;
                     }
                 }
+            } else if (app.state == APP_EDIT && ev.type == SDL_MOUSEBUTTONUP && ev.button.button == SDL_BUTTON_LEFT &&
+                        app.drag_mode == DRAG_DRAW_CAM) {
+                if (app.cam_stroke_count >= 3) {
+                    app_create_cam(&app, app.cam_stroke, app.cam_stroke_count, app.drag_start);
+                } else {
+                    /* A click rather than a drag: give them a working default
+                     * cam right there instead of nothing. */
+                    app_create_cam(&app, NULL, 0, app.drag_start);
+                }
+                app.cam_stroke_count = 0;
+                app.cam_draw_armed = false;
+                app.drag_mode = DRAG_NONE;
             } else if (app.state == APP_EDIT && ev.type == SDL_MOUSEBUTTONUP && ev.button.button == SDL_BUTTON_LEFT) {
                 if (app.drag_mode == DRAG_PENDING_EMPTY) {
                     push_undo(&app);
@@ -747,7 +1014,8 @@ int main(void) {
                 printf("Mechanism jammed: a fixed-length link would have to change length here. "
                         "Press STOP (or R), then adjust the geometry (or press VARY to let a link's length vary).\n");
             } else {
-                mechanism_trace_step(&app.mech);
+                app.sim_time += dt;
+                mechanism_trace_step(&app.mech, app.sim_time);
             }
         }
 
@@ -758,16 +1026,36 @@ int main(void) {
 
         /* Keep the mechanism inside the canvas so long links can't draw over
          * the toolbar. */
-        SDL_Rect canvas_clip = { UI_TOOLBAR_W, 0, CANVAS_W, WIN_H };
+        SDL_Rect canvas_clip = { UI_TOOLBAR_W, 0, CANVAS_W, CANVAS_H };
         SDL_RenderSetClipRect(ren, &canvas_clip);
         draw_mechanism(ren, &app.mech, app.drag_mode, app.drag_start, app.drag_current, app.view_pan, app.view_zoom);
+
+        /* The cam outline being drawn, closed back to its start so what you
+         * see is the shape that will actually be read. */
+        if (app.cam_stroke_count >= 2) {
+            for (int i = 1; i <= app.cam_stroke_count; i++) {
+                Vec2 a0 = world_to_screen(app.cam_stroke[i - 1], app.view_pan, app.view_zoom);
+                Vec2 a1 = world_to_screen(app.cam_stroke[i % app.cam_stroke_count], app.view_pan, app.view_zoom);
+                bool closing = (i == app.cam_stroke_count);
+                if (closing) render_line(ren, a0, a1, 120, 100, 150, 255);
+                else render_line(ren, a0, a1, 200, 175, 235, 255);
+            }
+        }
+        if (app.cam_draw_armed) {
+            const char *hint = "DRAG TO DRAW THE CAM OUTLINE   CLICK FOR A DEFAULT CAM   ESC TO CANCEL";
+            double w = render_text_width(9.0, hint);
+            render_text(ren, (Vec2){ UI_TOOLBAR_W + (CANVAS_W - w) / 2.0, 16.0 }, 9.0, hint,
+                        200, 175, 235, 255);
+        }
         SDL_RenderSetClipRect(ren, NULL);
 
+        render_plot(ren, &app.mech, (UiRect){ UI_TOOLBAR_W, CANVAS_H, CANVAS_W, PLOT_H });
         render_toolbar(ren, &app.toolbar, WIN_H);
         SDL_RenderPresent(ren);
         SDL_Delay(16);
     }
 
+    free(app.cam_stroke);
     free(app.pre_run_positions);
     free(app.frame_positions);
     free(app.frame_angles);

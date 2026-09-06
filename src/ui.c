@@ -16,6 +16,7 @@ static const ButtonSpec BUTTON_SPECS[] = {
     { UI_ANCHOR,  "ANCHOR",  "A",   false },
     { UI_LINK,    "LINK",    "L",   false },
     { UI_MOTOR,   "MOTOR",   "M",   false },
+    { UI_CAM,     "CAM",     "K",   false },
     { UI_VARY,    "VARY",    "V",   false },
     { UI_TRACE,   "TRACE",   "T",   false },
     { UI_DELETE,  "DELETE",  "DEL", false },
@@ -87,6 +88,12 @@ void ui_apply_state(Toolbar *t, UiState s) {
             b->enabled = s.editing && have_link &&
                             (s.selected_link_driven || s.selected_link_can_drive);
             b->active = have_link && s.selected_link_driven;
+            break;
+        case UI_CAM:
+            /* A drawing tool, not an operation on a selection: always offered
+             * while editing, and lit while it is armed. */
+            b->enabled = s.editing;
+            b->active = s.drawing_cam;
             break;
         case UI_VARY:
             /* A driven link is posed directly, so its shape is always rigid. */

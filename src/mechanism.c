@@ -1,7 +1,11 @@
 #include "mechanism.h"
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* How finely a cam's surface is sampled for hit-testing. */
+#define CAM_PICK_SAMPLES 180
 
 int mechanism_pair_index(int i, int j, int k) {
     return i * (2 * k - i - 1) / 2 + (j - i - 1);
@@ -22,17 +26,22 @@ void mechanism_init(Mechanism *m) {
     m->links = NULL;
     m->link_count = 0;
     m->link_capacity = 0;
+    m->cams = NULL;
+    m->cam_count = 0;
+    m->cam_capacity = 0;
 }
 
 void mechanism_free(Mechanism *m) {
     for (int i = 0; i < m->connector_count; i++) {
         free(m->connectors[i].path);
+        free(m->connectors[i].path_time);
     }
     for (int i = 0; i < m->link_count; i++) {
         free(m->links[i].connector_ids);
         free(m->links[i].rest_dist);
         free(m->links[i].frozen_local_offset);
     }
+    free(m->cams);
     free(m->links);
     free(m->connectors);
     mechanism_init(m);
@@ -46,11 +55,15 @@ void mechanism_clone(const Mechanism *src, Mechanism *dst) {
         Connector *d = &dst->connectors[i];
         *d = src->connectors[i];
         if (src->connectors[i].path_count > 0) {
-            d->path = malloc((size_t)src->connectors[i].path_count * sizeof(Vec2));
-            memcpy(d->path, src->connectors[i].path, (size_t)src->connectors[i].path_count * sizeof(Vec2));
+            size_t n = (size_t)src->connectors[i].path_count;
+            d->path = malloc(n * sizeof(Vec2));
+            memcpy(d->path, src->connectors[i].path, n * sizeof(Vec2));
+            d->path_time = malloc(n * sizeof(double));
+            memcpy(d->path_time, src->connectors[i].path_time, n * sizeof(double));
             d->path_capacity = src->connectors[i].path_count;
         } else {
             d->path = NULL;
+            d->path_time = NULL;
             d->path_capacity = 0;
         }
     }
@@ -80,6 +93,14 @@ void mechanism_clone(const Mechanism *src, Mechanism *dst) {
             d->frozen_local_offset = NULL;
         }
     }
+
+    /* Cams own no heap memory, so a flat copy is a full deep copy. */
+    dst->cam_count = src->cam_count;
+    dst->cam_capacity = src->cam_count;
+    dst->cams = (src->cam_count > 0) ? malloc((size_t)src->cam_count * sizeof(Cam)) : NULL;
+    if (src->cam_count > 0) {
+        memcpy(dst->cams, src->cams, (size_t)src->cam_count * sizeof(Cam));
+    }
 }
 
 int mechanism_add_connector(Mechanism *m, Vec2 pos, bool is_anchor) {
@@ -91,16 +112,47 @@ int mechanism_add_connector(Mechanism *m, Vec2 pos, bool is_anchor) {
     c->selected = false;
     c->traced = false;
     c->path = NULL;
+    c->path_time = NULL;
     c->path_count = 0;
     c->path_capacity = 0;
     c->alive = true;
     return m->connector_count++;
 }
 
+void mechanism_delete_cam(Mechanism *m, int cam_id) {
+    if (cam_id < 0 || cam_id >= m->cam_count) return;
+    Cam *c = &m->cams[cam_id];
+    if (!c->alive) return;
+    c->alive = false;
+    c->selected = false;
+    c->body_link_id = -1;
+    c->center_connector_id = -1;
+    c->follower_connector_id = -1;
+}
+
+/* A cam is defined by a link and two connectors; if any of them goes away the
+ * cam is meaningless, so it goes too. */
+static void delete_cams_using_link(Mechanism *m, int link_id) {
+    for (int i = 0; i < m->cam_count; i++) {
+        if (m->cams[i].alive && m->cams[i].body_link_id == link_id) mechanism_delete_cam(m, i);
+    }
+}
+
+static void delete_cams_using_connector(Mechanism *m, int connector_id) {
+    for (int i = 0; i < m->cam_count; i++) {
+        const Cam *c = &m->cams[i];
+        if (c->alive && (c->center_connector_id == connector_id ||
+                          c->follower_connector_id == connector_id)) {
+            mechanism_delete_cam(m, i);
+        }
+    }
+}
+
 void mechanism_delete_link(Mechanism *m, int link_id) {
     if (link_id < 0 || link_id >= m->link_count) return;
     Link *l = &m->links[link_id];
     if (!l->alive) return;
+    delete_cams_using_link(m, link_id);
     free(l->connector_ids);
     free(l->rest_dist);
     free(l->frozen_local_offset);
@@ -128,8 +180,11 @@ void mechanism_delete_connector(Mechanism *m, int connector_id) {
             }
         }
     }
+    delete_cams_using_connector(m, connector_id);
     free(m->connectors[connector_id].path);
+    free(m->connectors[connector_id].path_time);
     m->connectors[connector_id].path = NULL;
+    m->connectors[connector_id].path_time = NULL;
     m->connectors[connector_id].path_count = 0;
     m->connectors[connector_id].path_capacity = 0;
     m->connectors[connector_id].traced = false;
@@ -244,7 +299,9 @@ void mechanism_set_traced(Mechanism *m, int connector_id, bool traced) {
     c->traced = traced;
     if (!traced) {
         free(c->path);
+        free(c->path_time);
         c->path = NULL;
+        c->path_time = NULL;
         c->path_count = 0;
         c->path_capacity = 0;
     }
@@ -257,11 +314,20 @@ void mechanism_clear_traces(Mechanism *m) {
     }
 }
 
-void mechanism_trace_step(Mechanism *m) {
+void mechanism_trace_step(Mechanism *m, double sim_time) {
     for (int i = 0; i < m->connector_count; i++) {
         Connector *c = &m->connectors[i];
         if (!c->alive || !c->traced) continue;
-        c->path = grow(c->path, &c->path_capacity, c->path_count, sizeof(Vec2));
+        /* path and path_time are parallel, so they share one capacity and
+         * have to grow together. */
+        if (c->path_count >= c->path_capacity) {
+            int new_cap = (c->path_capacity == 0) ? 4 : c->path_capacity * 2;
+            while (new_cap <= c->path_count) new_cap *= 2;
+            c->path = realloc(c->path, (size_t)new_cap * sizeof(Vec2));
+            c->path_time = realloc(c->path_time, (size_t)new_cap * sizeof(double));
+            c->path_capacity = new_cap;
+        }
+        c->path_time[c->path_count] = sim_time;
         c->path[c->path_count++] = c->pos;
     }
 }
@@ -288,6 +354,79 @@ static double point_segment_dist(Vec2 p, Vec2 a, Vec2 b) {
     if (t > 1.0) t = 1.0;
     Vec2 proj = vec2_add(a, vec2_scale(ab, t));
     return vec2_dist(p, proj);
+}
+
+int mechanism_add_cam(Mechanism *m, int body_link_id, int center_connector_id, int follower_connector_id) {
+    if (body_link_id < 0 || body_link_id >= m->link_count || !m->links[body_link_id].alive) return -1;
+    if (center_connector_id < 0 || center_connector_id >= m->connector_count) return -1;
+    if (follower_connector_id < 0 || follower_connector_id >= m->connector_count) return -1;
+    if (center_connector_id == follower_connector_id) return -1;
+    if (!m->connectors[center_connector_id].alive || !m->connectors[follower_connector_id].alive) return -1;
+
+    /* The centre has to belong to the body link, or "turning with it" is
+     * meaningless. */
+    const Link *l = &m->links[body_link_id];
+    bool center_on_link = false;
+    for (int i = 0; i < l->connector_count; i++) {
+        if (l->connector_ids[i] == center_connector_id) center_on_link = true;
+    }
+    if (!center_on_link) return -1;
+
+    Vec2 centre = m->connectors[center_connector_id].pos;
+    Vec2 follower = m->connectors[follower_connector_id].pos;
+    double reach = vec2_dist(centre, follower);
+    if (reach < 1e-6) return -1; /* no axis direction to be had */
+
+    m->cams = grow(m->cams, &m->cam_capacity, m->cam_count, sizeof(Cam));
+    Cam *c = &m->cams[m->cam_count];
+
+    /* Size the cam so the follower starts sitting on the profile: the
+     * follower's current distance is the pitch radius at the low dwell. */
+    cam_set_defaults(c, reach);
+    c->body_link_id = body_link_id;
+    c->center_connector_id = center_connector_id;
+    c->follower_connector_id = follower_connector_id;
+    c->axis_origin = centre;
+    c->axis_dir = vec2_scale(vec2_sub(follower, centre), 1.0 / reach);
+
+    return m->cam_count++;
+}
+
+double mechanism_cam_angle(const Mechanism *m, int cam_id) {
+    if (cam_id < 0 || cam_id >= m->cam_count) return 0.0;
+    const Cam *c = &m->cams[cam_id];
+    if (!c->alive || c->ref_connector_id < 0 || c->center_connector_id < 0) return 0.0;
+    if (!m->connectors[c->ref_connector_id].alive) return 0.0;
+
+    Vec2 d = vec2_sub(m->connectors[c->ref_connector_id].pos, m->connectors[c->center_connector_id].pos);
+    if (vec2_len(d) < 1e-12) return 0.0;
+    return atan2(d.y, d.x) - c->frozen_ref_angle;
+}
+
+int mechanism_pick_cam(const Mechanism *m, Vec2 p, double dist_thresh) {
+    int best = -1;
+    double best_d = dist_thresh;
+    Vec2 pts[CAM_PICK_SAMPLES];
+
+    for (int i = 0; i < m->cam_count; i++) {
+        const Cam *c = &m->cams[i];
+        if (!c->alive || c->center_connector_id < 0) continue;
+        if (!m->connectors[c->center_connector_id].alive) continue;
+
+        Vec2 centre = m->connectors[c->center_connector_id].pos;
+        double angle = mechanism_cam_angle(m, i);
+        cam_sample_surface(c, pts, CAM_PICK_SAMPLES);
+        for (int k = 0; k < CAM_PICK_SAMPLES; k++) {
+            Vec2 a = vec2_add(centre, vec2_rotate(pts[k], angle));
+            Vec2 b = vec2_add(centre, vec2_rotate(pts[(k + 1) % CAM_PICK_SAMPLES], angle));
+            double d = point_segment_dist(p, a, b);
+            if (d <= best_d) {
+                best_d = d;
+                best = i;
+            }
+        }
+    }
+    return best;
 }
 
 int mechanism_pick_link_edge(const Mechanism *m, Vec2 p, double dist_thresh) {

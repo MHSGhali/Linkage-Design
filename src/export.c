@@ -12,6 +12,9 @@
  * many seconds), and stepping that coarsely would let the solver lose the
  * mechanism's branch, so each sample is reached via several small steps. */
 #define MAX_SUBSTEP_SECONDS (1.0 / 240.0)
+/* How finely a cam's surface is written out. Dense enough that the printed
+ * flank is smooth, small enough that the script stays readable. */
+#define CAM_EXPORT_SAMPLES 360
 
 /* How long one full revolution of the fastest motor takes, or 0 if nothing
  * is turning. */
@@ -59,7 +62,18 @@ bool export_blender_script(const Mechanism *m, SolverParams params, const char *
     if (substeps < 1) substeps = 1;
     double substep_dt = frame_dt / (double)substeps;
 
+    /* Cams that are exportable: alive, with a live centre we can hang them on. */
+    int *cam_ids = malloc((size_t)(m->cam_count > 0 ? m->cam_count : 1) * sizeof(int));
+    int cam_count = 0;
+    for (int i = 0; i < m->cam_count; i++) {
+        const Cam *c = &m->cams[i];
+        if (!c->alive || c->center_connector_id < 0) continue;
+        if (!m->connectors[c->center_connector_id].alive) continue;
+        cam_ids[cam_count++] = i;
+    }
+
     Vec2 *samples = malloc((size_t)EXPORT_FRAMES * (size_t)(joint_count > 0 ? joint_count : 1) * sizeof(Vec2));
+    double *cam_angles = malloc((size_t)EXPORT_FRAMES * (size_t)(cam_count > 0 ? cam_count : 1) * sizeof(double));
     int recorded = 0;
     bool jammed = false;
 
@@ -74,6 +88,10 @@ bool export_blender_script(const Mechanism *m, SolverParams params, const char *
         for (int j = 0; j < joint_count; j++) {
             samples[(size_t)recorded * (size_t)joint_count + j] = sim.connectors[joint_ids[j]].pos;
         }
+        for (int j = 0; j < cam_count; j++) {
+            cam_angles[(size_t)recorded * (size_t)(cam_count > 0 ? cam_count : 1) + j] =
+                mechanism_cam_angle(&sim, cam_ids[j]);
+        }
         recorded++;
     }
 
@@ -87,6 +105,7 @@ bool export_blender_script(const Mechanism *m, SolverParams params, const char *
         "\n"
         "ROD_RADIUS_MM = 3.0  # link/rod cylinder radius -- edit to taste before running\n"
         "JOINT_MARKER_RADIUS_MM = ROD_RADIUS_MM * 1.5\n"
+        "CAM_THICKNESS_MM = 8.0  # extrusion depth of each cam disc\n"
         "\n");
 
     fprintf(f, "FRAME_COUNT = %d\n", recorded);
@@ -124,6 +143,45 @@ bool export_blender_script(const Mechanism *m, SolverParams params, const char *
                 fprintf(f, "    (\"Link%d_c%dc%d\", %d, %d),\n", li, ci, cj, slot_i, slot_j);
             }
         }
+    }
+    fprintf(f, "]\n\n");
+
+    /* Cams: the physical surface as a closed polygon in cam-local mm (already
+     * inset from the pitch curve by the roller radius, so this is the shape
+     * that actually gets cut), plus the joint it spins about and the roller
+     * that rides it. */
+    fprintf(f, "CAMS = [\n");
+    Vec2 *profile = malloc((size_t)CAM_EXPORT_SAMPLES * sizeof(Vec2));
+    for (int j = 0; j < cam_count; j++) {
+        const Cam *c = &m->cams[cam_ids[j]];
+        int center_slot = -1, follower_slot = -1;
+        for (int s = 0; s < joint_count; s++) {
+            if (joint_ids[s] == c->center_connector_id) center_slot = s;
+            if (joint_ids[s] == c->follower_connector_id) follower_slot = s;
+        }
+        if (center_slot < 0) continue;
+
+        cam_sample_surface(c, profile, CAM_EXPORT_SAMPLES);
+        fprintf(f, "    (\"Cam_%d\", %d, %d, %.4f, [", cam_ids[j], center_slot, follower_slot,
+                c->roller_radius);
+        for (int k = 0; k < CAM_EXPORT_SAMPLES; k++) {
+            fprintf(f, "(%.4f,%.4f)%s", profile[k].x, profile[k].y,
+                    (k + 1 < CAM_EXPORT_SAMPLES) ? "," : "");
+        }
+        fprintf(f, "]),\n");
+    }
+    free(profile);
+    fprintf(f, "]\n\n");
+
+    /* One row of cam angles (radians) per animation frame, in CAMS order. */
+    fprintf(f, "CAM_ANGLES = [\n");
+    for (int fr = 0; fr < recorded; fr++) {
+        fprintf(f, "    [");
+        for (int j = 0; j < cam_count; j++) {
+            fprintf(f, "%.6f%s", cam_angles[(size_t)fr * (size_t)(cam_count > 0 ? cam_count : 1) + j],
+                    (j + 1 < cam_count) ? "," : "");
+        }
+        fprintf(f, "],\n");
     }
     fprintf(f, "]\n\n");
 
@@ -174,14 +232,60 @@ bool export_blender_script(const Mechanism *m, SolverParams params, const char *
         "    obj.rotation_mode = 'QUATERNION'\n"
         "    return obj\n"
         "\n"
+        "\n");
+
+    fprintf(f,
+        "def make_cam(name, profile, roller_radius_mm):\n"
+        "    # A solid prism swept from the cam's real surface outline: bottom\n"
+        "    # ring, top ring, a quad per edge, and an n-gon cap at each end.\n"
+        "    half = mm(CAM_THICKNESS_MM) / 2.0\n"
+        "    n = len(profile)\n"
+        "    verts = [(mm(x), mm(y), -half) for (x, y) in profile]\n"
+        "    verts += [(mm(x), mm(y), half) for (x, y) in profile]\n"
+        "    faces = [(i, (i + 1) %% n, n + ((i + 1) %% n), n + i) for i in range(n)]\n"
+        "    faces.append(tuple(reversed(range(n))))\n"
+        "    faces.append(tuple(range(n, 2 * n)))\n"
+        "    mesh = bpy.data.meshes.new(name)\n"
+        "    mesh.from_pydata(verts, [], faces)\n"
+        "    mesh.validate()\n"
+        "    mesh.update()\n"
+        "    obj = bpy.data.objects.new(name, mesh)\n"
+        "    bpy.context.scene.collection.objects.link(obj)\n"
+        "    obj.rotation_mode = 'XYZ'\n"
+        "    return obj\n"
+        "\n"
+        "\n"
+        "def make_roller(name, radius_mm):\n"
+        "    bpy.ops.mesh.primitive_cylinder_add(radius=mm(radius_mm),\n"
+        "                                        depth=mm(CAM_THICKNESS_MM),\n"
+        "                                        location=(0.0, 0.0, 0.0))\n"
+        "    obj = bpy.context.object\n"
+        "    obj.name = name\n"
+        "    return obj\n"
+        "\n"
         "\n"
         "joints = [make_joint(name, is_anchor) for (name, is_anchor) in JOINTS]\n"
         "rods = [(make_rod(name), i, j) for (name, i, j) in RODS]\n"
+        "cams = [(make_cam(name, profile, roller), center, follower)\n"
+        "        for (name, center, follower, roller, profile) in CAMS]\n"
+        "rollers = [(make_roller(name + '_Roller', roller), follower)\n"
+        "           for (name, _c, follower, roller, _p) in CAMS if follower >= 0]\n"
         "\n"
         "for frame_index, positions in enumerate(FRAMES):\n"
         "    frame = frame_index + 1\n"
+        "    angles = CAM_ANGLES[frame_index] if frame_index < len(CAM_ANGLES) else []\n"
         "    for obj, (x, y) in zip(joints, positions):\n"
         "        obj.location = (mm(x), mm(y), 0.0)\n"
+        "        obj.keyframe_insert('location', frame=frame)\n"
+        "    for cam_index, (obj, center, _follower) in enumerate(cams):\n"
+        "        cx, cy = positions[center]\n"
+        "        obj.location = (mm(cx), mm(cy), 0.0)\n"
+        "        obj.rotation_euler = (0.0, 0.0, angles[cam_index] if cam_index < len(angles) else 0.0)\n"
+        "        obj.keyframe_insert('location', frame=frame)\n"
+        "        obj.keyframe_insert('rotation_euler', frame=frame)\n"
+        "    for obj, follower in rollers:\n"
+        "        fx, fy = positions[follower]\n"
+        "        obj.location = (mm(fx), mm(fy), 0.0)\n"
         "        obj.keyframe_insert('location', frame=frame)\n"
         "    for obj, i, j in rods:\n"
         "        p0 = mathutils.Vector((mm(positions[i][0]), mm(positions[i][1]), 0.0))\n"
@@ -195,7 +299,9 @@ bool export_blender_script(const Mechanism *m, SolverParams params, const char *
         "        obj.keyframe_insert('location', frame=frame)\n"
         "        obj.keyframe_insert('rotation_quaternion', frame=frame)\n"
         "        obj.keyframe_insert('scale', frame=frame)\n"
-        "\n"
+        "\n");
+
+    fprintf(f,
         "def iter_fcurves(action):\n"
         "    # Blender <4.4 exposes action.fcurves directly; 4.4+ moved them\n"
         "    # into slotted actions (layers -> strips -> channelbags).\n"
@@ -215,7 +321,9 @@ bool export_blender_script(const Mechanism *m, SolverParams params, const char *
         "# The motion is already baked into the keyframes, so treat this as a\n"
         "# nicety: never let an API change here break the whole import.\n"
         "try:\n"
-        "    for obj in joints + [rod for (rod, _i, _j) in rods]:\n"
+        "    animated = (joints + [rod for (rod, _i, _j) in rods]\n"
+        "               + [cam for (cam, _c, _f) in cams] + [r for (r, _f) in rollers])\n"
+        "    for obj in animated:\n"
         "        action = obj.animation_data.action if obj.animation_data else None\n"
         "        if action is None:\n"
         "            continue\n"
@@ -227,11 +335,13 @@ bool export_blender_script(const Mechanism *m, SolverParams params, const char *
         "          'the animation is still correct.' %% exc)\n"
         "\n"
         "scene.frame_set(1)\n"
-        "print('Linkage Design: built %%d joints, %%d rods, %%d frames.'\n"
-        "      %% (len(joints), len(rods), FRAME_COUNT))\n");
+        "print('Linkage Design: built %%d joints, %%d rods, %%d cams, %%d frames.'\n"
+        "      %% (len(joints), len(rods), len(cams), FRAME_COUNT))\n");
 
     fclose(f);
     free(samples);
+    free(cam_angles);
+    free(cam_ids);
     free(joint_ids);
     mechanism_free(&sim);
     return true;

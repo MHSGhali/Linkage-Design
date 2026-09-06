@@ -4,6 +4,7 @@
 #include <SDL2/SDL.h>
 #include "vec2.h"
 #include "ui.h"
+#include "mechanism.h"
 
 void render_line(SDL_Renderer *ren, Vec2 a, Vec2 b, Uint8 red, Uint8 green, Uint8 blue, Uint8 alpha);
 void render_circle(SDL_Renderer *ren, Vec2 center, double radius, Uint8 red, Uint8 green, Uint8 blue, Uint8 alpha);
@@ -41,5 +42,20 @@ double render_text_width(double height, const char *text);
 /* Draws the whole toolbar strip (background, buttons, labels, hotkey hints
  * and group separators) down the left edge, `strip_height` tall. */
 void render_toolbar(SDL_Renderer *ren, const Toolbar *t, int strip_height);
+
+/* The colour a traced connector is drawn in, both as a dot in the canvas and
+ * as its curves in the plot, so the two can be matched by eye. Stable per
+ * connector id. */
+void render_trace_color(int connector_id, Uint8 *r, Uint8 *g, Uint8 *b);
+
+/* Draws a cam's physical surface (the pitch curve inset by the roller
+ * radius), rotated by `angle` about `center_screen`. `zoom` converts the
+ * cam's world-space dimensions to pixels. */
+void render_cam(SDL_Renderer *ren, const Cam *cam, Vec2 center_screen, double angle, double zoom,
+                 Uint8 red, Uint8 green, Uint8 blue, Uint8 alpha);
+
+/* Draws the x(t) and y(t) time-series panel for every traced connector, on a
+ * shared auto-scaled axis, filling `panel`. */
+void render_plot(SDL_Renderer *ren, const Mechanism *m, UiRect panel);
 
 #endif

@@ -3,9 +3,10 @@
 A general-purpose 2D mechanism editor and simulator: build a planar
 mechanism by hand out of connectors (joints), anchors (grounded connectors),
 and rigid links (each owning any number of connectors, not just simple
-two-point bars), mark one link as a constant-speed motor, then
-forward-simulate the resulting motion. Every link's length is shown live in
-the canvas, and the mechanism can be exported as a ready-to-run Blender
+two-point bars), add disc cams with translating roller followers, mark one
+link as a constant-speed motor, then forward-simulate the resulting motion.
+Every link's length is shown live in the canvas, traced points are plotted
+against time, and the mechanism can be exported as a ready-to-run Blender
 Python script for 3D printing.
 
 ## Build
@@ -47,6 +48,13 @@ disabled, RUN becomes STOP, and GRAVITY and CLEAR keep working.
   - `A`: toggle anchor (grounded) on the selected connectors
   - `M`: toggle the selected link as a driven motor (it must have exactly
     one anchor connector, which becomes the pivot); `+`/`-` adjust its speed
+  - `K`: the cam tool. Arm it, then **drag on the canvas to draw the cam's
+    outline** — the shape you draw becomes the cam. Nothing needs selecting
+    first: the shaft, its motor, and the roller follower are all created for
+    you, seated and ready to run. Click once instead of dragging for a
+    default cam. Escape cancels. Afterwards, click a cam's outline to select
+    it: `+`/`-` scale its lift, `[` and `]` shift its timing. See **Cams and
+    followers** below.
   - `V`: toggle the selected link's length between fixed (rigid, the
     default) and variable. A **fixed** link genuinely cannot change length:
     if the motor would have to stretch or compress it to keep turning, the
@@ -55,9 +63,10 @@ disabled, RUN becomes STOP, and GRAVITY and CLEAR keep working.
     like any other link — it only stretches or compresses when the rest of
     the mechanism leaves it no choice, and then only by as much as the
     geometry actually demands. Not available on a driven link.
-  - `T`: toggle path tracing on the selected connectors (traced connectors
-    are drawn cyan; their path is recorded and drawn while the simulation
-    runs, and reset each time you press `R`)
+  - `T`: toggle path tracing on the selected connectors. Each traced
+    connector takes a colour of its own; its path is drawn in the canvas and
+    its x and y are plotted against time below (see **The motion plot**).
+    Both reset each time you press `R`.
   - `E`: export the mechanism to `linkage_export.py`, a ready-to-run Blender
     Python script (see below)
   - Delete / Backspace: delete the selection
@@ -80,10 +89,74 @@ disabled, RUN becomes STOP, and GRAVITY and CLEAR keep working.
   there: once you've set it yourself, your choice applies either way.
 - `R`: run the simulation / stop and return to the pre-run layout
 
+## The motion plot
+
+Below the canvas is a plot of every traced connector's **x and y against
+time**. Each traced connector gets a colour, used for its dot, its path in the
+canvas and its two curves, so a curve can be matched to the point that drew
+it; x is the brighter of the pair and y the dimmer, each labelled where it
+ends. Both axes auto-scale, and x and y share one value axis so their
+magnitudes stay comparable.
+
+Frames are not uniform in length, so each trace sample is stamped with the
+simulation time it was taken at rather than being assumed evenly spaced --
+the time axis is real seconds. `C` (CLEAR) empties it, and it refills as the
+simulation runs.
+
 Every link's length is drawn as a live numeral alongside it (a small
 hand-drawn seven-segment display — no font dependency), rotated to run
 parallel to the link and offset just clear of it, reflecting its connectors'
 current positions.
+
+## Cams and followers
+
+A cam is a shaped disc that turns with a link (usually a motor) and pushes a
+roller follower along a fixed axis. **You draw the shape**: arm the cam tool
+(CAM / `K`) and drag a loop on the canvas. The whole rig is then built in one
+go — the shaft grounded at the outline's centroid, a motor to turn it, and the
+roller follower seated on the profile — so there is nothing to select and
+nothing to assemble by hand. A single click instead of a drag gives a default
+rise-dwell-fall cam of the classic kind.
+
+The shaft sits at the **centroid** of what you drew, which is what makes the
+cam roughly balanced. It also means an off-centre-looking blob gives less lift
+than you might expect: lift comes from how far the outline swings about its
+own centroid, not about the middle of the screen. Select the cam and use
+`+`/`-` to scale the lift up or down, and `[` / `]` to rotate the profile
+against the shaft — the same motion, earlier or later in the turn, which is
+cam timing.
+
+Internally the profile is kept as the **pitch curve** — the path of the
+roller's *centre* — as a radius every two degrees, splined between samples.
+Your drawn outline is the physical surface, so the pitch curve is that surface
+offset outward by the roller's radius along its normal. Keeping the pitch
+curve is what makes contact exact: the follower axis is radial, so the
+follower's distance from the centre is simply the pitch radius whenever the
+two are touching. A default (undrawn) cam fills the same table from the
+**cycloidal** rise / high dwell / fall / low dwell law, which has zero
+velocity *and* acceleration at both ends of every segment, so the segments
+join smoothly and the follower sees no jerk spike.
+
+A freehand outline routinely has a concave stretch tighter than the roller
+first guessed for it. Forcing the roller in anyway would **undercut**: it
+physically cannot reach into the notch, and the cut cam would not give the
+intended motion. Rather than hand back a profile unlike your drawing, the
+roller is shrunk until it fits the shape you actually drew — which is what a
+cam designer would do. Only a genuinely sharp notch still warns.
+
+**Contact is one-sided.** The cam can push the follower out but never pull it
+back, so what holds the follower down is a preloaded return spring. Turn the
+cam slowly and the follower tracks the profile exactly; spin it fast enough
+and the profile falls away quicker than the spring can push the follower after
+it, and the follower leaves the cam and drops back on -- real cam float. The
+roller is drawn green while it is touching and red while it is airborne, so
+this is visible rather than something to infer. (Contact never *jams*, being
+one-sided; the follower's guide axis is a hard constraint like any other, so
+dragging the follower off its axis does lock up -- see below.)
+
+Scope: the follower axis is radial, i.e. it passes through the cam centre.
+That is the textbook arrangement; offset followers and a general-purpose
+slider joint would be the natural next step.
 
 ## Binding (lock-up)
 
@@ -115,6 +188,12 @@ scene's frame rate.
 Each rod is a unit-depth cylinder scaled along its local Z per frame, so
 variable-length links animate their length correctly too. (Apply the scale
 in Blender before exporting for print.)
+
+**Cams are exported as real solids**, not skeletons: each one becomes a closed
+watertight mesh swept from its actual cut profile (already offset inward by
+the roller radius) to `CAM_THICKNESS_MM`, keyframed with the rotation it has
+in the simulation, and its roller comes along as a cylinder. That is the part
+you would send to a printer.
 
 Convention: **1 world unit = 1 mm** — the script sets the scene's display
 units to millimeters accordingly. Rod radius is a constant

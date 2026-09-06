@@ -307,3 +307,162 @@ void render_toolbar(SDL_Renderer *ren, const Toolbar *t, int strip_height) {
         }
     }
 }
+
+/* ---------------------------------------------------------------------------
+ * Cams
+ * ------------------------------------------------------------------------ */
+#define CAM_OUTLINE_SAMPLES 240
+
+void render_cam(SDL_Renderer *ren, const Cam *cam, Vec2 center_screen, double angle, double zoom,
+                 Uint8 red, Uint8 green, Uint8 blue, Uint8 alpha) {
+    static Vec2 pts[CAM_OUTLINE_SAMPLES];
+    cam_sample_surface(cam, pts, CAM_OUTLINE_SAMPLES);
+
+    Vec2 prev = { 0, 0 };
+    for (int i = 0; i <= CAM_OUTLINE_SAMPLES; i++) {
+        Vec2 local = pts[i % CAM_OUTLINE_SAMPLES];
+        Vec2 rotated = vec2_rotate(local, angle);
+        Vec2 p = { center_screen.x + rotated.x * zoom, center_screen.y + rotated.y * zoom };
+        if (i > 0) render_line(ren, prev, p, red, green, blue, alpha);
+        prev = p;
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * Time-series plot
+ * ------------------------------------------------------------------------ */
+#define PLOT_PAD_LEFT 52
+#define PLOT_PAD_RIGHT 26
+#define PLOT_PAD_TOP 14
+#define PLOT_PAD_BOTTOM 20
+#define PLOT_LABEL_HEIGHT 7.0
+
+static const Uint8 TRACE_PALETTE[][3] = {
+    {  80, 200, 220 },
+    { 120, 215, 140 },
+    { 240, 170,  80 },
+    { 225, 130, 205 },
+    { 200, 210,  90 },
+    { 120, 165, 245 },
+};
+#define TRACE_PALETTE_COUNT ((int)(sizeof TRACE_PALETTE / sizeof TRACE_PALETTE[0]))
+
+void render_trace_color(int connector_id, Uint8 *r, Uint8 *g, Uint8 *b) {
+    int i = connector_id % TRACE_PALETTE_COUNT;
+    if (i < 0) i += TRACE_PALETTE_COUNT;
+    *r = TRACE_PALETTE[i][0];
+    *g = TRACE_PALETTE[i][1];
+    *b = TRACE_PALETTE[i][2];
+}
+
+static bool connector_is_plottable(const Connector *c) {
+    return c->alive && c->traced && c->path_count >= 2;
+}
+
+void render_plot(SDL_Renderer *ren, const Mechanism *m, UiRect panel) {
+    render_rect_filled(ren, panel, 26, 26, 30, 255);
+    render_line(ren, (Vec2){ panel.x, panel.y + 0.5 }, (Vec2){ panel.x + panel.w, panel.y + 0.5 },
+                55, 57, 64, 255);
+
+    /* Shared ranges across every plotted series -- one set of axes, so x and
+     * y curves are directly comparable. */
+    double t_min = 0.0, t_max = 0.0, v_min = 0.0, v_max = 0.0;
+    bool any = false;
+    for (int i = 0; i < m->connector_count; i++) {
+        const Connector *c = &m->connectors[i];
+        if (!connector_is_plottable(c)) continue;
+        for (int k = 0; k < c->path_count; k++) {
+            double t = c->path_time[k];
+            double x = c->path[k].x, y = c->path[k].y;
+            if (!any) {
+                t_min = t_max = t;
+                v_min = fmin(x, y);
+                v_max = fmax(x, y);
+                any = true;
+            } else {
+                t_min = fmin(t_min, t); t_max = fmax(t_max, t);
+                v_min = fmin(v_min, fmin(x, y));
+                v_max = fmax(v_max, fmax(x, y));
+            }
+        }
+    }
+
+    if (!any) {
+        const char *hint = "TRACE A CONNECTOR TO PLOT ITS POSITION AGAINST TIME";
+        double w = render_text_width(8.0, hint);
+        Vec2 at = { panel.x + (panel.w - w) / 2.0, panel.y + panel.h / 2.0 - 4.0 };
+        render_text(ren, at, 8.0, hint, 96, 100, 110, 255);
+        return;
+    }
+
+    double plot_x = panel.x + PLOT_PAD_LEFT;
+    double plot_y = panel.y + PLOT_PAD_TOP;
+    double plot_w = panel.w - PLOT_PAD_LEFT - PLOT_PAD_RIGHT;
+    double plot_h = panel.h - PLOT_PAD_TOP - PLOT_PAD_BOTTOM;
+    if (plot_w < 10.0 || plot_h < 10.0) return;
+
+    double t_span = t_max - t_min;
+    if (t_span < 1e-9) t_span = 1.0;
+    double v_span = v_max - v_min;
+    if (v_span < 1e-9) v_span = 1.0;
+    /* A little headroom so curves never sit exactly on the frame. */
+    v_min -= v_span * 0.05;
+    v_max += v_span * 0.05;
+    v_span = v_max - v_min;
+
+    /* Frame and gridlines. */
+    render_rect_outline(ren, (UiRect){ (int)plot_x, (int)plot_y, (int)plot_w, (int)plot_h },
+                        58, 60, 68, 255);
+    for (int g = 1; g < 4; g++) {
+        double gy = plot_y + plot_h * (double)g / 4.0;
+        render_line(ren, (Vec2){ plot_x, gy }, (Vec2){ plot_x + plot_w, gy }, 40, 42, 48, 255);
+    }
+
+    /* Value axis labels at top, middle and bottom. */
+    for (int g = 0; g <= 2; g++) {
+        double frac = (double)g / 2.0;
+        double value = v_max - frac * v_span;
+        double gy = plot_y + plot_h * frac;
+        double w = render_number_width(PLOT_LABEL_HEIGHT, value);
+        render_number(ren, (Vec2){ plot_x - 8.0 - w, gy - PLOT_LABEL_HEIGHT / 2.0 }, 0.0,
+                      PLOT_LABEL_HEIGHT, value, 130, 135, 145, 255);
+    }
+
+    /* Time axis: 0 at the left, the newest sample at the right. */
+    render_number(ren, (Vec2){ plot_x, plot_y + plot_h + 5.0 }, 0.0, PLOT_LABEL_HEIGHT,
+                  t_min, 130, 135, 145, 255);
+    double tw = render_number_width(PLOT_LABEL_HEIGHT, t_max);
+    render_number(ren, (Vec2){ plot_x + plot_w - tw, plot_y + plot_h + 5.0 }, 0.0, PLOT_LABEL_HEIGHT,
+                  t_max, 130, 135, 145, 255);
+    render_text(ren, (Vec2){ plot_x + plot_w / 2.0 - 12.0, plot_y + plot_h + 5.0 },
+                PLOT_LABEL_HEIGHT, "TIME S", 110, 115, 125, 255);
+
+    for (int i = 0; i < m->connector_count; i++) {
+        const Connector *c = &m->connectors[i];
+        if (!connector_is_plottable(c)) continue;
+
+        Uint8 cr, cg, cb;
+        render_trace_color(i, &cr, &cg, &cb);
+        /* x at full strength, y in a dimmer shade of the same hue: one glance
+         * ties both curves to the same dot in the canvas. */
+        Uint8 dr = (Uint8)(cr * 0.55), dg = (Uint8)(cg * 0.55), db = (Uint8)(cb * 0.55);
+
+        Vec2 prev_x = { 0, 0 }, prev_y = { 0, 0 };
+        for (int k = 0; k < c->path_count; k++) {
+            double px = plot_x + plot_w * (c->path_time[k] - t_min) / t_span;
+            double py_x = plot_y + plot_h * (v_max - c->path[k].x) / v_span;
+            double py_y = plot_y + plot_h * (v_max - c->path[k].y) / v_span;
+            Vec2 cur_x = { px, py_x }, cur_y = { px, py_y };
+            if (k > 0) {
+                render_line(ren, prev_x, cur_x, cr, cg, cb, 255);
+                render_line(ren, prev_y, cur_y, dr, dg, db, 255);
+            }
+            prev_x = cur_x;
+            prev_y = cur_y;
+        }
+
+        /* Label each curve where it ends, instead of a separate legend box. */
+        render_text(ren, (Vec2){ prev_x.x + 4.0, prev_x.y - 3.0 }, PLOT_LABEL_HEIGHT, "X", cr, cg, cb, 255);
+        render_text(ren, (Vec2){ prev_y.x + 4.0, prev_y.y - 3.0 }, PLOT_LABEL_HEIGHT, "Y", dr, dg, db, 255);
+    }
+}

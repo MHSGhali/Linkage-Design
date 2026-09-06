@@ -5,10 +5,73 @@
 #include <string.h>
 #include "linalg.h"
 
+/* Two kinds of constraint share one least-squares problem.
+ *
+ * RES_PAIR is the original: a squared-distance residual between two
+ * connectors, in units of length^2. RES_AXIS keeps a cam's airborne follower
+ * on its guide axis, and is naturally linear -- a perpendicular offset, in
+ * units of length. Mixing the two unscaled would be a mistake: the single
+ * Levenberg damping term is scaled by the largest diagonal of JtJ across the
+ * whole problem, so a residual an order of magnitude smaller in its natural
+ * units would simply be ignored. RES_AXIS is therefore multiplied by a
+ * characteristic length of the mechanism, putting both kinds in length^2. */
+typedef enum { RES_PAIR, RES_AXIS } ResidualKind;
+
 typedef struct {
-    int ci, cj;
-    double rest;
+    ResidualKind kind;
+    int ci, cj;        /* RES_PAIR: both connectors. RES_AXIS: ci only. */
+    double rest;       /* RES_PAIR */
+    Vec2 axis_point;   /* RES_AXIS: a point on the axis (the cam centre) */
+    Vec2 axis_normal;  /* RES_AXIS: unit normal to the axis */
+    double scale;      /* RES_AXIS: characteristic length */
 } Residual;
+
+/* Largest rest distance anywhere in the mechanism -- the natural length scale
+ * for making the two residual kinds dimensionally comparable. */
+static double characteristic_length(const Mechanism *m) {
+    double best = 0.0;
+    for (int li = 0; li < m->link_count; li++) {
+        const Link *l = &m->links[li];
+        if (!l->alive) continue;
+        int k = l->connector_count;
+        for (int i = 0; i < k; i++) {
+            for (int j = i + 1; j < k; j++) {
+                double d = l->rest_dist[mechanism_pair_index(i, j, k)];
+                if (d > best) best = d;
+            }
+        }
+    }
+    for (int ci = 0; ci < m->cam_count; ci++) {
+        const Cam *c = &m->cams[ci];
+        if (c->alive && c->base_radius + c->lift > best) best = c->base_radius + c->lift;
+    }
+    return (best > 1e-9) ? best : 1.0;
+}
+
+/* The cam's follower axis: a line through the cam's CURRENT centre along the
+ * direction frozen at run start. */
+static Vec2 cam_center_pos(const Mechanism *m, const Cam *c) {
+    return m->connectors[c->center_connector_id].pos;
+}
+
+static bool cam_is_usable(const Mechanism *m, const Cam *c) {
+    if (!c->alive) return false;
+    if (c->center_connector_id < 0 || c->center_connector_id >= m->connector_count) return false;
+    if (c->follower_connector_id < 0 || c->follower_connector_id >= m->connector_count) return false;
+    return m->connectors[c->center_connector_id].alive && m->connectors[c->follower_connector_id].alive;
+}
+
+/* How far along its axis the follower currently sits, measured from the cam
+ * centre. This is exactly the pitch radius whenever the two are touching. */
+static double follower_axis_position(const Mechanism *m, const Cam *c) {
+    Vec2 d = vec2_sub(m->connectors[c->follower_connector_id].pos, cam_center_pos(m, c));
+    return vec2_dot(d, c->axis_dir);
+}
+
+/* The cam-local angle the follower axis currently points down. */
+static double follower_local_angle(const Mechanism *m, const Cam *c, int cam_id) {
+    return atan2(c->axis_dir.y, c->axis_dir.x) - mechanism_cam_angle(m, cam_id);
+}
 
 SolverParams solver_default_params(void) {
     SolverParams p;
@@ -54,6 +117,42 @@ void solver_freeze(Mechanism *m) {
             l->accumulated_angle_rad = 0.0;
         }
     }
+
+    for (int ci = 0; ci < m->cam_count; ci++) {
+        Cam *c = &m->cams[ci];
+        if (!cam_is_usable(m, c)) continue;
+        if (c->body_link_id < 0 || c->body_link_id >= m->link_count) continue;
+        const Link *l = &m->links[c->body_link_id];
+        Vec2 centre = m->connectors[c->center_connector_id].pos;
+
+        /* Read the cam's rotation off whichever of its body link's connectors
+         * sits farthest from the centre -- the longest lever gives the least
+         * noisy angle. */
+        int ref = -1;
+        double best = 0.0;
+        for (int i = 0; i < l->connector_count; i++) {
+            int cid = l->connector_ids[i];
+            if (cid == c->center_connector_id) continue;
+            double d = vec2_dist(m->connectors[cid].pos, centre);
+            if (d > best) { best = d; ref = cid; }
+        }
+        c->ref_connector_id = ref;
+        if (ref >= 0) {
+            Vec2 d = vec2_sub(m->connectors[ref].pos, centre);
+            c->frozen_ref_angle = atan2(d.y, d.x);
+        } else {
+            c->frozen_ref_angle = 0.0;
+        }
+
+        /* The follower axis is radial: the line through the centre and the
+         * follower's authored position. */
+        Vec2 f = vec2_sub(m->connectors[c->follower_connector_id].pos, centre);
+        double flen = vec2_len(f);
+        c->axis_origin = centre;
+        if (flen > 1e-9) c->axis_dir = vec2_scale(f, 1.0 / flen);
+        c->last_angle = 0.0;
+        c->in_contact = false;
+    }
 }
 
 static void pose_driven_links(Mechanism *m) {
@@ -69,7 +168,9 @@ static void pose_driven_links(Mechanism *m) {
     }
 }
 
-static bool connector_is_fixed(const Mechanism *m, int cid) {
+/* Grounded, or carried rigidly by a motor -- fixed no matter what else is
+ * going on, including for force integration. */
+static bool connector_is_anchored_or_driven(const Mechanism *m, int cid) {
     if (m->connectors[cid].is_anchor) return true;
     for (int li = 0; li < m->link_count; li++) {
         const Link *l = &m->links[li];
@@ -79,6 +180,68 @@ static bool connector_is_fixed(const Mechanism *m, int cid) {
         }
     }
     return false;
+}
+
+static bool connector_is_fixed(const Mechanism *m, int cid) {
+    if (connector_is_anchored_or_driven(m, cid)) return true;
+    /* A follower resting on its cam has its position dictated by the profile,
+     * exactly like a driven link's connector, so the rest of the mechanism
+     * must solve around it. One that has lifted off is free again. */
+    for (int ci = 0; ci < m->cam_count; ci++) {
+        const Cam *c = &m->cams[ci];
+        if (c->alive && c->in_contact && c->follower_connector_id == cid) return true;
+    }
+    return false;
+}
+
+/* Decides, for this frame, whether each follower is touching its cam, and if
+ * so places it on the profile.
+ *
+ * Contact is one-sided: the cam can push the follower out but never pull it
+ * back, so a profile falling away faster than the return spring can push the
+ * follower down leaves it airborne. That is real cam float, and it is why
+ * this is resolved by a test rather than by a bilateral constraint.
+ *
+ * Call after the motor angles have advanced and the driven links have been
+ * posed, but before the Gauss-Newton solve. */
+static void resolve_cam_contact(Mechanism *m) {
+    for (int ci = 0; ci < m->cam_count; ci++) {
+        Cam *c = &m->cams[ci];
+        if (!cam_is_usable(m, c)) { if (c->alive) c->in_contact = false; continue; }
+
+        double theta = mechanism_cam_angle(m, ci);
+        double phi = follower_local_angle(m, c, ci);
+        double s_min = cam_pitch_radius(c, phi);
+        double s = follower_axis_position(m, c);
+
+        if (s < s_min) {
+            Vec2 centre = cam_center_pos(m, c);
+            Vec2 new_pos = vec2_add(centre, vec2_scale(c->axis_dir, s_min));
+
+            /* Hand the follower the surface's own velocity rather than
+             * letting Verlet infer one from a snapped position -- otherwise
+             * every re-contact injects a spurious impulse and the follower
+             * chatters. phi runs backwards as the cam turns forwards, hence
+             * the sign.
+             *
+             * The cam angle comes from an atan2 and so wraps by a full turn
+             * once per revolution. Taken literally that reads as the cam
+             * having spun 360 degrees in a single frame, which would fling
+             * the follower off; take the shorter way round instead. */
+            double dtheta = theta - c->last_angle;
+            while (dtheta > M_PI) dtheta -= 2.0 * M_PI;
+            while (dtheta < -M_PI) dtheta += 2.0 * M_PI;
+            double ds = -cam_pitch_radius_deriv(c, phi) * dtheta;
+
+            Connector *f = &m->connectors[c->follower_connector_id];
+            f->prev_pos = vec2_sub(new_pos, vec2_scale(c->axis_dir, ds));
+            f->pos = new_pos;
+            c->in_contact = true;
+        } else {
+            c->in_contact = false;
+        }
+        c->last_angle = theta;
+    }
 }
 
 static Vec2 get_pos(const Mechanism *m, const int *free_index, const double *xvec, int cid) {
@@ -91,10 +254,16 @@ static double eval_residuals(const Mechanism *m, const int *free_index, const do
                               const Residual *res_list, int nres, double *r_out) {
     double cost = 0.0;
     for (int k = 0; k < nres; k++) {
-        Vec2 pi = get_pos(m, free_index, xvec, res_list[k].ci);
-        Vec2 pj = get_pos(m, free_index, xvec, res_list[k].cj);
-        double dx = pi.x - pj.x, dy = pi.y - pj.y;
-        double rr = dx * dx + dy * dy - res_list[k].rest * res_list[k].rest;
+        double rr;
+        if (res_list[k].kind == RES_AXIS) {
+            Vec2 p = get_pos(m, free_index, xvec, res_list[k].ci);
+            rr = vec2_dot(vec2_sub(p, res_list[k].axis_point), res_list[k].axis_normal) * res_list[k].scale;
+        } else {
+            Vec2 pi = get_pos(m, free_index, xvec, res_list[k].ci);
+            Vec2 pj = get_pos(m, free_index, xvec, res_list[k].cj);
+            double dx = pi.x - pj.x, dy = pi.y - pj.y;
+            rr = dx * dx + dy * dy - res_list[k].rest * res_list[k].rest;
+        }
         r_out[k] = rr;
         cost += rr * rr;
     }
@@ -105,6 +274,14 @@ static void build_jacobian(const Mechanism *m, const int *free_index, const doub
                             const Residual *res_list, int nres, int n, double *J) {
     memset(J, 0, (size_t)nres * (size_t)n * sizeof(double));
     for (int k = 0; k < nres; k++) {
+        if (res_list[k].kind == RES_AXIS) {
+            int ci = res_list[k].ci;
+            if (free_index[ci] >= 0) {
+                J[k * n + 2 * free_index[ci]] = res_list[k].axis_normal.x * res_list[k].scale;
+                J[k * n + 2 * free_index[ci] + 1] = res_list[k].axis_normal.y * res_list[k].scale;
+            }
+            continue;
+        }
         int ci = res_list[k].ci, cj = res_list[k].cj;
         Vec2 pi = get_pos(m, free_index, xvec, ci);
         Vec2 pj = get_pos(m, free_index, xvec, cj);
@@ -155,12 +332,35 @@ static bool solve_pass(Mechanism *m, SolverParams params, bool enforce_variable_
                         cap *= 2;
                         res_list = realloc(res_list, (size_t)cap * sizeof(Residual));
                     }
+                    res_list[nres].kind = RES_PAIR;
                     res_list[nres].ci = ci;
                     res_list[nres].cj = cj;
                     res_list[nres].rest = l->rest_dist[mechanism_pair_index(i, j, k)];
                     nres++;
                 }
             }
+        }
+
+        /* An airborne follower still slides on its guide axis. (In contact it
+         * is a fixed connector, so there is nothing to constrain.) */
+        double scale = characteristic_length(m);
+        for (int ci = 0; ci < m->cam_count; ci++) {
+            const Cam *c = &m->cams[ci];
+            if (!cam_is_usable(m, c)) continue;
+            int fid = c->follower_connector_id;
+            if (free_index[fid] < 0) continue;
+            if (nres >= cap) {
+                cap *= 2;
+                res_list = realloc(res_list, (size_t)cap * sizeof(Residual));
+            }
+            res_list[nres].kind = RES_AXIS;
+            res_list[nres].ci = fid;
+            res_list[nres].cj = fid;
+            res_list[nres].rest = 0.0;
+            res_list[nres].axis_point = cam_center_pos(m, c);
+            res_list[nres].axis_normal = vec2_perp(c->axis_dir);
+            res_list[nres].scale = scale;
+            nres++;
         }
 
         if (nres > 0) {
@@ -291,6 +491,18 @@ static bool has_length_violation(const Mechanism *m, double abs_tol, double rel_
             }
         }
     }
+
+    /* Cam contact is one-sided and so can never bind, but the follower's
+     * guide axis is a hard constraint like any other: if the linkage drags
+     * the follower off its axis, that is a genuine lock-up. */
+    for (int ci = 0; ci < m->cam_count; ci++) {
+        const Cam *c = &m->cams[ci];
+        if (!cam_is_usable(m, c)) continue;
+        Vec2 d = vec2_sub(m->connectors[c->follower_connector_id].pos, cam_center_pos(m, c));
+        double off_axis = fabs(vec2_dot(d, vec2_perp(c->axis_dir)));
+        double allowed = fmax(abs_tol, rel_tol * (c->base_radius + c->lift));
+        if (off_axis > allowed) return true;
+    }
     return false;
 }
 
@@ -340,6 +552,13 @@ bool solver_solve_at_current_angle(Mechanism *m, SolverParams params) {
 
 #define GRAVITY_VELOCITY_DAMPING 0.98
 
+static bool has_live_cam(const Mechanism *m) {
+    for (int ci = 0; ci < m->cam_count; ci++) {
+        if (m->cams[ci].alive) return true;
+    }
+    return false;
+}
+
 bool solver_advance(Mechanism *m, double dt, SolverParams params) {
     for (int li = 0; li < m->link_count; li++) {
         Link *l = &m->links[li];
@@ -347,10 +566,41 @@ bool solver_advance(Mechanism *m, double dt, SolverParams params) {
         l->accumulated_angle_rad += l->motor_speed_deg_s * (M_PI / 180.0) * dt;
     }
 
-    if (params.gravity.x != 0.0 || params.gravity.y != 0.0) {
+    /* Pose the driven links now, before contact is resolved, so each cam's
+     * rotation already reflects this frame. solve_pass poses them again;
+     * doing so twice is harmless because the pose depends only on the
+     * accumulated angle. */
+    pose_driven_links(m);
+
+    bool gravity_on = (params.gravity.x != 0.0 || params.gravity.y != 0.0);
+    if (gravity_on || has_live_cam(m)) {
+        /* External accelerations: gravity on everything, plus each cam's
+         * return spring on its own follower. The spring is what makes
+         * one-sided contact meaningful -- it is the only thing pressing the
+         * follower back onto the profile once the cam stops pushing. */
+        Vec2 *accel = malloc((size_t)m->connector_count * sizeof(Vec2));
+        for (int i = 0; i < m->connector_count; i++) accel[i] = params.gravity;
+
+        for (int ci = 0; ci < m->cam_count; ci++) {
+            const Cam *c = &m->cams[ci];
+            if (!cam_is_usable(m, c)) continue;
+            double s = follower_axis_position(m, c);
+            /* Preloaded: the rest position sits inside the base circle, so
+             * the spring always presses inward, never lifts. */
+            double s0 = c->base_radius - c->spring_preload;
+            accel[c->follower_connector_id] =
+                vec2_add(accel[c->follower_connector_id],
+                          vec2_scale(c->axis_dir, -c->spring_k * (s - s0)));
+        }
+
         for (int i = 0; i < m->connector_count; i++) {
             Connector *c = &m->connectors[i];
-            if (!c->alive || connector_is_fixed(m, i)) continue;
+            /* Deliberately NOT connector_is_fixed: a follower that was in
+             * contact last frame still gets integrated, so that if the cam
+             * has fallen away from under it this frame it is already moving.
+             * resolve_cam_contact below snaps it back if it is still
+             * touching. */
+            if (!c->alive || connector_is_anchored_or_driven(m, i)) continue;
             /* Verlet integration: (pos - prev_pos) is an implicit velocity
              * estimate, so no separate velocity field is needed. The
              * resulting position is just a seed for solver_solve_at_current_angle's
@@ -358,11 +608,14 @@ bool solver_advance(Mechanism *m, double dt, SolverParams params) {
              * whatever rigid-link constraints apply to it. */
             Vec2 velocity = vec2_sub(c->pos, c->prev_pos);
             Vec2 new_pos = vec2_add(vec2_add(c->pos, vec2_scale(velocity, GRAVITY_VELOCITY_DAMPING)),
-                                     vec2_scale(params.gravity, dt * dt));
+                                     vec2_scale(accel[i], dt * dt));
             c->prev_pos = c->pos;
             c->pos = new_pos;
         }
+        free(accel);
     }
+
+    resolve_cam_contact(m);
 
     return solver_solve_at_current_angle(m, params);
 }
