@@ -233,12 +233,16 @@ int main(void) {
     printf("    Cmd/Ctrl+Z: undo\n");
     printf("  Scroll wheel: zoom in/out (centered on cursor)\n");
     printf("  C: clear all traces (works while running too)\n");
-    printf("  G: toggle gravity (pulls unconstrained connectors down; rigid links stay rigid)\n");
+    printf("  G: toggle gravity (on automatically when the mechanism has no motor)\n");
     printf("  R: run/stop simulation\n");
 
     Mechanism mech;
     mechanism_init(&mech);
     SolverParams params = solver_default_params();
+    /* Gravity is applied automatically to a mechanism with no motor -- there
+     * would otherwise be nothing to make it move at all. Once the user
+     * presses G, their choice wins from then on. */
+    bool gravity_set_by_user = false;
 
     Mechanism undo_stack[UNDO_MAX];
     int undo_count = 0;
@@ -251,6 +255,13 @@ int main(void) {
 
     Vec2 *pre_run_positions = NULL;
     int pre_run_count = 0;
+
+    /* Start-of-frame snapshot, so a step that binds up can be rolled back
+     * rather than leaving fixed-length links visibly stretched. */
+    Vec2 *frame_positions = NULL;
+    double *frame_angles = NULL;
+    int frame_link_count = 0;
+    bool jammed = false;
 
     Vec2 view_pan = { 0, 0 };
     double view_zoom = 1.0;
@@ -266,6 +277,7 @@ int main(void) {
             } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_c) {
                 mechanism_clear_traces(&mech); /* works in both edit and running mode */
             } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_g) {
+                gravity_set_by_user = true;
                 if (params.gravity.x == 0.0 && params.gravity.y == 0.0) {
                     params.gravity = (Vec2){ 0.0, DEFAULT_GRAVITY_MAGNITUDE };
                     printf("Gravity ON.\n");
@@ -367,6 +379,19 @@ int main(void) {
                     pre_run_count = mech.connector_count;
                     pre_run_positions = malloc((size_t)pre_run_count * sizeof(Vec2));
                     for (int i = 0; i < pre_run_count; i++) pre_run_positions[i] = mech.connectors[i].pos;
+
+                    free(frame_positions);
+                    frame_positions = malloc((size_t)pre_run_count * sizeof(Vec2));
+                    free(frame_angles);
+                    frame_link_count = mech.link_count;
+                    frame_angles = (frame_link_count > 0) ? malloc((size_t)frame_link_count * sizeof(double)) : NULL;
+                    jammed = false;
+
+                    if (!gravity_set_by_user && !mechanism_has_driven_link(&mech)) {
+                        printf("No motor in this mechanism -- running it under gravity. "
+                                "Press G to control gravity yourself.\n");
+                    }
+
                     solver_freeze(&mech);
                     mechanism_clear_traces(&mech);
                     drag_mode = DRAG_NONE;
@@ -380,6 +405,12 @@ int main(void) {
                     free(pre_run_positions);
                     pre_run_positions = NULL;
                     pre_run_count = 0;
+                    free(frame_positions);
+                    frame_positions = NULL;
+                    free(frame_angles);
+                    frame_angles = NULL;
+                    frame_link_count = 0;
+                    jammed = false;
                     state = APP_EDIT;
                 }
             } else if (ev.type == SDL_MOUSEWHEEL) {
@@ -466,10 +497,30 @@ int main(void) {
         double dt = (double)(now - last_ticks) / 1000.0;
         last_ticks = now;
 
-        if (state == APP_RUNNING) {
+        if (state == APP_RUNNING && !jammed) {
             if (dt > 0.05) dt = 0.05; /* clamp huge stalls (e.g. window drag) */
-            solver_advance(&mech, dt, params);
-            mechanism_trace_step(&mech);
+
+            for (int i = 0; i < pre_run_count; i++) frame_positions[i] = mech.connectors[i].pos;
+            for (int i = 0; i < frame_link_count; i++) frame_angles[i] = mech.links[i].accumulated_angle_rad;
+
+            SolverParams frame_params = params;
+            if (!gravity_set_by_user && !mechanism_has_driven_link(&mech)) {
+                frame_params.gravity = (Vec2){ 0.0, DEFAULT_GRAVITY_MAGNITUDE };
+            }
+            solver_advance(&mech, dt, frame_params);
+
+            if (solver_has_length_violation(&mech, params.length_tol_abs, params.length_tol_rel)) {
+                /* This step would only be reachable by stretching a
+                 * fixed-length link, so roll it back entirely and stop:
+                 * a rigid link is rigid, so the mechanism binds instead. */
+                for (int i = 0; i < pre_run_count; i++) mech.connectors[i].pos = frame_positions[i];
+                for (int i = 0; i < frame_link_count; i++) mech.links[i].accumulated_angle_rad = frame_angles[i];
+                jammed = true;
+                printf("Mechanism jammed: a fixed-length link would have to change length here. "
+                        "Press R to stop, then adjust the geometry (or press V to let a link's length vary).\n");
+            } else {
+                mechanism_trace_step(&mech);
+            }
         }
 
         SDL_SetRenderDrawColor(ren, 20, 20, 20, 255);
@@ -480,6 +531,8 @@ int main(void) {
     }
 
     free(pre_run_positions);
+    free(frame_positions);
+    free(frame_angles);
     mechanism_free(&mech);
     for (int i = 0; i < undo_count; i++) mechanism_free(&undo_stack[i]);
     SDL_DestroyRenderer(ren);

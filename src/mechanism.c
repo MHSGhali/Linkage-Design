@@ -179,6 +179,13 @@ void mechanism_set_rigid(Mechanism *m, int link_id, bool rigid) {
     l->rigid = rigid;
 }
 
+bool mechanism_has_driven_link(const Mechanism *m) {
+    for (int li = 0; li < m->link_count; li++) {
+        if (m->links[li].alive && m->links[li].is_driven) return true;
+    }
+    return false;
+}
+
 void mechanism_set_anchor(Mechanism *m, int connector_id, bool is_anchor) {
     if (connector_id < 0 || connector_id >= m->connector_count) return;
     if (!m->connectors[connector_id].alive) return;

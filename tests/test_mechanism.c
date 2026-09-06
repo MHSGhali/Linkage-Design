@@ -131,17 +131,16 @@ static void test_ternary_link_rigidity(void) {
     mechanism_free(&m);
 }
 
-static void test_damping_floor_prevents_singular_failure(void) {
+static void test_dead_center_singularity_is_solved(void) {
     /* Same crank-rocker family as test 1, driven to the exact fully-extended
      * dead center (theta=180deg): A=(-1,0), O4=(4,0). At any point with
      * B.y==0 (not just the true root B=(2,0)), both the coupler and rocker
      * distance-constraint gradients point purely along x -- the Jacobian's
      * y-column is EXACTLY zero there, deterministically, regardless of
      * floating-point specifics. Seeding B at (1.5,0) (on that degenerate
-     * line, but not yet at the true root) makes the bug reproduce
-     * deterministically: with multiplicative-only damping, lambda*0 stays 0
-     * at any lambda, so the y-unknown's row of the normal equations is
-     * exactly singular on every attempt. */
+     * line, but not yet at the true root) exercises that singular direction
+     * head-on: damping has to restrain it, or the solve either divides
+     * through a singular matrix or proposes a runaway step along it. */
     Mechanism m;
     int o2, o4, a, b;
     build_four_bar(&m, &o2, &o4, &a, &b);
@@ -149,40 +148,85 @@ static void test_damping_floor_prevents_singular_failure(void) {
     solver_freeze(&m);
     m.connectors[b].pos = (Vec2){ 1.5, 0.0 };
     m.links[0].accumulated_angle_rad = M_PI;
-    SolverParams good_params = solver_default_params();
-    bool converged = solver_solve_at_current_angle(&m, good_params);
+    SolverParams params = solver_default_params();
+    solver_solve_at_current_angle(&m, params);
 
-    /* B's tolerance is deliberately loose: exactly at this dead center the
-     * problem is genuinely singular in the y-direction (see comment above),
-     * so even the tiny floating-point inexactness of M_PI (sin(M_PI) is
-     * ~1.2e-16, not exactly 0) gets amplified by division against the tiny
-     * damping_floor pivot into a small but real drift in B.y over the
-     * iterations -- a real property of solving near a singularity, not a
-     * logic bug. */
-    check_true("dead-center solve converges with damping floor", converged);
     check_close("dead-center A.x", m.connectors[a].pos.x, -1.0, 1e-6);
     check_close("dead-center A.y", m.connectors[a].pos.y, 0.0, 1e-6);
     check_close("dead-center B.x", m.connectors[b].pos.x, 2.0, 1e-3);
     check_close("dead-center B.y", m.connectors[b].pos.y, 0.0, 1e-3);
+    check_true("dead-center solve leaves no length violation",
+               !solver_has_length_violation(&m, params.length_tol_abs, params.length_tol_rel));
 
     mechanism_free(&m);
+}
 
-    /* Same scenario, but with the damping floor disabled (regression-locks
-     * the exact bug class found in the earlier four-bar synthesis tool: a
-     * zero-sensitivity Jacobian column leaves multiplicative-only damping
-     * singular no matter how far lambda is raised). */
-    Mechanism m2;
-    int o2b, o4b, ab, bb;
-    build_four_bar(&m2, &o2b, &o4b, &ab, &bb);
-    solver_freeze(&m2);
-    m2.connectors[bb].pos = (Vec2){ 1.5, 0.0 };
-    m2.links[0].accumulated_angle_rad = M_PI;
-    SolverParams no_floor_params = good_params;
-    no_floor_params.damping_floor = 0.0;
-    bool converged_no_floor = solver_solve_at_current_angle(&m2, no_floor_params);
-    check_true("dead-center solve fails without damping floor (regression lock)", !converged_no_floor);
+static void test_near_null_direction_does_not_stall_the_solve(void) {
+    /* A pendulum hanging straight down: the bob is directly below its
+     * anchor, so dx==0 and moving sideways changes the rod's length only to
+     * second order. Damping scaled per-diagonal (lambda * JtJ[d][d]) barely
+     * restrains that direction at all, so Gauss-Newton proposes an enormous
+     * sideways step, every step gets rejected, the solve gives up, and the
+     * rod silently stretches further every frame. Damping scaled to the
+     * problem's overall magnitude keeps it in hand. This is the shape of a
+     * motorless mechanism swinging under gravity, so it must stay solid. */
+    Mechanism m;
+    mechanism_init(&m);
+    int o = mechanism_add_connector(&m, (Vec2){ 400, 200 }, true);
+    int bob = mechanism_add_connector(&m, (Vec2){ 400, 400 }, false); /* straight down */
+    int rod[2] = { o, bob };
+    mechanism_add_link(&m, rod, 2);
 
-    mechanism_free(&m2);
+    solver_freeze(&m); /* rest length 200 */
+    SolverParams params = solver_default_params();
+
+    /* Displace it the way a fast-moving gravity step would: mostly
+     * sideways, dropping it off the constraint circle. */
+    m.connectors[bob].pos = (Vec2){ 388.0, 401.0 };
+    solver_solve_at_current_angle(&m, params);
+
+    check_close("the rod is pulled back to its rest length",
+                vec2_dist(m.connectors[o].pos, m.connectors[bob].pos), 200.0, 1e-6);
+    check_true("no length violation is reported after the correction",
+               !solver_has_length_violation(&m, params.length_tol_abs, params.length_tol_rel));
+
+    mechanism_free(&m);
+}
+
+static void test_motorless_mechanism_falls_under_gravity(void) {
+    /* The whole point of the no-motor case: with gravity on and nothing
+     * driving it, a pendulum must actually swing, and its rod must stay
+     * exactly rigid the entire time -- including through the bottom of the
+     * swing, where it moves fastest and passes through the singular
+     * straight-down configuration. */
+    Mechanism m;
+    mechanism_init(&m);
+    int o = mechanism_add_connector(&m, (Vec2){ 400, 200 }, true);
+    int bob = mechanism_add_connector(&m, (Vec2){ 600, 200 }, false);
+    int rod[2] = { o, bob };
+    mechanism_add_link(&m, rod, 2);
+    check_true("mechanism reports having no driven link", !mechanism_has_driven_link(&m));
+
+    solver_freeze(&m);
+    SolverParams params = solver_default_params();
+    params.gravity = (Vec2){ 0.0, 400.0 };
+
+    double start_y = m.connectors[bob].pos.y;
+    bool ever_violated = false;
+    for (int f = 0; f < 600; f++) {
+        solver_advance(&m, 1.0 / 60.0, params);
+        if (solver_has_length_violation(&m, params.length_tol_abs, params.length_tol_rel)) {
+            ever_violated = true;
+            break;
+        }
+    }
+
+    check_true("a motorless pendulum never spuriously binds while swinging", !ever_violated);
+    check_true("gravity actually swung the bob downward", m.connectors[bob].pos.y > start_y + 50.0);
+    check_close("the rod held its length for the whole swing",
+                vec2_dist(m.connectors[o].pos, m.connectors[bob].pos), 200.0, 1e-3);
+
+    mechanism_free(&m);
 }
 
 static void test_connector_tracing(void) {
@@ -349,7 +393,11 @@ static void test_gravity_preserves_rigid_constraint(void) {
     mechanism_free(&m);
 }
 
-static void test_variable_length_link_is_not_enforced(void) {
+static void test_variable_link_holds_its_length_when_nothing_forces_it(void) {
+    /* A variable-length link is not a free-floating connection: it should
+     * still hold its rest length whenever the rest of the mechanism lets
+     * it, and only give way when the geometry leaves no choice. Here
+     * nothing else touches A, so the link has no excuse to be stretched. */
     Mechanism m;
     mechanism_init(&m);
     int o = mechanism_add_connector(&m, (Vec2){ 0, 0 }, true);
@@ -361,16 +409,52 @@ static void test_variable_length_link_is_not_enforced(void) {
     mechanism_set_rigid(&m, lid, false);
     check_true("mechanism_set_rigid can turn rigidity off", !m.links[lid].rigid);
 
-    solver_freeze(&m); /* rest_dist still recomputed (=50) but unused while non-rigid */
+    solver_freeze(&m); /* rest = 50 */
     SolverParams params = solver_default_params();
 
     /* Simulate having dragged A far away in edit mode, then run one frame. */
     m.connectors[a].pos = (Vec2){ 500, 0 };
-    bool converged = solver_solve_at_current_angle(&m, params);
+    solver_solve_at_current_angle(&m, params);
 
-    check_true("solve still reports converged (nothing left to enforce)", converged);
-    check_close("non-rigid link's distance is left wherever it was, not restored",
-                vec2_dist(m.connectors[o].pos, m.connectors[a].pos), 500.0, 1e-6);
+    check_close("a variable link still pulls back to its rest length when unforced",
+                vec2_dist(m.connectors[o].pos, m.connectors[a].pos), 50.0, 1e-3);
+
+    mechanism_free(&m);
+}
+
+static void test_variable_link_stretches_only_as_far_as_forced(void) {
+    /* O2 and O4 anchored 400 apart. B is held exactly 150 from O4 by a
+     * RIGID link, so B can never come closer than 250 to O2 -- yet the
+     * VARIABLE link joining O2 to B only "wants" to be 100 long. It must
+     * therefore stretch, but only to 250: the least the rigid geometry
+     * leaves it. */
+    Mechanism m;
+    mechanism_init(&m);
+    int o2 = mechanism_add_connector(&m, (Vec2){ 0, 0 }, true);
+    int o4 = mechanism_add_connector(&m, (Vec2){ 400, 0 }, true);
+    int b = mechanism_add_connector(&m, (Vec2){ 250, 0 }, false);
+    int rigid_link[2] = { b, o4 };
+    int variable_link[2] = { o2, b };
+    int rigid_id = mechanism_add_link(&m, rigid_link, 2);
+    int variable_id = mechanism_add_link(&m, variable_link, 2);
+    mechanism_set_rigid(&m, variable_id, false);
+
+    solver_freeze(&m);
+    /* Freeze captures rest lengths from the current layout (150 and 250);
+     * shorten what the variable link wants so that it is genuinely forced
+     * to stretch. */
+    m.links[variable_id].rest_dist[0] = 100.0;
+
+    SolverParams params = solver_default_params();
+    solver_solve_at_current_angle(&m, params);
+
+    check_close("the rigid link is held exactly at its rest length",
+                vec2_dist(m.connectors[b].pos, m.connectors[o4].pos), 150.0, 1e-3);
+    check_close("the variable link stretches only as far as the rigid geometry forces",
+                vec2_dist(m.connectors[o2].pos, m.connectors[b].pos), 250.0, 1e-3);
+    check_true("a forced variable link does not count as the mechanism binding",
+               !solver_has_length_violation(&m, params.length_tol_abs, params.length_tol_rel));
+    (void)rigid_id;
 
     mechanism_free(&m);
 }
@@ -385,15 +469,13 @@ static void test_toggling_back_to_rigid_reenforces_constraint(void) {
 
     mechanism_set_rigid(&m, lid, false);
     solver_freeze(&m);
-    m.connectors[a].pos = (Vec2){ 50, 500 };
     SolverParams params = solver_default_params();
-    solver_solve_at_current_angle(&m, params);
-    check_close("moved freely while non-rigid", m.connectors[a].pos.y, 500.0, 1e-6);
 
-    /* Toggling back to rigid and re-freezing captures whatever the CURRENT
-     * (stretched) distance is as the new fixed length -- consistent with
-     * how solver_freeze always recomputes rest_dist from current positions. */
+    /* Re-freezing after toggling back to rigid captures whatever the
+     * CURRENT distance is as the new fixed length -- consistent with how
+     * solver_freeze always recomputes rest_dist from current positions. */
     mechanism_set_rigid(&m, lid, true);
+    m.connectors[a].pos = (Vec2){ 50, 500 };
     solver_freeze(&m);
     double expected_len = vec2_dist(m.connectors[o].pos, m.connectors[a].pos);
     m.connectors[a].pos = vec2_add(m.connectors[a].pos, (Vec2){ 10, 10 });
@@ -404,17 +486,102 @@ static void test_toggling_back_to_rigid_reenforces_constraint(void) {
     mechanism_free(&m);
 }
 
+static void test_jam_detection(void) {
+    /* A four-bar that binds as soon as the crank turns: ground 400, crank
+     * 100, coupler 150, rocker 150. B must be 150 from A and 150 from O4,
+     * which needs |A - O4| <= 300. At crank angle 0 that distance is
+     * exactly 300 (fully extended, just assemblable); at ANY other angle A
+     * swings away from O4 and the distance exceeds 300, so the loop cannot
+     * close without stretching a fixed-length link. */
+    Mechanism m;
+    mechanism_init(&m);
+    int o2 = mechanism_add_connector(&m, (Vec2){ 0, 0 }, true);
+    int o4 = mechanism_add_connector(&m, (Vec2){ 400, 0 }, true);
+    int a = mechanism_add_connector(&m, (Vec2){ 100, 0 }, false);
+    int b = mechanism_add_connector(&m, (Vec2){ 250, 0 }, false);
+    int crank[2] = { o2, a };
+    int coupler[2] = { a, b };
+    int rocker[2] = { b, o4 };
+    mechanism_add_link(&m, crank, 2);
+    mechanism_add_link(&m, coupler, 2);
+    mechanism_add_link(&m, rocker, 2);
+    mechanism_toggle_driven(&m, 0, 0.0);
+
+    solver_freeze(&m);
+    SolverParams params = solver_default_params();
+
+    solver_solve_at_current_angle(&m, params);
+    check_true("the assemblable starting position reports no violation",
+               !solver_has_length_violation(&m, 0.02, 0.0001));
+
+    /* Now drive it past what the fixed lengths allow. */
+    m.links[0].accumulated_angle_rad = M_PI / 4.0;
+    solver_solve_at_current_angle(&m, params);
+
+    check_true("driving past the linkage's limit is reported as a length violation",
+               solver_has_length_violation(&m, 0.02, 0.0001));
+
+    /* Confirm the report reflects a real stretch, not solver noise: the
+     * coupler and rocker together can't span the gap they're asked to. */
+    double span = vec2_dist(m.connectors[a].pos, m.connectors[o4].pos);
+    check_true("the required span really exceeds coupler + rocker", span > 300.0 + 0.25);
+    double coupler_len = vec2_dist(m.connectors[a].pos, m.connectors[b].pos);
+    double rocker_len = vec2_dist(m.connectors[b].pos, m.connectors[o4].pos);
+    check_true("at least one fixed link is visibly off its rest length",
+               fabs(coupler_len - 150.0) > 0.25 || fabs(rocker_len - 150.0) > 0.25);
+
+    mechanism_free(&m);
+}
+
+static void test_working_mechanism_reports_no_jam(void) {
+    /* The same four-bar as test 1, at a solvable angle: the jam check must
+     * NOT fire, or a perfectly good simulation would freeze. Uses realistic
+     * app-scale coordinates (hundreds of units) to confirm the check is
+     * scale-aware rather than tied to an absolute residual tolerance. */
+    Mechanism m;
+    mechanism_init(&m);
+    int o2 = mechanism_add_connector(&m, (Vec2){ 0, 0 }, true);
+    int o4 = mechanism_add_connector(&m, (Vec2){ 400, 0 }, true);
+    int a = mechanism_add_connector(&m, (Vec2){ 100, 0 }, false);
+    int b = mechanism_add_connector(&m, (Vec2){ 1000.0 / 3.0, 400.0 * sqrt(2.0) / 3.0 }, false);
+    int crank[2] = { o2, a };
+    int coupler[2] = { a, b };
+    int rocker[2] = { b, o4 };
+    mechanism_add_link(&m, crank, 2);
+    mechanism_add_link(&m, coupler, 2);
+    mechanism_add_link(&m, rocker, 2);
+    mechanism_toggle_driven(&m, 0, 0.0);
+
+    solver_freeze(&m);
+    SolverParams params = solver_default_params();
+
+    /* Drive it through a range of angles it can actually reach. */
+    for (int step = 1; step <= 10; step++) {
+        m.links[0].accumulated_angle_rad = (M_PI / 4.0) * ((double)step / 10.0);
+        solver_solve_at_current_angle(&m, params);
+        check_true("a solvable four-bar never reports a length violation",
+                   !solver_has_length_violation(&m, 0.02, 0.0001));
+    }
+
+    mechanism_free(&m);
+}
+
 int main(void) {
     test_four_bar_reduces_to_closed_form();
     test_ternary_link_rigidity();
-    test_damping_floor_prevents_singular_failure();
+    test_dead_center_singularity_is_solved();
+    test_near_null_direction_does_not_stall_the_solve();
+    test_motorless_mechanism_falls_under_gravity();
     test_connector_tracing();
     test_mechanism_clone_is_independent_deep_copy();
     test_export_blender_script();
     test_gravity_moves_free_unconstrained_connector();
     test_gravity_preserves_rigid_constraint();
-    test_variable_length_link_is_not_enforced();
+    test_variable_link_holds_its_length_when_nothing_forces_it();
+    test_variable_link_stretches_only_as_far_as_forced();
     test_toggling_back_to_rigid_reenforces_constraint();
+    test_jam_detection();
+    test_working_mechanism_reports_no_jam();
 
     if (failures == 0) {
         printf("\nAll tests passed.\n");

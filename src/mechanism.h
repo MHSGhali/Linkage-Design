@@ -98,6 +98,10 @@ bool mechanism_toggle_driven(Mechanism *m, int link_id, double default_speed_deg
  * (see the Link.rigid comment above). No-op on an invalid/dead link id. */
 void mechanism_set_rigid(Mechanism *m, int link_id, bool rigid);
 
+/* Whether any live link is currently driven by a motor. A mechanism with
+ * none has nothing making it move on its own. */
+bool mechanism_has_driven_link(const Mechanism *m);
+
 /* Sets/clears whether a connector's position is recorded each simulation
  * frame. Clearing it discards any previously recorded path. No-op on an
  * invalid/dead id. */

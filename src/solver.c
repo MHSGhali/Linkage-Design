@@ -17,6 +17,12 @@ SolverParams solver_default_params(void) {
     p.lambda_init = 1e-3;
     p.damping_floor = 1e-9;
     p.gravity = (Vec2){ 0.0, 0.0 };
+    /* Deliberately tight: a solve that actually converges lands within
+     * ~1e-9 of the rest length, so anything approaching a visible fraction
+     * of a unit means the solver is straining against geometry it cannot
+     * satisfy. */
+    p.length_tol_abs = 0.02;
+    p.length_tol_rel = 0.0001;
     return p;
 }
 
@@ -114,9 +120,10 @@ static void build_jacobian(const Mechanism *m, const int *free_index, const doub
     }
 }
 
-bool solver_solve_at_current_angle(Mechanism *m, SolverParams params) {
-    pose_driven_links(m);
-
+/* One Gauss-Newton solve. `enforce_variable_links` decides whether links
+ * whose length has been toggled variable are held at their rest length
+ * (treated exactly like rigid ones) or left entirely unconstrained. */
+static bool solve_pass(Mechanism *m, SolverParams params, bool enforce_variable_links) {
     int nconn = m->connector_count;
     int *free_index = malloc((size_t)nconn * sizeof(int));
     int num_free = 0;
@@ -135,11 +142,10 @@ bool solver_solve_at_current_angle(Mechanism *m, SolverParams params) {
         Residual *res_list = malloc((size_t)cap * sizeof(Residual));
         for (int li = 0; li < m->link_count; li++) {
             Link *l = &m->links[li];
-            /* Driven links are exactly satisfied by construction; non-rigid
-             * (toggled variable-length) links contribute no distance
-             * constraints at all, leaving their connectors' relative
-             * positions free. */
-            if (!l->alive || l->is_driven || !l->rigid) continue;
+            /* Driven links are exactly satisfied by construction. Variable
+             * links are enforced or not depending on which pass this is. */
+            if (!l->alive || l->is_driven) continue;
+            if (!l->rigid && !enforce_variable_links) continue;
             int k = l->connector_count;
             for (int i = 0; i < k; i++) {
                 for (int j = i + 1; j < k; j++) {
@@ -195,15 +201,24 @@ bool solver_solve_at_current_angle(Mechanism *m, SolverParams params) {
                     rhs[a] = -s;
                 }
 
+                /* Damping is scaled to the whole problem (the largest diagonal
+                 * of JtJ), not to each diagonal entry individually. Per-entry
+                 * (Marquardt) scaling fails badly in a near-null direction:
+                 * a pendulum hanging straight down has dx~0, so the x
+                 * diagonal ~4dx^2 is nearly zero and lambda*4dx^2 damps it
+                 * essentially not at all, letting Gauss-Newton propose an
+                 * enormous sideways step (the direction that changes length
+                 * only to second order). Every such step is rejected, the
+                 * solve gives up, and the link silently stretches. Damping by
+                 * the problem's overall magnitude restrains that direction. */
+                double max_diag = 0.0;
+                for (int d = 0; d < n; d++) max_diag = fmax(max_diag, Mm[d * n + d]);
+                if (max_diag <= 0.0) max_diag = 1.0;
+
                 bool improved = false;
                 for (int sub = 0; sub < 12 && !improved; sub++) {
                     memcpy(Mtmp, Mm, (size_t)n * (size_t)n * sizeof(double));
-                    /* Additive floor alongside multiplicative damping: a free
-                     * connector whose Jacobian column is exactly zero at this
-                     * configuration (e.g. a dead-center singularity) would
-                     * otherwise leave lambda*Mm[d][d]==0 at any lambda, making
-                     * the system singular no matter how far lambda is raised. */
-                    for (int d = 0; d < n; d++) Mtmp[d * n + d] += lambda * Mm[d * n + d] + params.damping_floor;
+                    for (int d = 0; d < n; d++) Mtmp[d * n + d] += lambda * max_diag + params.damping_floor;
                     memcpy(rhs_tmp, rhs, (size_t)n * sizeof(double));
 
                     if (!linalg_solve(Mtmp, rhs_tmp, n, delta)) {
@@ -256,6 +271,71 @@ bool solver_solve_at_current_angle(Mechanism *m, SolverParams params) {
 
     free(free_index);
     return result;
+}
+
+static bool has_length_violation(const Mechanism *m, double abs_tol, double rel_tol, bool include_variable) {
+    for (int li = 0; li < m->link_count; li++) {
+        const Link *l = &m->links[li];
+        /* Driven links are posed rigidly by construction, so they can't bind. */
+        if (!l->alive || l->is_driven) continue;
+        if (!l->rigid && !include_variable) continue;
+
+        int k = l->connector_count;
+        for (int i = 0; i < k; i++) {
+            for (int j = i + 1; j < k; j++) {
+                double rest = l->rest_dist[mechanism_pair_index(i, j, k)];
+                double actual = vec2_dist(m->connectors[l->connector_ids[i]].pos,
+                                           m->connectors[l->connector_ids[j]].pos);
+                double allowed = fmax(abs_tol, rel_tol * rest);
+                if (fabs(actual - rest) > allowed) return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool solver_has_length_violation(const Mechanism *m, double abs_tol, double rel_tol) {
+    return has_length_violation(m, abs_tol, rel_tol, false);
+}
+
+static bool has_variable_link(const Mechanism *m) {
+    for (int li = 0; li < m->link_count; li++) {
+        const Link *l = &m->links[li];
+        if (l->alive && !l->is_driven && !l->rigid) return true;
+    }
+    return false;
+}
+
+bool solver_solve_at_current_angle(Mechanism *m, SolverParams params) {
+    pose_driven_links(m);
+
+    /* With no variable-length links there is nothing to decide. */
+    if (!has_variable_link(m)) return solve_pass(m, params, false);
+
+    /* Otherwise, first try to hold EVERY link at its rest length, variable
+     * ones included: a variable link should only give way when the geometry
+     * genuinely leaves it no choice, not merely because it is allowed to.
+     * If that succeeds, nothing needed to stretch and we keep it. */
+    Vec2 *saved = malloc((size_t)m->connector_count * sizeof(Vec2));
+    for (int i = 0; i < m->connector_count; i++) saved[i] = m->connectors[i].pos;
+
+    /* Judge success by the lengths themselves, not solve_pass's convergence
+     * flag: that flag compares an absolute least-squares cost against a
+     * fixed tolerance, and the residuals are in units of length SQUARED, so
+     * at real coordinate scales it reads "not converged" even for a
+     * perfectly good fit. */
+    solve_pass(m, params, true);
+    if (!has_length_violation(m, params.length_tol_abs, params.length_tol_rel, true)) {
+        free(saved);
+        return true;
+    }
+
+    /* It didn't fit. Restore the frame's warm start and re-solve enforcing
+     * only the genuinely rigid links, letting the variable ones absorb
+     * whatever the rigid geometry demands of them. */
+    for (int i = 0; i < m->connector_count; i++) m->connectors[i].pos = saved[i];
+    free(saved);
+    return solve_pass(m, params, false);
 }
 
 #define GRAVITY_VELOCITY_DAMPING 0.98
