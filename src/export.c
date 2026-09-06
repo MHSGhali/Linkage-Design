@@ -16,18 +16,24 @@
  * flank is smooth, small enough that the script stays readable. */
 #define CAM_EXPORT_SAMPLES 360
 
-/* How long one full revolution of the fastest motor takes, or 0 if nothing
- * is turning. */
+/* How long the mechanism takes to come back round to where it started, or 0
+ * if nothing is turning.
+ *
+ * That is set by the SLOWEST motor, not the fastest: with one motor the two
+ * are the same, but a drawing machine's arms all turn at whole multiples of a
+ * base rate, and it is one turn of the slowest that completes the drawing.
+ * Sampling the fastest instead would export a fraction of the figure. */
 static double driven_period_seconds(const Mechanism *m) {
-    double fastest = 0.0;
+    double slowest = 0.0;
     for (int li = 0; li < m->link_count; li++) {
         const Link *l = &m->links[li];
         if (!l->alive || !l->is_driven) continue;
         double speed = fabs(l->motor_speed_deg_s);
-        if (speed > fastest) fastest = speed;
+        if (speed <= 0.0) continue;
+        if (slowest <= 0.0 || speed < slowest) slowest = speed;
     }
-    if (fastest <= 0.0) return 0.0;
-    return 360.0 / fastest;
+    if (slowest <= 0.0) return 0.0;
+    return 360.0 / slowest;
 }
 
 bool export_blender_script(const Mechanism *m, SolverParams params, const char *filepath) {

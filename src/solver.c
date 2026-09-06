@@ -155,17 +155,48 @@ void solver_freeze(Mechanism *m) {
     }
 }
 
+/* A motor's pivot is usually an anchor, but it need not be: a motor can be
+ * mounted on a part that another motor moves, which is exactly what a chain
+ * of rotating arms is. So the driven links are posed in dependency order --
+ * anchors first, then whatever their motion has now settled -- rather than in
+ * array order, which would pose a child arm from its parent's stale position.
+ *
+ * The frozen offsets are captured relative to each pivot, and each link's
+ * accumulated angle is absolute, so an arm turning at k times the base rate
+ * sweeps k turns per cycle in world terms. That is what makes the chain sum
+ * a Fourier series rather than a nest of relative rotations. */
 static void pose_driven_links(Mechanism *m) {
-    for (int li = 0; li < m->link_count; li++) {
-        Link *l = &m->links[li];
-        if (!l->alive || !l->is_driven) continue;
-        Vec2 pivot_pos = m->connectors[l->pivot_connector_id].pos;
-        for (int i = 0; i < l->connector_count; i++) {
-            int cid = l->connector_ids[i];
-            if (cid == l->pivot_connector_id) continue; /* anchor, never moves */
-            m->connectors[cid].pos = vec2_add(pivot_pos, vec2_rotate(l->frozen_local_offset[i], l->accumulated_angle_rad));
+    if (m->link_count <= 0) return;
+
+    bool *settled = malloc((size_t)(m->connector_count > 0 ? m->connector_count : 1) * sizeof(bool));
+    bool *posed = calloc((size_t)m->link_count, sizeof(bool));
+    for (int i = 0; i < m->connector_count; i++) settled[i] = m->connectors[i].is_anchor;
+
+    bool progress = true;
+    while (progress) {
+        progress = false;
+        for (int li = 0; li < m->link_count; li++) {
+            Link *l = &m->links[li];
+            if (!l->alive || !l->is_driven || posed[li]) continue;
+            int pivot = l->pivot_connector_id;
+            if (pivot < 0 || pivot >= m->connector_count || !settled[pivot]) continue;
+            if (!l->frozen_local_offset) continue;
+
+            Vec2 pivot_pos = m->connectors[pivot].pos;
+            for (int i = 0; i < l->connector_count; i++) {
+                int cid = l->connector_ids[i];
+                if (cid == pivot) continue;
+                m->connectors[cid].pos =
+                    vec2_add(pivot_pos, vec2_rotate(l->frozen_local_offset[i], l->accumulated_angle_rad));
+                settled[cid] = true;
+            }
+            posed[li] = true;
+            progress = true;
         }
     }
+
+    free(posed);
+    free(settled);
 }
 
 /* Grounded, or carried rigidly by a motor -- fixed no matter what else is

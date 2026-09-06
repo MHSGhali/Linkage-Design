@@ -17,6 +17,8 @@ static const ButtonSpec BUTTON_SPECS[] = {
     { UI_LINK,    "LINK",    "L",   false },
     { UI_MOTOR,   "MOTOR",   "M",   false },
     { UI_CAM,     "CAM",     "K",   false },
+    { UI_LINKAGE, "LINKAGE", "P",   false },
+    { UI_ARMS,    "ARMS",    "B",   false },
     { UI_VARY,    "VARY",    "V",   false },
     { UI_TRACE,   "TRACE",   "T",   false },
     { UI_DELETE,  "DELETE",  "DEL", false },
@@ -94,6 +96,16 @@ void ui_apply_state(Toolbar *t, UiState s) {
              * while editing, and lit while it is armed. */
             b->enabled = s.editing;
             b->active = s.drawing_cam;
+            break;
+        case UI_LINKAGE:
+            /* Both path tools are drawing tools, not operations on a
+             * selection, so they need nothing selected. Lit while armed. */
+            b->enabled = s.editing;
+            b->active = s.drawing_linkage;
+            break;
+        case UI_ARMS:
+            b->enabled = s.editing;
+            b->active = s.drawing_arms;
             break;
         case UI_VARY:
             /* A driven link is posed directly, so its shape is always rigid. */

@@ -227,6 +227,28 @@ int mechanism_add_link(Mechanism *m, const int *connector_ids, int count) {
     return m->link_count++;
 }
 
+bool mechanism_set_driven_about(Mechanism *m, int link_id, int pivot_connector_id, double speed_deg_s) {
+    if (link_id < 0 || link_id >= m->link_count) return false;
+    Link *l = &m->links[link_id];
+    if (!l->alive) return false;
+    if (pivot_connector_id < 0 || pivot_connector_id >= m->connector_count) return false;
+    if (!m->connectors[pivot_connector_id].alive) return false;
+
+    bool on_link = false;
+    for (int i = 0; i < l->connector_count; i++) {
+        if (l->connector_ids[i] == pivot_connector_id) on_link = true;
+    }
+    if (!on_link) return false;
+
+    free(l->frozen_local_offset);
+    l->frozen_local_offset = NULL;
+    l->is_driven = true;
+    l->pivot_connector_id = pivot_connector_id;
+    l->motor_speed_deg_s = speed_deg_s;
+    l->accumulated_angle_rad = 0.0;
+    return true;
+}
+
 void mechanism_set_rigid(Mechanism *m, int link_id, bool rigid) {
     if (link_id < 0 || link_id >= m->link_count) return;
     Link *l = &m->links[link_id];

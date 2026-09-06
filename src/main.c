@@ -9,6 +9,7 @@
 #include "render.h"
 #include "export.h"
 #include "ui.h"
+#include "synth.h"
 
 #define CANVAS_W 900
 #define CANVAS_H 700
@@ -30,6 +31,11 @@
 #define CAM_TIMING_STEP (5.0 * M_PI / 180.0)
 #define CAM_STROKE_MIN_SPACING 3.0   /* world units between recorded points */
 #define CAM_DEFAULT_RADIUS 90.0      /* a click, rather than a drawn outline */
+#define PATH_GHOST_POINTS 220        /* how finely the target is kept for drawing */
+#define PATH_BASE_SPEED_DEG_S 45.0   /* the slowest arm: one cycle every 8 seconds */
+#define PATH_TARGET_POINTS 64        /* the drawn path, resampled for four-bar fitting */
+#define PATH_POOR_FIT_FRACTION 0.05  /* above this, say the linkage isn't up to the path */
+#define PATH_TARGET_FRACTION 0.0025  /* stop adding arms below this share of the path's size */
 
 /* World<->screen mapping: screen = world*zoom + pan. All Mechanism/mouse
  * positions are handled in world space; only rendering and raw SDL mouse
@@ -45,12 +51,18 @@ static Vec2 world_to_screen(Vec2 world, Vec2 pan, double zoom) {
 
 typedef enum { APP_EDIT, APP_RUNNING } AppState;
 
+/* The two machines a drawn path can be turned into. A four-bar is five parts
+ * and one motor but can only trace the curves four-bars trace; a chain of
+ * arms will follow anything at the cost of dozens of parts and a motor each. */
+typedef enum { PATH_TOOL_NONE, PATH_TOOL_LINKAGE, PATH_TOOL_ARMS } PathTool;
+
 typedef enum {
     DRAG_NONE,
     DRAG_MOVE_CONNECTORS,
     DRAG_PENDING_EMPTY,
     DRAG_BOX_SELECT,
-    DRAG_DRAW_CAM
+    DRAG_DRAW_CAM,
+    DRAG_DRAW_PATH
 } DragMode;
 
 /* Bounded stacks of full mechanism snapshots (mechanism_clone). Simple and
@@ -81,6 +93,18 @@ typedef struct {
     bool cam_draw_armed;
     Vec2 *cam_stroke;
     int cam_stroke_count, cam_stroke_capacity;
+
+    /* PATH works the same way, but what it does with the stroke is decompose
+     * it into a chain of rotating arms that redraws it. */
+    PathTool path_tool;          /* PATH_TOOL_NONE unless one is armed */
+    Vec2 *path_stroke;
+    int path_stroke_count, path_stroke_capacity;
+
+    /* The drawn path is kept after synthesis and drawn faintly, so the
+     * generated curve can be compared against what was asked for. */
+    Vec2 path_ghost[PATH_GHOST_POINTS];
+    int path_ghost_count;
+    bool path_ghost_closed;
 
     Vec2 *pre_run_positions;
     int pre_run_count;
@@ -301,19 +325,16 @@ static void app_toggle_motor(App *a) {
     }
 }
 
-/* Records a point of the cam outline being drawn, thinning out samples that
- * are too close together to matter. */
-static void stroke_push(App *a, Vec2 p) {
-    if (a->cam_stroke_count > 0 &&
-        vec2_dist(a->cam_stroke[a->cam_stroke_count - 1], p) < CAM_STROKE_MIN_SPACING) {
-        return;
+/* Records a point of a stroke being drawn, thinning out samples that are too
+ * close together to matter. Shared by the cam and path tools. */
+static void stroke_push(Vec2 **pts, int *count, int *capacity, Vec2 p) {
+    if (*count > 0 && vec2_dist((*pts)[*count - 1], p) < CAM_STROKE_MIN_SPACING) return;
+    if (*count >= *capacity) {
+        int cap = (*capacity == 0) ? 64 : *capacity * 2;
+        *pts = realloc(*pts, (size_t)cap * sizeof(Vec2));
+        *capacity = cap;
     }
-    if (a->cam_stroke_count >= a->cam_stroke_capacity) {
-        int cap = (a->cam_stroke_capacity == 0) ? 64 : a->cam_stroke_capacity * 2;
-        a->cam_stroke = realloc(a->cam_stroke, (size_t)cap * sizeof(Vec2));
-        a->cam_stroke_capacity = cap;
-    }
-    a->cam_stroke[a->cam_stroke_count++] = p;
+    (*pts)[(*count)++] = p;
 }
 
 /* Area centroid of the drawn outline (the shoelace centroid, which is far
@@ -435,6 +456,155 @@ static void app_adjust_cam_timing(App *a, double delta_rad) {
     push_undo(a);
     cam_rotate_profile(&a->mech.cams[cid], delta_rad);
     printf("Cam timing shifted by %.0f deg.\n", delta_rad * 180.0 / M_PI);
+}
+
+static void app_arm_path_tool(App *a, PathTool tool) {
+    a->path_tool = (a->path_tool == tool) ? PATH_TOOL_NONE : tool;
+    a->path_stroke_count = 0;
+    if (a->path_tool == PATH_TOOL_LINKAGE) {
+        printf("Linkage tool armed: draw a curve and a four-bar will be fitted to it -- "
+                "five parts and one motor, but only the curves a four-bar can trace. "
+                "Escape cancels.\n");
+    } else if (a->path_tool == PATH_TOOL_ARMS) {
+        printf("Arms tool armed: draw any curve at all and a chain of rotating arms "
+                "will be built to redraw it exactly. Escape cancels.\n");
+    }
+}
+
+/* Turns a decomposition into real, editable mechanism parts: a grounded point
+ * for the average position, then one motorised arm per term, each hung off the
+ * tip of the last and turning at its own multiple of the base speed. The pen
+ * is the final tip, traced. Nothing here is special-cased -- once built it is
+ * an ordinary mechanism you can drag, retime and export. */
+static void app_build_fourier_chain(App *a, Vec2 anchor, const FourierArm *arms, int count,
+                                     double rms, double size, bool closed) {
+    push_undo(a);
+    clear_selection(&a->mech);
+
+    int previous = mechanism_add_connector(&a->mech, anchor, true);
+    Vec2 tip_pos = anchor;
+    int built = 0;
+
+    for (int i = 0; i < count; i++) {
+        /* An arm far shorter than a pixel contributes nothing but clutter. */
+        if (vec2_len(arms[i].amplitude) < size * 1e-4) continue;
+
+        tip_pos = vec2_add(tip_pos, arms[i].amplitude);
+        int tip = mechanism_add_connector(&a->mech, tip_pos, false);
+        int ids[2] = { previous, tip };
+        int link = mechanism_add_link(&a->mech, ids, 2);
+        mechanism_set_driven_about(&a->mech, link, previous,
+                                    (double)arms[i].harmonic * PATH_BASE_SPEED_DEG_S);
+        previous = tip;
+        built++;
+    }
+
+    if (built < 1) {
+        discard_last_undo(a);
+        printf("That path decomposed to nothing usable.\n");
+        return;
+    }
+
+    mechanism_set_traced(&a->mech, previous, true);
+    a->mech.connectors[previous].selected = true;
+
+    printf("Built a %d-arm drawing machine for that %s path. Average miss %.2f units "
+            "(%.2f%% of its size). Press R to watch it draw.\n",
+            built, closed ? "closed" : "open", rms, size > 0.0 ? 100.0 * rms / size : 0.0);
+}
+
+/* Turns a fitted four-bar into real, editable mechanism parts: two grounded
+ * pivots, the crank driven by a motor, a ternary coupler carrying the traced
+ * point, and the rocker closing the loop. */
+static void app_build_four_bar(App *a, const FourBar *fb, double error, double size) {
+    Vec2 crank_end, coupler_end, traced;
+    if (!fourbar_pose(fb, 0.0, &crank_end, &coupler_end, &traced)) {
+        printf("The fitted linkage could not be assembled; nothing was added.\n");
+        return;
+    }
+
+    push_undo(a);
+    clear_selection(&a->mech);
+
+    int o2 = mechanism_add_connector(&a->mech, fb->ground_a, true);
+    int o4 = mechanism_add_connector(&a->mech, fb->ground_b, true);
+    int pa = mechanism_add_connector(&a->mech, crank_end, false);
+    int pb = mechanism_add_connector(&a->mech, coupler_end, false);
+    int tip = mechanism_add_connector(&a->mech, traced, false);
+
+    int crank_ids[2] = { o2, pa };
+    int coupler_ids[3] = { pa, pb, tip };   /* ternary: the traced point rides the coupler */
+    int rocker_ids[2] = { pb, o4 };
+    int crank_link = mechanism_add_link(&a->mech, crank_ids, 2);
+    mechanism_add_link(&a->mech, coupler_ids, 3);
+    mechanism_add_link(&a->mech, rocker_ids, 2);
+    mechanism_toggle_driven(&a->mech, crank_link, DEFAULT_MOTOR_SPEED_DEG_S);
+
+    mechanism_set_traced(&a->mech, tip, true);
+    a->mech.connectors[tip].selected = true;
+
+    double percent = (size > 0.0) ? 100.0 * error / size : 0.0;
+    printf("Fitted a four-bar: crank %.1f, coupler %.1f, rocker %.1f, ground %.1f. "
+            "Average miss %.2f units (%.2f%% of the path). Press R to watch it trace.\n",
+            fb->crank, fb->coupler, fb->rocker, vec2_dist(fb->ground_a, fb->ground_b),
+            error, percent);
+    if (error > size * PATH_POOR_FIT_FRACTION) {
+        printf("That path is outside what a four-bar can trace. Undo and use ARMS "
+                "for a machine that will follow it exactly.\n");
+    }
+}
+
+static void app_synthesize_linkage(App *a) {
+    int n = a->path_stroke_count;
+    if (n < 4) {
+        printf("That stroke is too short to fit a linkage to.\n");
+        return;
+    }
+    bool closed = synth_stroke_is_closed(a->path_stroke, n);
+
+    a->path_ghost_count = PATH_GHOST_POINTS;
+    a->path_ghost_closed = closed;
+    synth_resample(a->path_stroke, n, closed, a->path_ghost, PATH_GHOST_POINTS);
+
+    Vec2 target[PATH_TARGET_POINTS];
+    synth_resample(a->path_stroke, n, closed, target, PATH_TARGET_POINTS);
+    double size = synth_path_size(a->path_stroke, n);
+
+    printf("Searching for a four-bar that traces that %s path...\n", closed ? "closed" : "open");
+    FourBar fb;
+    double error = 0.0;
+    if (!synth_fit_four_bar(target, PATH_TARGET_POINTS, closed, synth_default_params(), &fb, &error)) {
+        printf("No four-bar linkage could be fitted to that path. Try ARMS instead.\n");
+        return;
+    }
+    app_build_four_bar(a, &fb, error, size);
+}
+
+static void app_synthesize_arms(App *a) {
+    int n = a->path_stroke_count;
+    if (n < 4) {
+        printf("That stroke is too short to build a mechanism from.\n");
+        return;
+    }
+
+    bool closed = synth_stroke_is_closed(a->path_stroke, n);
+
+    /* Keep the drawing to display behind the result. */
+    a->path_ghost_count = PATH_GHOST_POINTS;
+    a->path_ghost_closed = closed;
+    synth_resample(a->path_stroke, n, closed, a->path_ghost, PATH_GHOST_POINTS);
+
+    double size = synth_path_size(a->path_stroke, n);
+    Vec2 anchor;
+    FourierArm arms[SYNTH_MAX_ARMS];
+    double rms = 0.0;
+    int count = synth_fourier_fit(a->path_stroke, n, closed, SYNTH_MAX_ARMS,
+                                   size * PATH_TARGET_FRACTION, &anchor, arms, &rms);
+    if (count < 1) {
+        printf("Couldn't read a usable path from that stroke.\n");
+        return;
+    }
+    app_build_fourier_chain(a, anchor, arms, count, rms, size, closed);
 }
 
 static void app_toggle_vary(App *a) {
@@ -566,13 +736,18 @@ static void app_dispatch(App *a, UiAction action) {
     case UI_LINK:    app_link_selected(a); break;
     case UI_MOTOR:   app_toggle_motor(a); break;
     case UI_CAM:     app_toggle_cam_draw(a); break;
+    case UI_LINKAGE: app_arm_path_tool(a, PATH_TOOL_LINKAGE); break;
+    case UI_ARMS:    app_arm_path_tool(a, PATH_TOOL_ARMS); break;
     case UI_VARY:    app_toggle_vary(a); break;
     case UI_TRACE:   app_toggle_trace(a); break;
     case UI_DELETE:  app_delete_selection(a); break;
     case UI_UNDO:    app_undo(a); break;
     case UI_REDO:    app_redo(a); break;
     case UI_GRAVITY: app_toggle_gravity(a); break;
-    case UI_CLEAR:   mechanism_clear_traces(&a->mech); break;
+    case UI_CLEAR:
+        mechanism_clear_traces(&a->mech);
+        a->path_ghost_count = 0; /* the drawn target is a guide like any trace */
+        break;
     case UI_EXPORT:  app_export(a); break;
     case UI_RUN:     app_toggle_run(a); break;
     case UI_NONE:
@@ -608,6 +783,8 @@ static UiState app_ui_state(const App *a) {
     }
 
     s.drawing_cam = a->cam_draw_armed;
+    s.drawing_linkage = (a->path_tool == PATH_TOOL_LINKAGE);
+    s.drawing_arms = (a->path_tool == PATH_TOOL_ARMS);
     s.can_undo = (a->undo_count > 0);
     s.can_redo = (a->redo_count > 0);
     Vec2 g = effective_gravity(a);
@@ -683,7 +860,10 @@ static void draw_mechanism(SDL_Renderer *ren, const Mechanism *m, DragMode drag_
                 Vec2 mid = { (a.x + bpt.x) / 2.0, (a.y + bpt.y) / 2.0 };
                 Vec2 dir = vec2_sub(bpt, a);
                 double dir_len = vec2_len(dir);
-                if (dir_len > 1e-6) {
+                /* Only label a link the number actually fits alongside. A
+                 * drawing machine has dozens of short arms, and labelling
+                 * every one buries the mechanism in numerals. */
+                if (dir_len > 1e-6 && dir_len > render_number_width(10.0 * view_zoom, length) + 8.0) {
                     Vec2 dir_unit = vec2_scale(dir, 1.0 / dir_len);
                     double angle = atan2(dir_unit.y, dir_unit.x);
                     /* Keep text reading left-to-right rather than upside down
@@ -769,6 +949,13 @@ int main(void) {
     printf("       click once for a default cam). The centre, motor and roller follower\n");
     printf("       are all created for you. Click a cam's outline to select it:\n");
     printf("       +/- resize its lift, [ and ] shift its timing.\n");
+    printf("    Two path tools: draw a curve and get a machine that traces it.\n");
+    printf("      P: LINKAGE -- fits a four-bar. Five parts and one motor, but only\n");
+    printf("         the curves four-bars can trace (beans, ellipses, figure-eights).\n");
+    printf("      B: ARMS -- a chain of rotating arms. Traces ANY curve exactly,\n");
+    printf("         at the cost of dozens of parts. Use it for stars, hearts, etc.\n");
+    printf("       Close the loop for a repeating cycle; leave it open and the pen\n");
+    printf("       sweeps out along it and back.\n");
     printf("    V: toggle selected link's length between fixed and variable (green = variable)\n");
     printf("    T: toggle path tracing on selected connectors\n");
     printf("    E: export mechanism to a Blender Python script\n");
@@ -801,6 +988,12 @@ int main(void) {
     app.cam_stroke = NULL;
     app.cam_stroke_count = 0;
     app.cam_stroke_capacity = 0;
+    app.path_tool = PATH_TOOL_NONE;
+    app.path_stroke = NULL;
+    app.path_stroke_count = 0;
+    app.path_stroke_capacity = 0;
+    app.path_ghost_count = 0;
+    app.path_ghost_closed = false;
     ui_init(&app.toolbar);
 
     Uint32 last_ticks = SDL_GetTicks();
@@ -832,7 +1025,9 @@ int main(void) {
                     } else if (app.drag_mode == DRAG_BOX_SELECT) {
                         app.drag_current = p;
                     } else if (app.drag_mode == DRAG_DRAW_CAM) {
-                        stroke_push(&app, p);
+                        stroke_push(&app.cam_stroke, &app.cam_stroke_count, &app.cam_stroke_capacity, p);
+                    } else if (app.drag_mode == DRAG_DRAW_PATH) {
+                        stroke_push(&app.path_stroke, &app.path_stroke_count, &app.path_stroke_capacity, p);
                     }
                 }
             } else if (ev.type == SDL_MOUSEBUTTONDOWN && ev.button.button == SDL_BUTTON_LEFT &&
@@ -847,6 +1042,7 @@ int main(void) {
                 app.toolbar.pressed = -1;
             } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_c) {
                 mechanism_clear_traces(&app.mech); /* works in both edit and running mode */
+                app.path_ghost_count = 0;
             } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_g) {
                 app_toggle_gravity(&app);
             } else if (ev.type == SDL_KEYDOWN && app.state == APP_EDIT) {
@@ -868,6 +1064,10 @@ int main(void) {
                     app_toggle_motor(&app);
                 } else if (k == SDLK_k) {
                     app_toggle_cam_draw(&app);
+                } else if (k == SDLK_p) {
+                    app_arm_path_tool(&app, PATH_TOOL_LINKAGE);
+                } else if (k == SDLK_b) {
+                    app_arm_path_tool(&app, PATH_TOOL_ARMS);
                 } else if (k == SDLK_LEFTBRACKET) {
                     app_adjust_cam_timing(&app, -CAM_TIMING_STEP);
                 } else if (k == SDLK_RIGHTBRACKET) {
@@ -891,6 +1091,10 @@ int main(void) {
                         app.cam_draw_armed = false;
                         app.cam_stroke_count = 0;
                         printf("Cam tool cancelled.\n");
+                    } else if (app.path_tool != PATH_TOOL_NONE) {
+                        app.path_tool = PATH_TOOL_NONE;
+                        app.path_stroke_count = 0;
+                        printf("Path tool cancelled.\n");
                     } else {
                         clear_selection(&app.mech);
                     }
@@ -916,12 +1120,19 @@ int main(void) {
                     app.view_zoom = new_zoom;
                 }
             } else if (app.state == APP_EDIT && ev.type == SDL_MOUSEBUTTONDOWN && ev.button.button == SDL_BUTTON_LEFT &&
+                        app.path_tool != PATH_TOOL_NONE) {
+                Vec2 p = screen_to_world((Vec2){ (double)ev.button.x, (double)ev.button.y }, app.view_pan, app.view_zoom);
+                app.drag_mode = DRAG_DRAW_PATH;
+                app.drag_start = p;
+                app.path_stroke_count = 0;
+                stroke_push(&app.path_stroke, &app.path_stroke_count, &app.path_stroke_capacity, p);
+            } else if (app.state == APP_EDIT && ev.type == SDL_MOUSEBUTTONDOWN && ev.button.button == SDL_BUTTON_LEFT &&
                         app.cam_draw_armed) {
                 Vec2 p = screen_to_world((Vec2){ (double)ev.button.x, (double)ev.button.y }, app.view_pan, app.view_zoom);
                 app.drag_mode = DRAG_DRAW_CAM;
                 app.drag_start = p;
                 app.cam_stroke_count = 0;
-                stroke_push(&app, p);
+                stroke_push(&app.cam_stroke, &app.cam_stroke_count, &app.cam_stroke_capacity, p);
             } else if (app.state == APP_EDIT && ev.type == SDL_MOUSEBUTTONDOWN && ev.button.button == SDL_BUTTON_LEFT) {
                 Vec2 p = screen_to_world((Vec2){ (double)ev.button.x, (double)ev.button.y }, app.view_pan, app.view_zoom);
                 bool shift = (SDL_GetModState() & KMOD_SHIFT) != 0;
@@ -957,6 +1168,13 @@ int main(void) {
                         app.drag_current = p;
                     }
                 }
+            } else if (app.state == APP_EDIT && ev.type == SDL_MOUSEBUTTONUP && ev.button.button == SDL_BUTTON_LEFT &&
+                        app.drag_mode == DRAG_DRAW_PATH) {
+                if (app.path_tool == PATH_TOOL_LINKAGE) app_synthesize_linkage(&app);
+                else app_synthesize_arms(&app);
+                app.path_stroke_count = 0;
+                app.path_tool = PATH_TOOL_NONE;
+                app.drag_mode = DRAG_NONE;
             } else if (app.state == APP_EDIT && ev.type == SDL_MOUSEBUTTONUP && ev.button.button == SDL_BUTTON_LEFT &&
                         app.drag_mode == DRAG_DRAW_CAM) {
                 if (app.cam_stroke_count >= 3) {
@@ -1041,6 +1259,32 @@ int main(void) {
                 else render_line(ren, a0, a1, 200, 175, 235, 255);
             }
         }
+        /* The path that was asked for, kept behind the result so the fit can
+         * be judged by eye. */
+        for (int i = 1; i < app.path_ghost_count; i++) {
+            render_line(ren, world_to_screen(app.path_ghost[i - 1], app.view_pan, app.view_zoom),
+                        world_to_screen(app.path_ghost[i], app.view_pan, app.view_zoom),
+                        95, 90, 120, 255);
+        }
+        if (app.path_ghost_closed && app.path_ghost_count > 2) {
+            render_line(ren, world_to_screen(app.path_ghost[app.path_ghost_count - 1], app.view_pan, app.view_zoom),
+                        world_to_screen(app.path_ghost[0], app.view_pan, app.view_zoom), 95, 90, 120, 255);
+        }
+
+        for (int i = 1; i < app.path_stroke_count; i++) {
+            render_line(ren, world_to_screen(app.path_stroke[i - 1], app.view_pan, app.view_zoom),
+                        world_to_screen(app.path_stroke[i], app.view_pan, app.view_zoom),
+                        150, 200, 255, 255);
+        }
+
+        if (app.path_tool != PATH_TOOL_NONE) {
+            const char *hint = (app.path_tool == PATH_TOOL_LINKAGE)
+                ? "DRAW A PATH FOR A FOUR-BAR LINKAGE TO TRACE   ESC TO CANCEL"
+                : "DRAW ANY PATH FOR A CHAIN OF ARMS TO REDRAW   ESC TO CANCEL";
+            double w = render_text_width(9.0, hint);
+            render_text(ren, (Vec2){ UI_TOOLBAR_W + (CANVAS_W - w) / 2.0, 16.0 }, 9.0, hint,
+                        150, 200, 255, 255);
+        }
         if (app.cam_draw_armed) {
             const char *hint = "DRAG TO DRAW THE CAM OUTLINE   CLICK FOR A DEFAULT CAM   ESC TO CANCEL";
             double w = render_text_width(9.0, hint);
@@ -1052,10 +1296,12 @@ int main(void) {
         render_plot(ren, &app.mech, (UiRect){ UI_TOOLBAR_W, CANVAS_H, CANVAS_W, PLOT_H });
         render_toolbar(ren, &app.toolbar, WIN_H);
         SDL_RenderPresent(ren);
+
         SDL_Delay(16);
     }
 
     free(app.cam_stroke);
+    free(app.path_stroke);
     free(app.pre_run_positions);
     free(app.frame_positions);
     free(app.frame_angles);

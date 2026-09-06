@@ -5,6 +5,10 @@ mechanism by hand out of connectors (joints), anchors (grounded connectors),
 and rigid links (each owning any number of connectors, not just simple
 two-point bars), add disc cams with translating roller followers, mark one
 link as a constant-speed motor, then forward-simulate the resulting motion.
+Or work the other way round: **draw a path you want a point to follow and the
+program designs a machine that traces it** — either a neat four-bar linkage,
+or, for shapes no linkage can manage, a chain of rotating arms that will
+redraw anything you can draw.
 Every link's length is shown live in the canvas, traced points are plotted
 against time, and the mechanism can be exported as a ready-to-run Blender
 Python script for 3D printing.
@@ -55,6 +59,13 @@ disabled, RUN becomes STOP, and GRAVITY and CLEAR keep working.
     default cam. Escape cancels. Afterwards, click a cam's outline to select
     it: `+`/`-` scale its lift, `[` and `]` shift its timing. See **Cams and
     followers** below.
+  - `P`: **LINKAGE** — draw a curve and a four-bar is fitted to it. Five parts
+    and one motor, but only the curves four-bars can trace.
+  - `B`: **ARMS** — draw *any* curve and a chain of rotating arms is built to
+    redraw it exactly. Dozens of parts, but nothing is out of reach.
+
+    Both build a complete, running, editable mechanism from one stroke. See
+    **Designing from a path** below for which to reach for.
   - `V`: toggle the selected link's length between fixed (rigid, the
     default) and variable. A **fixed** link genuinely cannot change length:
     if the motor would have to stretch or compress it to keep turning, the
@@ -107,6 +118,66 @@ Every link's length is drawn as a live numeral alongside it (a small
 hand-drawn seven-segment display — no font dependency), rotated to run
 parallel to the link and offset just clear of it, reflecting its connectors'
 current positions.
+
+## Designing from a path
+
+Everything else in this program works forwards: you build a mechanism and see
+what it does. The path tools work backwards. Draw a curve and one of them
+designs a machine that traces it, then builds it out of ordinary parts you can
+drag, retime and export like anything else.
+
+There are two, because there is a real trade to make.
+
+**LINKAGE (`P`)** fits a **four-bar**: two grounded pivots, a motorised crank,
+a ternary coupler carrying the traced point, and a rocker closing the loop.
+Five parts, one motor — the machine you would actually build. But coupler
+curves are a restricted family. Beans, ellipses, figure-eights, teardrops and
+D-shapes come out well; a star or a heart is simply not in the set. The tool
+still returns its closest attempt and prints the average miss as a percentage
+of your drawing, and if that is more than a few percent it says outright that
+the path is beyond a four-bar and points you at ARMS.
+
+Fitting is a search, and an honest one: four-bar synthesis is badly
+multi-modal, so it draws hundreds of thousands of candidates from a prior
+scaled to your drawing, discards the great majority that cannot turn a full
+revolution, keeps the best few dozen, and polishes each with a derivative-free
+pattern search. That takes a few seconds. The seed is fixed, so the same
+drawing always gives the same linkage.
+
+**ARMS (`B`)** builds a **chain of rotating arms**. Any closed curve is a sum
+of circular motions at whole-number frequencies, so arms hung tip to tail,
+each turning at its own multiple of a base speed, have a pen at the end that
+traces it — a Fourier series made out of parts. Because the fit is a transform
+rather than a search it is instant, exact in the limit, and works on anything:
+a star takes about 35 arms and a heart about 29, both landing near a quarter
+of a percent. The cost is the part count and a motor on every arm.
+
+Arms are added longest first, which is the best use of however many you get:
+dropping the smallest terms is provably the closest approximation for that
+count. The tool keeps adding until the average miss falls below a quarter of a
+percent of your drawing, or it hits 48 arms.
+
+Both tools read your stroke the same way. Finish near where you started and it
+is a **closed loop**, traced over and over. Leave it open and it is an **open
+stroke**: for a linkage that means the drawn part need only lie somewhere on
+the coupler curve, and for arms the stroke is **mirrored** so the pen sweeps
+out along it and back. Mirroring rather than just joining the ends matters — a
+straight jump from end to start is a step, and a step needs endless harmonics,
+so it would ripple along the whole curve.
+
+Only the *shape* is matched, never the timing: where along the curve the pen
+sits at any moment is whatever the machine gives. That is the standard problem
+and by far the more useful one.
+
+Whichever you use, the path you drew stays on screen behind the result in a
+dim outline, so you can judge the fit by eye as well as by the number printed
+to the terminal. CLEAR (`C`) removes it.
+
+Two things worth knowing about arm chains. The whole figure takes one turn of
+the *slowest* arm — eight seconds by default — so let it run a full cycle
+before judging it. And a drawing is one continuous stroke: a face with
+separate eyes and a mouth would need the pen to lift, which no single chain
+can do, so draw it without lifting or build it from several paths.
 
 ## Cams and followers
 
@@ -228,6 +299,31 @@ otherwise-unconstrained degrees of freedom, not a separate physics engine.
 `src/export.c` writes the Blender script; undo/redo (in `src/main.c`) is a
 pair of bounded stacks of full `mechanism_clone()` snapshots — one pushed
 before each edit, the other filled by undoing and discarded by the next edit.
+
+`src/synth.c` owns both path tools. Both start by resampling the stroke to even
+arc length -- a freehand stroke bunches up wherever the hand slowed, which
+would otherwise distort the result badly.
+
+The four-bar side has closed-form four-bar kinematics, the Grashof test that
+decides whether a candidate can be driven round at all, and the search. Its
+cost is the symmetric distance between the drawn points and the candidate's
+coupler curve, measured to the curve's *segments* rather than its samples, so
+a coarse sampling still measures the true distance.
+
+The arm-chain side mirrors the stroke if it is open and takes a discrete
+Fourier transform; each coefficient becomes one arm. Which arms to keep is
+decided by Parseval's theorem: the energy in the terms you drop *is* the mean
+squared deviation, so the error of every possible truncation is known without
+reconstructing anything.
+
+Each arm is an ordinary driven link, pivoting on the tip of the one before it.
+That needed one generalisation in `src/solver.c`: a motor's pivot no longer has
+to be an anchor, so driven links are posed in dependency order -- anchors
+first, then whatever their motion has settled -- rather than in array order,
+which would pose a child arm from its parent's stale position. Because each
+link's accumulated angle is absolute rather than relative to its parent, an arm
+turning at k times the base rate sweeps k turns per cycle in world terms, which
+is exactly what makes the chain sum a Fourier series.
 
 `src/ui.c` owns the toolbar: its layout, hit-testing, and the rules deciding
 which buttons are enabled and lit. It deliberately has no SDL dependency, so

@@ -9,6 +9,7 @@
 #include "../src/export.h"
 #include "../src/ui.h"
 #include "../src/cam.h"
+#include "../src/synth.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -22,6 +23,15 @@ static void check_close(const char *name, double actual, double expected, double
         failures++;
     } else {
         printf("PASS %s\n", name);
+    }
+}
+
+/* For assertions inside a loop, where one line per iteration would drown the
+ * log: only says anything when it fails. */
+static void check_true_quiet(bool cond) {
+    if (!cond) {
+        printf("FAIL (in loop)\n");
+        failures++;
     }
 }
 
@@ -692,6 +702,8 @@ static UiState blank_ui_state(void) {
     s.selected_link_can_drive = false;
     s.all_selected_traced = false;
     s.drawing_cam = false;
+    s.drawing_linkage = false;
+    s.drawing_arms = false;
     s.has_selection = false;
     s.can_undo = false;
     s.can_redo = false;
@@ -704,7 +716,7 @@ static void test_toolbar_layout_is_well_formed(void) {
     Toolbar t;
     ui_init(&t);
 
-    check_true("toolbar has every requested button", t.count == 14);
+    check_true("toolbar has every requested button", t.count == 16);
 
     bool all_inside = true, no_overlap = true, all_have_labels = true;
     for (int i = 0; i < t.count; i++) {
@@ -1334,6 +1346,379 @@ static void test_follower_tracks_a_drawn_cam(void) {
     mechanism_free(&m);
 }
 
+
+/* --------------------------------------------------------------------------
+ * Path synthesis (src/synth.c): draw any curve, get a machine that redraws it.
+ * ----------------------------------------------------------------------- */
+
+/* A five-pointed star -- sharp corners, which is exactly what a four-bar
+ * could never trace and what the arm chain is meant to handle. */
+static int build_star(Vec2 *out, double radius)  {
+    Vec2 vertex[10];
+    for (int i = 0; i < 10; i++) {
+        double a = M_PI / 2.0 + 2.0 * M_PI * (double)i / 10.0;
+        double r = (i % 2 == 0) ? radius : radius * 0.41;
+        vertex[i] = (Vec2){ r * cos(a), r * sin(a) };
+    }
+    int n = 0;
+    for (int i = 0; i < 10; i++) {
+        Vec2 a = vertex[i], b = vertex[(i + 1) % 10];
+        for (int k = 0; k < 24; k++) {
+            double t = (double)k / 24.0;
+            out[n++] = vec2_add(a, vec2_scale(vec2_sub(b, a), t));
+        }
+    }
+    return n;
+}
+
+static void test_stroke_preparation(void) {
+    /* A freehand stroke bunches up wherever the hand slowed; resampling to
+     * even arc length is what stops those stretches dominating. */
+    Vec2 uneven[5] = { { 0, 0 }, { 1, 0 }, { 2, 0 }, { 3, 0 }, { 100, 0 } };
+    Vec2 even[11];
+    synth_resample(uneven, 5, false, even, 11);
+
+    check_close("resampling starts at the stroke's start", vec2_dist(even[0], uneven[0]), 0.0, 1e-9);
+    check_close("resampling ends at the stroke's end", vec2_dist(even[10], uneven[4]), 0.0, 1e-6);
+
+    bool spacing_even = true;
+    double step = vec2_dist(even[0], even[1]);
+    for (int i = 1; i < 10; i++) {
+        if (fabs(vec2_dist(even[i], even[i + 1]) - step) > 1e-6) spacing_even = false;
+    }
+    check_true("resampled points are evenly spaced along the stroke", spacing_even);
+    check_close("...at the expected spacing", step, 10.0, 1e-6);
+
+    Vec2 loop[17];
+    for (int i = 0; i < 17; i++) {
+        double a = 2.0 * M_PI * (double)i / 16.0;
+        loop[i] = (Vec2){ 50.0 * cos(a), 50.0 * sin(a) };
+    }
+    check_true("a stroke ending where it began reads as closed", synth_stroke_is_closed(loop, 17));
+
+    Vec2 open_stroke[9];
+    for (int i = 0; i < 9; i++) open_stroke[i] = (Vec2){ 10.0 * (double)i, 0.0 };
+    check_true("a stroke ending far from its start reads as open",
+               !synth_stroke_is_closed(open_stroke, 9));
+
+    check_close("path size is its largest extent", synth_path_size(loop, 17), 100.0, 1e-6);
+}
+
+/* ---- The four-bar tool ------------------------------------------------- */
+
+/* The same four-bar family the solver tests use: O2=(0,0), O4=(4,0), crank 1,
+ * coupler 3, rocker 2. At a 90-degree crank angle the closed-form answer for
+ * B is known exactly, so it pins the kinematics independently of the solver. */
+static void test_fourbar_pose_matches_closed_form(void) {
+    FourBar fb = { { 0, 0 }, { 4, 0 }, 1.0, 3.0, 2.0, 3.0, 0.0, 1 };
+    Vec2 a, b, point;
+    check_true("four-bar assembles at 90 degrees",
+               fourbar_pose(&fb, M_PI / 2.0, &a, &b, &point));
+
+    check_close("synth A.x", a.x, 0.0, 1e-12);
+    check_close("synth A.y", a.y, 1.0, 1e-12);
+    check_close("synth B.x", b.x, (44.0 + 4.0 * sqrt(2.0)) / 17.0, 1e-9);
+    check_close("synth B.y", b.y, (6.0 + 16.0 * sqrt(2.0)) / 17.0, 1e-9);
+    check_close("traced point at u=coupler,v=0 lands on B", vec2_dist(point, b), 0.0, 1e-9);
+
+    fb.branch = -1;
+    fourbar_pose(&fb, M_PI / 2.0, &a, &b, &point);
+    check_close("the other branch mirrors B.x", b.x, (44.0 - 4.0 * sqrt(2.0)) / 17.0, 1e-9);
+    check_close("the other branch mirrors B.y", b.y, (6.0 - 16.0 * sqrt(2.0)) / 17.0, 1e-9);
+
+    FourBar broken = { { 0, 0 }, { 4, 0 }, 1.0, 0.2, 0.2, 0.1, 0.0, 1 };
+    check_true("an unassemblable linkage is reported as such",
+               !fourbar_coupler_point(&broken, 0.0, &point));
+}
+
+static void test_grashof_classification(void) {
+    FourBar good = { { 0, 0 }, { 400, 0 }, 100.0, 350.0, 300.0, 180.0, 120.0, 1 };
+    check_true("a Grashof crank-rocker turns fully", fourbar_crank_rotates(&good));
+
+    FourBar not_shortest = { { 0, 0 }, { 450, 0 }, 250.0, 452.0, 200.0, 100.0, 50.0, 1 };
+    check_true("a crank that isn't the shortest link doesn't turn fully",
+               !fourbar_crank_rotates(&not_shortest));
+
+    /* s + l == p + q exactly: a change point, where the linkage can flip
+     * branches. Excluded deliberately. */
+    FourBar change_point = { { 0, 0 }, { 4, 0 }, 1.0, 3.0, 2.0, 3.0, 0.0, 1 };
+    check_true("a change-point linkage is excluded", !fourbar_crank_rotates(&change_point));
+
+    FourBar degenerate = { { 0, 0 }, { 0, 0 }, 1.0, 3.0, 2.0, 1.0, 0.0, 1 };
+    check_true("coincident ground pivots are rejected", !fourbar_crank_rotates(&degenerate));
+}
+
+/* Small enough to keep the suite quick, large enough to find a good answer. */
+static SynthParams test_synth_params(void) {
+    SynthParams p = synth_default_params();
+    p.random_starts = 60000;
+    p.refine_candidates = 16;
+    p.refine_sweeps = 80;
+    return p;
+}
+
+static void test_four_bar_recovers_an_achievable_curve(void) {
+    /* Take a curve a four-bar CAN trace, hand the fitter nothing but the
+     * points, and check it finds a linkage tracing essentially that curve.
+     * The answer need not be the original -- different four-bars share coupler
+     * curves -- so the check is on the curve, not the parameters. */
+    FourBar truth = { { 0, 0 }, { 400, 0 }, 100.0, 350.0, 300.0, 180.0, 120.0, 1 };
+    Vec2 target[64];
+    bool traceable = true;
+    for (int i = 0; i < 64; i++) {
+        if (!fourbar_coupler_point(&truth, 2.0 * M_PI * (double)i / 64.0, &target[i])) traceable = false;
+    }
+    check_true("the truth curve is traceable all the way round", traceable);
+    double span = synth_path_size(target, 64);
+
+    FourBar got;
+    double err = 0.0;
+    check_true("the four-bar tool finds a linkage for an achievable curve",
+               synth_fit_four_bar(target, 64, true, test_synth_params(), &got, &err));
+    check_true("the fitted linkage's crank turns fully", fourbar_crank_rotates(&got));
+    check_true("the fit is within a few percent of the curve's size", err < 0.06 * span);
+    check_close("reported error matches a fresh evaluation",
+                synth_fit_error(&got, target, 64, true), err, 1e-9);
+    check_true("the original linkage scores near-zero on its own curve",
+               synth_fit_error(&truth, target, 64, true) < 0.01 * span);
+}
+
+static void test_four_bar_is_deterministic(void) {
+    FourBar truth = { { 0, 0 }, { 400, 0 }, 100.0, 350.0, 300.0, 180.0, 120.0, 1 };
+    Vec2 target[48];
+    for (int i = 0; i < 48; i++) {
+        fourbar_coupler_point(&truth, 2.0 * M_PI * (double)i / 48.0, &target[i]);
+    }
+    SynthParams p = test_synth_params();
+    p.random_starts = 20000;
+    FourBar a, b;
+    double ea = 0.0, eb = 0.0;
+    bool ok_a = synth_fit_four_bar(target, 48, true, p, &a, &ea);
+    bool ok_b = synth_fit_four_bar(target, 48, true, p, &b, &eb);
+    check_true("both runs succeed", ok_a && ok_b);
+    check_close("the same drawing gives the same error", eb, ea, 1e-12);
+    check_close("...and the same crank", b.crank, a.crank, 1e-12);
+}
+
+/* The whole reason both tools exist: a star is outside what a four-bar can
+ * trace, and the tool should return a visibly poor fit rather than pretend --
+ * which is exactly the case where the app points you at ARMS. */
+static void test_four_bar_cannot_manage_a_star(void) {
+    Vec2 star[256];
+    int n = build_star(star, 110.0);
+    Vec2 target[64];
+    synth_resample(star, n, true, target, 64);
+    double size = synth_path_size(target, 64);
+
+    FourBar got;
+    double err = 0.0;
+    bool ok = synth_fit_four_bar(target, 64, true, test_synth_params(), &got, &err);
+    check_true("the four-bar tool still returns its best effort on a star", ok);
+    check_true("but a star is well outside what a four-bar can trace",
+               err > 0.05 * size);
+
+    /* The arm chain, on the same star, gets nowhere near that badly wrong. */
+    Vec2 anchor;
+    FourierArm arms[SYNTH_MAX_ARMS];
+    double rms = 0.0;
+    int arm_count = synth_fourier_fit(star, n, true, 32, 0.0, &anchor, arms, &rms);
+    check_true("the arm chain handles the same star", arm_count == 32);
+    check_true("and does so far more accurately than the four-bar", rms < err * 0.2);
+}
+
+/* ---- The arm-chain tool ------------------------------------------------ */
+
+static void test_fourier_reproduces_a_circle_exactly(void) {
+    /* A circle is a single rotating arm, and it is the one shape that stays a
+     * single arm under arc-length resampling, so it pins the decomposition
+     * exactly. (Sampled finely: the stroke is a polygon, and its chords sag
+     * very slightly inside the true circle.) */
+    Vec2 circle[512];
+    for (int i = 0; i < 512; i++) {
+        double a = 2.0 * M_PI * (double)i / 512.0;
+        circle[i] = (Vec2){ 200.0 + 80.0 * cos(a), 150.0 + 80.0 * sin(a) };
+    }
+
+    Vec2 anchor;
+    FourierArm arms[SYNTH_MAX_ARMS];
+    double rms = 0.0;
+    int count = synth_fourier_fit(circle, 512, true, SYNTH_MAX_ARMS, 0.05, &anchor, arms, &rms);
+
+    check_true("a circle needs exactly one arm", count == 1);
+    check_close("the chain hangs from the circle's centre.x", anchor.x, 200.0, 1e-4);
+    check_close("the chain hangs from the circle's centre.y", anchor.y, 150.0, 1e-4);
+    check_close("the arm is the circle's radius", vec2_len(arms[0].amplitude), 80.0, 0.01);
+    check_true("the arm turns once per cycle", abs(arms[0].harmonic) == 1);
+    check_true("the deviation is negligible", rms < 0.05);
+}
+
+static void test_fourier_traces_a_star(void) {
+    /* The shape the user actually asked for. Sharp corners need many terms,
+     * so this checks both that the error falls as arms are added and that the
+     * final machine really does follow the drawing. */
+    Vec2 star[256];
+    int n = build_star(star, 110.0);
+    double size = synth_path_size(star, n);
+
+    Vec2 anchor;
+    FourierArm arms[SYNTH_MAX_ARMS];
+    double coarse = 0.0, fine = 0.0;
+    int few = synth_fourier_fit(star, n, true, 6, 0.0, &anchor, arms, &coarse);
+    int many = synth_fourier_fit(star, n, true, 32, 0.0, &anchor, arms, &fine);
+
+    check_true("a small budget uses every arm it is given", few == 6);
+    check_true("a larger budget uses more arms", many == 32);
+    check_true("more arms means less deviation", fine < coarse);
+    check_true("32 arms trace a star to well under a percent", fine < 0.01 * size);
+
+    /* Every point of the drawing should lie on the curve the machine draws. */
+    double worst = 0.0;
+    for (int i = 0; i < n; i++) {
+        double best = 1e300;
+        for (int k = 0; k < 720; k++) {
+            Vec2 p = synth_fourier_point(anchor, arms, many, (double)k / 720.0);
+            best = fmin(best, vec2_dist(star[i], p));
+        }
+        if (best > worst) worst = best;
+    }
+    check_true("every point of the star lands on the traced curve", worst < 0.02 * size);
+}
+
+static void test_fourier_stops_early_when_accurate_enough(void) {
+    /* A gentle shape should not spend the whole budget. Note an ellipse is
+     * NOT two arms here: the stroke is resampled to even arc length, which is
+     * right for a hand drawing but is a different parameterisation from the
+     * even-angle one that makes an ellipse two harmonics. */
+    Vec2 ellipse[256];
+    for (int i = 0; i < 256; i++) {
+        double a = 2.0 * M_PI * (double)i / 256.0;
+        ellipse[i] = (Vec2){ 120.0 * cos(a), 60.0 * sin(a) };
+    }
+    double size = synth_path_size(ellipse, 256);
+
+    Vec2 anchor;
+    FourierArm arms[SYNTH_MAX_ARMS];
+    double rms = 0.0;
+    int count = synth_fourier_fit(ellipse, 256, true, SYNTH_MAX_ARMS, size * 0.002, &anchor, arms, &rms);
+    check_true("a gentle shape stops well inside the arm budget", count < SYNTH_MAX_ARMS / 2);
+    check_true("having met the tolerance asked for", rms <= size * 0.002);
+
+    bool descending = true;
+    for (int i = 1; i < count; i++) {
+        if (vec2_len(arms[i].amplitude) > vec2_len(arms[i - 1].amplitude) + 1e-12) descending = false;
+    }
+    check_true("arms come out longest first", descending);
+}
+
+static void test_fourier_handles_an_open_stroke(void) {
+    /* An open stroke is mirrored into a closed cycle, so the pen sweeps out
+     * along it and back. Closing it with a straight jump instead would put a
+     * step in the curve that no sane number of arms could represent. */
+    Vec2 wave[64];
+    for (int i = 0; i < 64; i++) {
+        double t = (double)i / 63.0;
+        wave[i] = (Vec2){ 300.0 * t, 40.0 * sin(3.0 * M_PI * t) };
+    }
+    double size = synth_path_size(wave, 64);
+
+    Vec2 anchor;
+    FourierArm arms[SYNTH_MAX_ARMS];
+    double rms = 0.0;
+    int count = synth_fourier_fit(wave, 64, false, SYNTH_MAX_ARMS, size * 0.002, &anchor, arms, &rms);
+    check_true("an open stroke decomposes", count > 0);
+
+    double worst = 0.0;
+    for (int i = 0; i < 64; i++) {
+        double best = 1e300;
+        for (int k = 0; k < 720; k++) {
+            Vec2 p = synth_fourier_point(anchor, arms, count, (double)k / 720.0);
+            best = fmin(best, vec2_dist(wave[i], p));
+        }
+        if (best > worst) worst = best;
+    }
+    check_true("the pen passes along every point of an open stroke", worst < 0.02 * size);
+}
+
+static void test_fourier_rejects_useless_input(void) {
+    Vec2 anchor;
+    FourierArm arms[SYNTH_MAX_ARMS];
+    double rms = 0.0;
+    Vec2 two[2] = { { 0, 0 }, { 10, 0 } };
+    check_true("too few points is rejected",
+               synth_fourier_fit(two, 2, true, SYNTH_MAX_ARMS, 0.1, &anchor, arms, &rms) == 0);
+
+    Vec2 dot[8];
+    for (int i = 0; i < 8; i++) dot[i] = (Vec2){ 5.0, 5.0 };
+    check_true("a path with no extent is rejected",
+               synth_fourier_fit(dot, 8, true, SYNTH_MAX_ARMS, 0.1, &anchor, arms, &rms) == 0);
+}
+
+/* The end-to-end statement: build the machine out of real mechanism parts,
+ * simulate it, and check the traced point follows the drawing. This is what
+ * exercises the solver's chained motors -- each arm pivots on the tip of the
+ * one before, not on ground. */
+static void test_arm_chain_simulates_and_traces_the_path(void) {
+    Vec2 star[256];
+    int n = build_star(star, 110.0);
+    double size = synth_path_size(star, n);
+
+    Vec2 anchor;
+    FourierArm arms[SYNTH_MAX_ARMS];
+    double rms = 0.0;
+    int count = synth_fourier_fit(star, n, true, 24, 0.0, &anchor, arms, &rms);
+    check_true("the star decomposes", count == 24);
+
+    Mechanism m;
+    mechanism_init(&m);
+    int previous = mechanism_add_connector(&m, anchor, true);
+    Vec2 tip = anchor;
+    double base_speed = 45.0;
+    for (int i = 0; i < count; i++) {
+        tip = vec2_add(tip, arms[i].amplitude);
+        int t = mechanism_add_connector(&m, tip, false);
+        int ids[2] = { previous, t };
+        int link = mechanism_add_link(&m, ids, 2);
+        check_true_quiet(mechanism_set_driven_about(&m, link, previous,
+                                                     (double)arms[i].harmonic * base_speed));
+        previous = t;
+    }
+    int pen = previous;
+
+    SolverParams params = solver_default_params();
+    solver_freeze(&m);
+
+    /* One cycle is one turn of the slowest arm: 360/45 = 8 seconds. */
+    const double dt = 1.0 / 240.0;
+    const int steps = (int)(8.0 / dt);
+    Vec2 drawn[2000];
+    int drawn_count = 0;
+    for (int step = 0; step < steps; step++) {
+        solver_advance(&m, dt, params);
+        if (step % 2 == 0 && drawn_count < 2000) drawn[drawn_count++] = m.connectors[pen].pos;
+    }
+
+    /* Every point of the star should have been passed through. */
+    double worst = 0.0;
+    for (int i = 0; i < n; i++) {
+        double best = 1e300;
+        for (int k = 0; k < drawn_count; k++) best = fmin(best, vec2_dist(star[i], drawn[k]));
+        if (best > worst) worst = best;
+    }
+    check_true("the simulated machine draws the star", worst < 0.03 * size);
+
+    /* And it must go all the way round once -- a machine that merely wobbled
+     * near the figure could pass a sloppier version of the check above. The
+     * pen's travel in one cycle should be the star's perimeter. */
+    double perimeter = 0.0;
+    for (int i = 0; i < n; i++) perimeter += vec2_dist(star[i], star[(i + 1) % n]);
+    double travel = 0.0;
+    for (int k = 1; k < drawn_count; k++) travel += vec2_dist(drawn[k - 1], drawn[k]);
+    check_true("the pen travels one full circuit of the figure",
+               travel > 0.9 * perimeter && travel < 1.15 * perimeter);
+
+    mechanism_free(&m);
+}
+
 static void test_cam_button_enablement(void) {
     Toolbar t;
     ui_init(&t);
@@ -1349,10 +1734,33 @@ static void test_cam_button_enablement(void) {
     ui_apply_state(&t, s);
     check_true("CAM is lit while the drawing tool is armed", button_for(&t, UI_CAM)->active);
 
+    /* Both path tools are the same shape of tool: no selection, lit while
+     * armed, and only one of them armed at a time. */
+    s = blank_ui_state();
+    ui_apply_state(&t, s);
+    check_true("LINKAGE needs no selection to be available", button_for(&t, UI_LINKAGE)->enabled);
+    check_true("ARMS needs no selection to be available", button_for(&t, UI_ARMS)->enabled);
+    check_true("LINKAGE is unlit until armed", !button_for(&t, UI_LINKAGE)->active);
+    check_true("ARMS is unlit until armed", !button_for(&t, UI_ARMS)->active);
+
+    s.drawing_linkage = true;
+    ui_apply_state(&t, s);
+    check_true("LINKAGE lights up when armed", button_for(&t, UI_LINKAGE)->active);
+    check_true("...and ARMS stays unlit", !button_for(&t, UI_ARMS)->active);
+
+    s = blank_ui_state();
+    s.drawing_arms = true;
+    ui_apply_state(&t, s);
+    check_true("ARMS lights up when armed", button_for(&t, UI_ARMS)->active);
+    check_true("...and LINKAGE stays unlit", !button_for(&t, UI_LINKAGE)->active);
+
+    s = blank_ui_state();
     s.editing = false;
     s.running = true;
     ui_apply_state(&t, s);
     check_true("CAM is disabled while running", !button_for(&t, UI_CAM)->enabled);
+    check_true("LINKAGE is disabled while running", !button_for(&t, UI_LINKAGE)->enabled);
+    check_true("ARMS is disabled while running", !button_for(&t, UI_ARMS)->enabled);
 }
 
 int main(void) {
@@ -1391,6 +1799,18 @@ int main(void) {
     test_follower_tracks_a_drawn_cam();
     test_trace_records_sample_times();
     test_cam_button_enablement();
+    test_stroke_preparation();
+    test_fourbar_pose_matches_closed_form();
+    test_grashof_classification();
+    test_four_bar_recovers_an_achievable_curve();
+    test_four_bar_is_deterministic();
+    test_four_bar_cannot_manage_a_star();
+    test_fourier_reproduces_a_circle_exactly();
+    test_fourier_traces_a_star();
+    test_fourier_stops_early_when_accurate_enough();
+    test_fourier_handles_an_open_stroke();
+    test_fourier_rejects_useless_input();
+    test_arm_chain_simulates_and_traces_the_path();
 
     if (failures == 0) {
         printf("\nAll tests passed.\n");

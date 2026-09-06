@@ -22,6 +22,8 @@ typedef enum {
     UI_LINK,
     UI_MOTOR,
     UI_CAM,
+    UI_LINKAGE,
+    UI_ARMS,
     UI_VARY,
     UI_TRACE,
     UI_DELETE,
@@ -64,6 +66,8 @@ typedef struct {
     bool selected_link_can_drive; /* exactly one of its connectors is an anchor */
     bool all_selected_traced;     /* every selected connector is already traced */
     bool drawing_cam;             /* the cam drawing tool is armed */
+    bool drawing_linkage;         /* the four-bar path tool is armed */
+    bool drawing_arms;            /* the arm-chain path tool is armed */
     bool has_selection;           /* any connector or link selected */
     bool can_undo, can_redo;
     bool gravity_on;              /* gravity is in effect (incl. the motorless default) */

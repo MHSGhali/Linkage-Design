@@ -101,6 +101,12 @@ void mechanism_set_anchor(Mechanism *m, int connector_id, bool is_anchor);
  * invalid/dead link id. */
 bool mechanism_toggle_driven(Mechanism *m, int link_id, double default_speed_deg_s);
 
+/* Makes `link_id` a motor turning about `pivot_connector_id` at
+ * `speed_deg_s`. Unlike mechanism_toggle_driven the pivot need NOT be an
+ * anchor: a motor can be mounted on a part that something else moves, which
+ * is what a chain of rotating arms is. Returns false on invalid input. */
+bool mechanism_set_driven_about(Mechanism *m, int link_id, int pivot_connector_id, double speed_deg_s);
+
 /* Sets whether a link's pairwise distances are enforced by the solver
  * (see the Link.rigid comment above). No-op on an invalid/dead link id. */
 void mechanism_set_rigid(Mechanism *m, int link_id, bool rigid);
