@@ -7,6 +7,7 @@
 #include "../src/mechanism.h"
 #include "../src/solver.h"
 #include "../src/export.h"
+#include "../src/ui.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -667,6 +668,202 @@ static void test_working_mechanism_reports_no_jam(void) {
     mechanism_free(&m);
 }
 
+/* --------------------------------------------------------------------------
+ * Toolbar (src/ui.c) -- layout, hit-testing and the enable/active rules.
+ * ----------------------------------------------------------------------- */
+
+static const UiButton *button_for(const Toolbar *t, UiAction action) {
+    for (int i = 0; i < t->count; i++) {
+        if (t->buttons[i].action == action) return &t->buttons[i];
+    }
+    return NULL;
+}
+
+/* A plain editing state with nothing selected -- the baseline each test
+ * tweaks one field of. */
+static UiState blank_ui_state(void) {
+    UiState s;
+    s.editing = true;
+    s.selected_connector_count = 0;
+    s.selected_link = -1;
+    s.selected_link_driven = false;
+    s.selected_link_rigid = true;
+    s.selected_link_can_drive = false;
+    s.all_selected_traced = false;
+    s.has_selection = false;
+    s.can_undo = false;
+    s.can_redo = false;
+    s.gravity_on = false;
+    s.running = false;
+    return s;
+}
+
+static void test_toolbar_layout_is_well_formed(void) {
+    Toolbar t;
+    ui_init(&t);
+
+    check_true("toolbar has every requested button", t.count == 13);
+
+    bool all_inside = true, no_overlap = true, all_have_labels = true;
+    for (int i = 0; i < t.count; i++) {
+        const UiRect *r = &t.buttons[i].rect;
+        if (r->x < 0 || r->x + r->w > UI_TOOLBAR_W || r->y < 0) all_inside = false;
+        if (!t.buttons[i].label || !t.buttons[i].label[0]) all_have_labels = false;
+        for (int j = i + 1; j < t.count; j++) {
+            const UiRect *o = &t.buttons[j].rect;
+            if (r->y < o->y + o->h && o->y < r->y + r->h) no_overlap = false;
+        }
+    }
+    check_true("every button sits inside the toolbar strip", all_inside);
+    check_true("no two buttons overlap", no_overlap);
+    check_true("every button has a label", all_have_labels);
+
+    const UiButton *last = &t.buttons[t.count - 1];
+    check_true("the whole toolbar fits in the window height", last->rect.y + last->rect.h < 700);
+}
+
+static void test_toolbar_hit_testing(void) {
+    Toolbar t;
+    ui_init(&t);
+
+    bool centers_hit = true;
+    for (int i = 0; i < t.count; i++) {
+        const UiRect *r = &t.buttons[i].rect;
+        if (ui_hit_test(&t, r->x + r->w / 2, r->y + r->h / 2) != i) centers_hit = false;
+    }
+    check_true("each button's centre hit-tests to that button", centers_hit);
+
+    /* The gap between the first two buttons belongs to no button. */
+    const UiRect *first = &t.buttons[0].rect;
+    check_true("the gap between buttons hits nothing",
+                ui_hit_test(&t, first->x + first->w / 2, first->y + first->h + 1) == -1);
+
+    check_true("a point right of the strip hits nothing",
+                ui_hit_test(&t, UI_TOOLBAR_W + 40, first->y + 5) == -1);
+    check_true("the canvas is not inside the toolbar", !ui_contains(&t, UI_TOOLBAR_W, 300));
+    check_true("the strip is inside the toolbar", ui_contains(&t, UI_TOOLBAR_W - 1, 300));
+}
+
+static void test_toolbar_enablement_rules(void) {
+    Toolbar t;
+    ui_init(&t);
+
+    /* Nothing selected: the actions that need a selection are all off. */
+    UiState s = blank_ui_state();
+    ui_apply_state(&t, s);
+    check_true("ANCHOR is disabled with nothing selected", !button_for(&t, UI_ANCHOR)->enabled);
+    check_true("LINK is disabled with nothing selected", !button_for(&t, UI_LINK)->enabled);
+    check_true("DELETE is disabled with nothing selected", !button_for(&t, UI_DELETE)->enabled);
+    check_true("MOTOR is disabled with no link selected", !button_for(&t, UI_MOTOR)->enabled);
+    check_true("UNDO is disabled with empty history", !button_for(&t, UI_UNDO)->enabled);
+    check_true("REDO is disabled with empty history", !button_for(&t, UI_REDO)->enabled);
+    check_true("RUN is always available", button_for(&t, UI_RUN)->enabled);
+    check_true("GRAVITY is always available", button_for(&t, UI_GRAVITY)->enabled);
+
+    /* One connector is enough to anchor or trace, but not to link. */
+    s = blank_ui_state();
+    s.selected_connector_count = 1;
+    s.has_selection = true;
+    ui_apply_state(&t, s);
+    check_true("ANCHOR is enabled with one connector selected", button_for(&t, UI_ANCHOR)->enabled);
+    check_true("TRACE is enabled with one connector selected", button_for(&t, UI_TRACE)->enabled);
+    check_true("LINK still needs a second connector", !button_for(&t, UI_LINK)->enabled);
+
+    s.selected_connector_count = 2;
+    ui_apply_state(&t, s);
+    check_true("LINK is enabled with two connectors selected", button_for(&t, UI_LINK)->enabled);
+
+    /* TRACE lights up only when everything selected is already traced. */
+    s.all_selected_traced = true;
+    ui_apply_state(&t, s);
+    check_true("TRACE is lit when the selection is traced", button_for(&t, UI_TRACE)->active);
+
+    /* A selected link with one anchor can be driven; without one it cannot. */
+    s = blank_ui_state();
+    s.selected_link = 0;
+    s.has_selection = true;
+    s.selected_link_can_drive = true;
+    ui_apply_state(&t, s);
+    check_true("MOTOR is enabled on a link with exactly one anchor", button_for(&t, UI_MOTOR)->enabled);
+    check_true("MOTOR is unlit on an undriven link", !button_for(&t, UI_MOTOR)->active);
+    check_true("VARY is enabled on an undriven link", button_for(&t, UI_VARY)->enabled);
+
+    s.selected_link_can_drive = false;
+    ui_apply_state(&t, s);
+    check_true("MOTOR is disabled on a link with no anchor", !button_for(&t, UI_MOTOR)->enabled);
+
+    /* A driven link: MOTOR lit (so it can be turned off), VARY unavailable. */
+    s = blank_ui_state();
+    s.selected_link = 0;
+    s.has_selection = true;
+    s.selected_link_driven = true;
+    ui_apply_state(&t, s);
+    check_true("MOTOR stays enabled on a driven link so it can be undriven",
+                button_for(&t, UI_MOTOR)->enabled);
+    check_true("MOTOR is lit on a driven link", button_for(&t, UI_MOTOR)->active);
+    check_true("VARY is disabled on a driven link", !button_for(&t, UI_VARY)->enabled);
+
+    /* A variable-length link lights VARY. */
+    s = blank_ui_state();
+    s.selected_link = 0;
+    s.has_selection = true;
+    s.selected_link_rigid = false;
+    ui_apply_state(&t, s);
+    check_true("VARY is lit on a variable-length link", button_for(&t, UI_VARY)->active);
+
+    /* History depth drives UNDO/REDO independently. */
+    s = blank_ui_state();
+    s.can_undo = true;
+    ui_apply_state(&t, s);
+    check_true("UNDO is enabled once there is history", button_for(&t, UI_UNDO)->enabled);
+    check_true("REDO stays disabled until something is undone", !button_for(&t, UI_REDO)->enabled);
+    s.can_redo = true;
+    ui_apply_state(&t, s);
+    check_true("REDO is enabled once something has been undone", button_for(&t, UI_REDO)->enabled);
+
+    check_true("GRAVITY is unlit when gravity is off", !button_for(&t, UI_GRAVITY)->active);
+    s.gravity_on = true;
+    ui_apply_state(&t, s);
+    check_true("GRAVITY is lit when gravity is in force", button_for(&t, UI_GRAVITY)->active);
+}
+
+static void test_toolbar_disables_editing_while_running(void) {
+    Toolbar t;
+    ui_init(&t);
+
+    UiState s = blank_ui_state();
+    s.editing = false;
+    s.running = true;
+    /* Plenty selected, plenty of history -- running is what must gate these. */
+    s.selected_connector_count = 3;
+    s.has_selection = true;
+    s.selected_link = 0;
+    s.selected_link_can_drive = true;
+    s.can_undo = true;
+    s.can_redo = true;
+    ui_apply_state(&t, s);
+
+    check_true("JOINT is disabled while running", !button_for(&t, UI_JOINT)->enabled);
+    check_true("LINK is disabled while running", !button_for(&t, UI_LINK)->enabled);
+    check_true("ANCHOR is disabled while running", !button_for(&t, UI_ANCHOR)->enabled);
+    check_true("MOTOR is disabled while running", !button_for(&t, UI_MOTOR)->enabled);
+    check_true("DELETE is disabled while running", !button_for(&t, UI_DELETE)->enabled);
+    check_true("UNDO is disabled while running", !button_for(&t, UI_UNDO)->enabled);
+    check_true("REDO is disabled while running", !button_for(&t, UI_REDO)->enabled);
+    check_true("EXPORT is disabled while running", !button_for(&t, UI_EXPORT)->enabled);
+
+    check_true("GRAVITY still works while running", button_for(&t, UI_GRAVITY)->enabled);
+    check_true("CLEAR still works while running", button_for(&t, UI_CLEAR)->enabled);
+    check_true("RUN still works while running", button_for(&t, UI_RUN)->enabled);
+    check_true("RUN is lit while running", button_for(&t, UI_RUN)->active);
+    check_true("RUN reads STOP while running", strcmp(button_for(&t, UI_RUN)->label, "STOP") == 0);
+
+    s.running = false;
+    s.editing = true;
+    ui_apply_state(&t, s);
+    check_true("RUN reads RUN again when stopped", strcmp(button_for(&t, UI_RUN)->label, "RUN") == 0);
+}
+
 int main(void) {
     test_four_bar_reduces_to_closed_form();
     test_ternary_link_rigidity();
@@ -684,6 +881,10 @@ int main(void) {
     test_toggling_back_to_rigid_reenforces_constraint();
     test_jam_detection();
     test_working_mechanism_reports_no_jam();
+    test_toolbar_layout_is_well_formed();
+    test_toolbar_hit_testing();
+    test_toolbar_enablement_rules();
+    test_toolbar_disables_editing_while_running();
 
     if (failures == 0) {
         printf("\nAll tests passed.\n");

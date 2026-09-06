@@ -24,6 +24,15 @@ make test   # builds and runs the headless kinematics regression tests
 ./linkage_design
 ```
 
+Every command has a button in the toolbar down the left edge **and** a
+keyboard shortcut — the two are interchangeable, and each button shows its
+shortcut on the right. Buttons grey out when they don't apply (LINK needs two
+connectors selected, MOTOR needs a link with exactly one anchor, and so on)
+and light up yellow when the thing they control is on (GRAVITY while gravity
+is in force, MOTOR on a driven link, VARY on a variable-length link, TRACE on
+a traced connector). While the simulation runs, the editing buttons are
+disabled, RUN becomes STOP, and GRAVITY and CLEAR keep working.
+
 - **Edit mode** (mouse):
   - Click empty space: place a connector and select it
   - Drag from empty space: rubber-band select connectors in the box
@@ -32,6 +41,8 @@ make test   # builds and runs the headless kinematics regression tests
   - Drag a selected connector: move the whole selection (reshapes any
     attached links — rest lengths are only frozen when you press `R`)
 - **Edit mode** (keyboard):
+  - `J`: place a connector at the centre of the view and select it (the
+    JOINT button does the same, for when you'd rather not aim a click)
   - `L`: link the selected connectors (rigid; needs 2+ selected)
   - `A`: toggle anchor (grounded) on the selected connectors
   - `M`: toggle the selected link as a driven motor (it must have exactly
@@ -53,6 +64,8 @@ make test   # builds and runs the headless kinematics regression tests
   - Escape: clear the selection
   - Cmd/Ctrl+Z: undo the last edit (placing/moving/deleting a connector,
     linking, toggling anchor/motor/length/tracing, changing motor speed)
+  - Shift+Cmd/Ctrl+Z or Cmd/Ctrl+Y: redo what you just undid. Making a fresh
+    edit after undoing discards the redo history, as usual.
 - Scroll wheel: zoom in/out, centered on the cursor
 - `C`: clear all recorded traces (works in edit mode or mid-simulation,
   without untracing anything)
@@ -78,9 +91,10 @@ Fixed-length links are treated as genuinely rigid. If the motor reaches a
 position the mechanism cannot physically assume without a fixed link
 changing length — a non-Grashof linkage hitting its limit position, say —
 the simulation rolls that step back and stops, leaving every link at exactly
-its rest length, and prints a message. It stays locked until you press `R`
-to stop, so you can see precisely where it bound up. To let it through,
-either change the geometry or press `V` on the link that needs to give.
+its rest length, and prints a message. It stays locked until you stop the
+simulation (STOP / `R`), so you can see precisely where it bound up. To let it
+through, either change the geometry or hit VARY (`V`) on the link that needs
+to give.
 
 ## Exporting to Blender
 
@@ -132,5 +146,14 @@ Gravity is a Verlet integration step applied to free connectors before that
 same Gauss-Newton solve, which then projects them back onto the rigid-link
 constraint manifold — so gravity is just an external force on
 otherwise-unconstrained degrees of freedom, not a separate physics engine.
-`src/export.c` writes the Blender script; undo (in `src/main.c`) is a
-bounded stack of full `mechanism_clone()` snapshots taken before each edit.
+`src/export.c` writes the Blender script; undo/redo (in `src/main.c`) is a
+pair of bounded stacks of full `mechanism_clone()` snapshots — one pushed
+before each edit, the other filled by undoing and discarded by the next edit.
+
+`src/ui.c` owns the toolbar: its layout, hit-testing, and the rules deciding
+which buttons are enabled and lit. It deliberately has no SDL dependency, so
+those rules are covered by the headless tests alongside the kinematics ones;
+`render.c` draws it, including a small stroke-drawn alphabet that keeps the
+app free of any font dependency (the same reason link dimensions are drawn
+as hand-rolled seven-segment numerals). Every button and its hotkey call the
+same function in `main.c`, so the two can't drift apart.
