@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <stdbool.h>
@@ -309,36 +310,136 @@ static void test_mechanism_clone_is_independent_deep_copy(void) {
     mechanism_free(&clone);
 }
 
+/* Reads a whole file into a heap buffer, or NULL. Caller frees. */
+static char *read_file(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (len < 0) { fclose(f); return NULL; }
+    char *buf = malloc((size_t)len + 1);
+    size_t n = fread(buf, 1, (size_t)len, f);
+    buf[n] = '\0';
+    fclose(f);
+    return buf;
+}
+
+/* Counts non-overlapping occurrences of `needle` in `haystack`. */
+static int count_occurrences(const char *haystack, const char *needle) {
+    int count = 0;
+    size_t nlen = strlen(needle);
+    for (const char *p = strstr(haystack, needle); p; p = strstr(p + nlen, needle)) count++;
+    return count;
+}
+
 static void test_export_blender_script(void) {
+    /* A Grashof crank-rocker (ground 400, crank 100, coupler 350, rocker
+     * 300: s+l = 500 <= p+q = 650, with the crank shortest), so the crank
+     * turns all the way round and the export has a full cycle of real
+     * motion to record rather than binding partway. B is placed at the
+     * circle-circle intersection that makes those rest lengths exact. */
+    Mechanism m;
+    mechanism_init(&m);
+    double bx = 100.0 + (300.0 * 300.0 - 300.0 * 300.0 + 350.0 * 350.0) / (2.0 * 300.0);
+    double by = sqrt(350.0 * 350.0 - (bx - 100.0) * (bx - 100.0));
+    int o2 = mechanism_add_connector(&m, (Vec2){ 0, 0 }, true);
+    int o4 = mechanism_add_connector(&m, (Vec2){ 400, 0 }, true);
+    int a = mechanism_add_connector(&m, (Vec2){ 100, 0 }, false);
+    int b = mechanism_add_connector(&m, (Vec2){ bx, by }, false);
+    int crank[2] = { o2, a };
+    int coupler[2] = { a, b };
+    int rocker[2] = { b, o4 };
+    mechanism_add_link(&m, crank, 2);
+    mechanism_add_link(&m, coupler, 2);
+    mechanism_add_link(&m, rocker, 2);
+    mechanism_toggle_driven(&m, 0, 90.0);
+
+    const char *path = "test_export_output.py";
+    SolverParams params = solver_default_params();
+    check_true("export_blender_script succeeds", export_blender_script(&m, params, path));
+
+    char *buf = read_file(path);
+    check_true("exported file can be reopened", buf != NULL);
+    if (buf) {
+        check_true("script sets metric units", strstr(buf, "unit_settings.system = 'METRIC'") != NULL);
+        check_true("script builds joints", strstr(buf, "def make_joint(") != NULL);
+        check_true("script builds rods", strstr(buf, "def make_rod(") != NULL);
+        check_true("script names the anchor joints", strstr(buf, "(\"Anchor_0\", True)") != NULL);
+        check_true("script names the moving joints", strstr(buf, "(\"Joint_2\", False)") != NULL);
+        check_true("script includes a rod for the crank link", strstr(buf, "(\"Link0_c0c2\"") != NULL);
+        check_true("script includes a rod for the coupler link", strstr(buf, "(\"Link1_c2c3\"") != NULL);
+
+        /* The animation itself: a frame table, keyframes, and a frame range. */
+        check_true("script emits a per-frame position table", strstr(buf, "FRAMES = [") != NULL);
+        check_true("script keyframes rod position", strstr(buf, "keyframe_insert('location'") != NULL);
+        check_true("script keyframes rod orientation", strstr(buf, "keyframe_insert('rotation_quaternion'") != NULL);
+        check_true("script keyframes rod length", strstr(buf, "keyframe_insert('scale'") != NULL);
+        check_true("script sets the scene frame range", strstr(buf, "scene.frame_end") != NULL);
+        check_true("script uses linear interpolation between samples",
+                   strstr(buf, "'LINEAR'") != NULL);
+
+        int frame_rows = count_occurrences(buf, "    [(");
+        check_true("a fully rotating mechanism records every animation frame",
+                   frame_rows == EXPORT_FRAMES);
+
+        /* A static export would repeat one pose. Compare the first row
+         * against one a quarter of the way through rather than the last:
+         * the crank completes exactly one revolution, so the final frame
+         * lands back on the starting pose (the animation loops cleanly). */
+        const char *first_row = strstr(buf, "    [(");
+        const char *quarter_row = first_row;
+        for (int i = 0; i < EXPORT_FRAMES / 4 && quarter_row; i++) {
+            quarter_row = strstr(quarter_row + 6, "    [(");
+        }
+        /* Compare the WHOLE row: the anchors are written first and never
+         * move, so a short prefix would match no matter what the mechanism
+         * is doing. */
+        bool rows_differ = false;
+        if (first_row && quarter_row) {
+            size_t len_a = strcspn(first_row, "\n");
+            size_t len_b = strcspn(quarter_row, "\n");
+            rows_differ = (len_a != len_b) || (memcmp(first_row, quarter_row, len_a) != 0);
+        }
+        check_true("the recorded frames are not all the same pose", rows_differ);
+
+        free(buf);
+    }
+
+    remove(path);
+    mechanism_free(&m);
+}
+
+static void test_export_animation_actually_moves(void) {
+    /* Guard against exporting a table of identical frames (which is what a
+     * static export looks like): the driven crank's tip must trace out a
+     * genuinely varying path across the recorded frames. */
     Mechanism m;
     mechanism_init(&m);
     int o2 = mechanism_add_connector(&m, (Vec2){ 0, 0 }, true);
-    int o4 = mechanism_add_connector(&m, (Vec2){ 100, 0 }, true);
-    int a = mechanism_add_connector(&m, (Vec2){ 20, 0 }, false);
+    int a = mechanism_add_connector(&m, (Vec2){ 100, 0 }, false);
     int crank[2] = { o2, a };
-    int rocker[2] = { a, o4 };
     mechanism_add_link(&m, crank, 2);
-    mechanism_add_link(&m, rocker, 2);
+    mechanism_toggle_driven(&m, 0, 90.0);
 
-    const char *path = "test_export_output.py";
-    check_true("export_blender_script succeeds", export_blender_script(&m, path));
+    const char *path = "test_export_anim.py";
+    SolverParams params = solver_default_params();
+    check_true("animated export succeeds", export_blender_script(&m, params, path));
 
-    FILE *f = fopen(path, "r");
-    check_true("exported file can be reopened", f != NULL);
-    if (f) {
-        char buf[8192];
-        size_t n = fread(buf, 1, sizeof(buf) - 1, f);
-        buf[n] = '\0';
-        fclose(f);
-
-        check_true("script sets metric units", strstr(buf, "unit_settings.system = 'METRIC'") != NULL);
-        check_true("script defines add_rod", strstr(buf, "def add_rod(") != NULL);
-        check_true("script defines add_joint", strstr(buf, "def add_joint(") != NULL);
-        check_true("script includes an anchor joint call", strstr(buf, "add_joint(\"Anchor_0\"") != NULL);
-        check_true("script includes a non-anchor joint call", strstr(buf, "add_joint(\"Joint_2\"") != NULL);
-        check_true("script includes a rod for the crank link", strstr(buf, "add_rod(\"Link0_c0c2\"") != NULL);
-        check_true("script includes a rod for the rocker link", strstr(buf, "add_rod(\"Link1_c2c1\"") != NULL);
-        check_true("script encodes the crank endpoint coordinates", strstr(buf, "20.000000, 0.000000") != NULL);
+    char *buf = read_file(path);
+    check_true("animated export can be reopened", buf != NULL);
+    if (buf) {
+        /* The crank tip starts at (100,0); a quarter turn later it should be
+         * near (0,100), and the table should contain both extremes. */
+        char *frames = strstr(buf, "FRAMES = [");
+        check_true("frame table present", frames != NULL);
+        if (frames) {
+            check_true("first frame holds the starting pose", strstr(frames, "(100.0000,0.0000)") != NULL);
+            /* Somewhere in the revolution the tip passes near the far side. */
+            check_true("the crank tip swings to the opposite side",
+                       strstr(frames, "(-99.") != NULL || strstr(frames, "(-100.") != NULL);
+        }
+        free(buf);
     }
 
     remove(path);
@@ -575,6 +676,7 @@ int main(void) {
     test_connector_tracing();
     test_mechanism_clone_is_independent_deep_copy();
     test_export_blender_script();
+    test_export_animation_actually_moves();
     test_gravity_moves_free_unconstrained_connector();
     test_gravity_preserves_rigid_constraint();
     test_variable_link_holds_its_length_when_nothing_forces_it();

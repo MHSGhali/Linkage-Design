@@ -3,15 +3,27 @@
 
 #include <stdbool.h>
 #include "mechanism.h"
+#include "solver.h"
+
+/* Number of animation samples written by export_blender_script. */
+#define EXPORT_FRAMES 120
 
 /* Writes a ready-to-run Blender Python script to `filepath`: one cylinder
- * per rigid pairwise link edge and one empty per connector (joint/anchor),
- * positioned from the mechanism's CURRENT connector positions (not frozen
- * rest lengths, so it reflects whatever is currently drawn/edited).
+ * per pairwise link edge and one empty per connector (joint/anchor), plus a
+ * keyframe per sample so the mechanism ANIMATES in Blender exactly as it
+ * does here.
+ *
+ * The motion is produced by simulating a private copy of the mechanism, so
+ * the live one is left untouched. A driven mechanism is sampled over one
+ * full revolution of its fastest motor; one with no motor is sampled over a
+ * few seconds of gravity. If the mechanism binds partway (a fixed-length
+ * link would have to change length), sampling stops there and the animation
+ * covers only the part it could actually reach.
+ *
  * Convention: 1 mechanism world unit = 1 mm; the script sets the Blender
  * scene's display units to millimeters and converts coordinates to meters
  * (Blender's internal unit) accordingly. Returns false if the file could
  * not be opened for writing. */
-bool export_blender_script(const Mechanism *m, const char *filepath);
+bool export_blender_script(const Mechanism *m, SolverParams params, const char *filepath);
 
 #endif

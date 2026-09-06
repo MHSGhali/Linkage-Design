@@ -362,8 +362,16 @@ int main(void) {
                     }
                 } else if (k == SDLK_e) {
                     const char *path = "linkage_export.py";
-                    if (export_blender_script(&mech, path)) {
-                        printf("Exported to %s -- run it inside Blender's Scripting tab, or `blender --python %s`.\n", path, path);
+                    /* Export the motion the app would actually show, including
+                     * gravity applying automatically to a motorless mechanism. */
+                    SolverParams export_params = params;
+                    if (!gravity_set_by_user && !mechanism_has_driven_link(&mech)) {
+                        export_params.gravity = (Vec2){ 0.0, DEFAULT_GRAVITY_MAGNITUDE };
+                    }
+                    if (export_blender_script(&mech, export_params, path)) {
+                        printf("Exported %d animation frames to %s -- run it inside Blender's Scripting tab "
+                                "(or `blender --python %s`), then press Space to play.\n",
+                                EXPORT_FRAMES, path, path);
                     } else {
                         printf("Failed to write %s\n", path);
                     }

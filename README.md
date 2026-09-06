@@ -84,11 +84,24 @@ either change the geometry or press `V` on the link that needs to give.
 
 ## Exporting to Blender
 
-Pressing `E` writes `linkage_export.py` in the current directory: a script
-that, run inside Blender (Scripting tab, or `blender --python
-linkage_export.py`), creates one cylinder per rigid link edge and one empty
-per joint (anchors and regular connectors are named `Anchor_N` /
-`Joint_N`), positioned from the mechanism's current connector coordinates.
+Pressing `E` writes `linkage_export.py` in the current directory. Run it
+inside Blender (Scripting tab, or `blender --python linkage_export.py`) and
+it builds one cylinder per link edge and one empty per joint (named
+`Anchor_N` / `Joint_N`) — **and animates them**: press Space in Blender to
+watch the mechanism run exactly as it does here.
+
+The motion is produced by simulating a private copy of the mechanism, so
+exporting never disturbs what's on screen. A driven mechanism is sampled
+over one full revolution of its fastest motor, so the animation loops
+cleanly; a motorless one is sampled over a few seconds of gravity. If the
+mechanism binds partway, sampling stops at the bind and the animation covers
+only what it could actually reach. Playback is set to real time via the
+scene's frame rate.
+
+Each rod is a unit-depth cylinder scaled along its local Z per frame, so
+variable-length links animate their length correctly too. (Apply the scale
+in Blender before exporting for print.)
+
 Convention: **1 world unit = 1 mm** — the script sets the scene's display
 units to millimeters accordingly. Rod radius is a constant
 (`ROD_RADIUS_MM`) at the top of the generated script, since this 2D tool
