@@ -53,3 +53,10 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# Project build outputs (extensionless binaries produced by the Makefile)
+/linkage_design
+/tests/test_mechanism
+
+# Generated Blender export (created by pressing E in the app)
+/linkage_export.py
