@@ -31,14 +31,25 @@ make test   # builds and runs the headless kinematics regression tests
 ./linkage_design
 ```
 
+The window is resizable, and **`H` lists every key inside it** — there is
+nothing you have to read here first.
+
 Every command has a button in the toolbar down the left edge **and** a
 keyboard shortcut — the two are interchangeable, and each button shows its
 shortcut on the right. Buttons grey out when they don't apply (LINK needs two
 connectors selected, MOTOR needs a link with exactly one anchor, and so on)
 and light up yellow when the thing they control is on (GRAVITY while gravity
 is in force, MOTOR on a driven link, VARY on a variable-length link, TRACE on
-a traced connector). While the simulation runs, the editing buttons are
-disabled, RUN becomes STOP, and GRAVITY and CLEAR keep working.
+a traced connector). Pressing a key runs it through exactly the same rules the
+button obeys: a command that isn't available says what it wants selected
+first, in the same words its tooltip uses. While the simulation runs, the
+editing buttons are disabled, RUN becomes STOP, and GRAVITY, CLEAR, FIT and
+PAUSE keep working.
+
+**Everything the program says appears on the canvas**, bottom-left, and fades
+after a few seconds; a condition that is still true (a jam) stays up as a
+banner across the top until it isn't. The same text is still printed to the
+terminal for anyone running it from one.
 
 - **Edit mode** (mouse):
   - Click empty space: place a connector and select it
@@ -47,6 +58,9 @@ disabled, RUN becomes STOP, and GRAVITY and CLEAR keep working.
   - Click a link's edge: select that link
   - Drag a selected connector: move the whole selection (reshapes any
     attached links — rest lengths are only frozen when you press `R`)
+  - Middle-drag: pan the view. Arrow keys do the same, `0` puts it back to
+    1:1, and `F` (FIT) frames the whole mechanism — use it whenever something
+    has wandered off the edge.
 - Hovering a toolbar button for a moment shows a **tooltip** saying what it
   does and what it wants selected first — the buttons that behave differently
   depending on the selection (GEAR above all) say so there.
@@ -101,8 +115,14 @@ disabled, RUN becomes STOP, and GRAVITY and CLEAR keep working.
     connector takes a colour of its own; its path is drawn in the canvas and
     its x and y are plotted against time below (see **The motion plot**).
     Both reset each time you press `R`.
-  - `E`: export the mechanism to `linkage_export.py`, a ready-to-run Blender
-    Python script (see below)
+  - `E`: export the mechanism to a ready-to-run Blender Python script. You are
+    asked for the file name, and told if one of that name already exists (see
+    **Exporting to Blender** below).
+  - Cmd/Ctrl+`S`: **save the mechanism** so you can come back to it, and
+    Cmd/Ctrl+`O` to open one again. Shift+Cmd/Ctrl+`S` saves under a new name.
+    This is the machine itself, not the animation EXPORT writes — see
+    **Saving your work** below.
+  - `H` or `?`: the list of every key. `F`: fit the view to the mechanism.
   - Delete / Backspace: delete the selection
   - Escape: clear the selection
   - Cmd/Ctrl+Z: undo the last edit (placing/moving/deleting a connector,
@@ -122,6 +142,12 @@ disabled, RUN becomes STOP, and GRAVITY and CLEAR keep working.
   otherwise nothing would make it move at all. Pressing `G` takes over from
   there: once you've set it yourself, your choice applies either way.
 - `R`: run the simulation / stop and return to the pre-run layout
+- Space: **pause** where it is, without putting anything back. While paused,
+  `.` advances exactly one frame — which is how you watch a linkage go through
+  a dead centre. `<` and `>` run it anywhere from a tenth of real time to four
+  times it, live.
+- While it runs you can still click a part to select it and use `+`/`-` to
+  change a motor's speed, so "what if it turned faster" needs no stopping.
 
 ## The motion plot
 
@@ -397,14 +423,35 @@ Fixed-length links are treated as genuinely rigid. If the motor reaches a
 position the mechanism cannot physically assume without a fixed link
 changing length — a non-Grashof linkage hitting its limit position, say —
 the simulation rolls that step back and stops, leaving every link at exactly
-its rest length, and prints a message. It stays locked until you stop the
+its rest length, and says so in a banner across the top of the canvas (RUN
+also changes to read JAMMED). It stays locked until you stop the
 simulation (STOP / `R`), so you can see precisely where it bound up. To let it
 through, either change the geometry or hit VARY (`V`) on the link that needs
 to give.
 
+## Saving your work
+
+Cmd/Ctrl+`S` writes the mechanism to a `.linkage` file: a plain-text document
+listing the pins, bodies, joints and cam profiles, which reopens with
+Cmd/Ctrl+`O` exactly as you left it — same geometry, same motors, same motion.
+Everything that can be worked out again (rest lengths, pitch radii, recorded
+traces) is left out and rebuilt on opening, so the file stays small and
+readable.
+
+The title bar shows the file's name and marks it with `*` while there are
+unsaved changes, and closing the window with changes outstanding asks first.
+A file that turns out to be damaged is refused with a message saying which
+line failed — what is already on screen is never disturbed by a failed open.
+
+Names without a directory go in the working directory, or in your home
+directory when that isn't writable (which is what happens when the app is
+launched from a file manager). Either way the message tells you the full path
+it wrote.
+
 ## Exporting to Blender
 
-Pressing `E` writes `linkage_export.py` in the current directory. Run it
+Pressing `E` asks for a name and writes a Blender script — it used to write
+`linkage_export.py` over whatever was already called that, without asking. Run it
 inside Blender (Scripting tab, or `blender --python linkage_export.py`) and
 it builds one cylinder per link edge and one empty per joint (named
 `Anchor_N` / `Joint_N`) — **and animates them**: press Space in Blender to

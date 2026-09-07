@@ -13,6 +13,11 @@ typedef struct {
 } ButtonSpec;
 
 static const ButtonSpec BUTTON_SPECS[] = {
+    { UI_OPEN,    "OPEN",    "^O",
+      "Open a mechanism you saved earlier. You will be asked for the file name.", false },
+    { UI_SAVE,    "SAVE",    "^S",
+      "Save this mechanism so you can come back to it. Unlike EXPORT, which writes an "
+      "animation, this writes the machine itself.", false },
     { UI_TEMPLATE,"TEMPLATE","N",
       "Open the gallery of standard mechanisms. Click one to drop it in, running.", false },
     { UI_JOINT,   "JOINT",   "J",
@@ -53,6 +58,9 @@ static const ButtonSpec BUTTON_SPECS[] = {
       "Step back through your edits.", true  },
     { UI_REDO,    "REDO",    "^Y",
       "Step forward again through undone edits.", false },
+    { UI_FIT,     "FIT",     "F",
+      "Pan and zoom until the whole mechanism is on screen. Use it when something "
+      "has wandered off the edge. Works while running.", false },
     { UI_GRAVITY, "GRAVITY", "G",
       "Turn gravity on or off. A mechanism with no motor runs under gravity by default.", true  },
     { UI_CLEAR,   "CLEAR",   "C",
@@ -60,31 +68,58 @@ static const ButtonSpec BUTTON_SPECS[] = {
     { UI_EXPORT,  "EXPORT",  "E",
       "Write the motion out as a Blender script, ready to run and play.", false },
     { UI_RUN,     "RUN",     "R",
-      "Start or stop the simulation.", false },
+      "Start or stop the simulation. Stopping puts every part back where it started.", false },
+    { UI_HELP,    "HELP",    "H",
+      "List every key and what it does. Everything here has a button as well, and every "
+      "button shows its key on the right.", true  },
+    { UI_PAUSE,   "PAUSE",   "SPC",
+      "Hold the mechanism still where it is, without putting it back. Then . steps one "
+      "frame at a time, and < and > slow it down or speed it up.", false },
 };
 #define BUTTON_SPEC_COUNT ((int)(sizeof BUTTON_SPECS / sizeof BUTTON_SPECS[0]))
 
-void ui_init(Toolbar *t) {
+void ui_init(Toolbar *t, int strip_height) {
     t->count = 0;
     t->hover = -1;
     t->pressed = -1;
 
+    int n = BUTTON_SPEC_COUNT < UI_ACTION_COUNT ? BUTTON_SPEC_COUNT : UI_ACTION_COUNT;
+    int groups = 0;
+    for (int i = 1; i < n; i++) if (BUTTON_SPECS[i].group_start) groups++;
+
+    /* Squeeze to fit rather than running off the bottom of the window, where
+     * a button can neither be read nor pressed. Spacing goes first, since it
+     * costs the least, and only then the buttons themselves -- down to a floor
+     * where the label would stop being legible. */
+    int button_h = UI_BUTTON_H, gap = UI_BUTTON_GAP, group_gap = UI_GROUP_GAP;
+    int needed = UI_TOP_MARGIN + n * (button_h + gap) + groups * group_gap;
+    if (strip_height > 0 && needed > strip_height) {
+        gap = 2;
+        group_gap = 4;
+        needed = UI_TOP_MARGIN + n * (button_h + gap) + groups * group_gap;
+        if (needed > strip_height) {
+            int room = strip_height - UI_TOP_MARGIN - groups * group_gap - n * gap;
+            button_h = room / n;
+            if (button_h < UI_BUTTON_MIN_H) button_h = UI_BUTTON_MIN_H;
+        }
+    }
+
     int y = UI_TOP_MARGIN;
-    for (int i = 0; i < BUTTON_SPEC_COUNT && i < UI_ACTION_COUNT; i++) {
+    for (int i = 0; i < n; i++) {
         const ButtonSpec *spec = &BUTTON_SPECS[i];
-        if (spec->group_start && i > 0) y += UI_GROUP_GAP;
+        if (spec->group_start && i > 0) y += group_gap;
 
         UiButton *b = &t->buttons[t->count++];
         b->action = spec->action;
         b->label = spec->label;
         b->hint = spec->hint;
         b->tip = spec->tip;
-        b->rect = (UiRect){ UI_MARGIN, y, UI_BUTTON_W, UI_BUTTON_H };
+        b->rect = (UiRect){ UI_MARGIN, y, UI_BUTTON_W, button_h };
         b->enabled = true;
         b->active = false;
         b->separator_above = spec->group_start && i > 0;
 
-        y += UI_BUTTON_H + UI_BUTTON_GAP;
+        y += button_h + gap;
     }
 }
 
@@ -102,11 +137,39 @@ bool ui_contains(const Toolbar *t, int x, int y) {
     return x >= 0 && x < UI_TOOLBAR_W;
 }
 
+static const UiButton *button_for_action(const Toolbar *t, UiAction action) {
+    for (int i = 0; i < t->count; i++) {
+        if (t->buttons[i].action == action) return &t->buttons[i];
+    }
+    return NULL;
+}
+
+bool ui_action_enabled(const Toolbar *t, UiAction action) {
+    const UiButton *b = button_for_action(t, action);
+    return b && b->enabled;
+}
+
+const char *ui_action_label(const Toolbar *t, UiAction action) {
+    const UiButton *b = button_for_action(t, action);
+    return b ? b->label : "";
+}
+
+const char *ui_action_tip(const Toolbar *t, UiAction action) {
+    const UiButton *b = button_for_action(t, action);
+    return b ? b->tip : "";
+}
+
 void ui_apply_state(Toolbar *t, UiState s) {
     bool have_link = (s.selected_link >= 0);
     for (int i = 0; i < t->count; i++) {
         UiButton *b = &t->buttons[i];
         switch (b->action) {
+        case UI_OPEN:
+        case UI_SAVE:
+            /* The document, not the mechanism: not while it is moving. */
+            b->enabled = s.editing;
+            b->active = false;
+            break;
         case UI_TEMPLATE:
             b->enabled = s.editing;
             b->active = s.gallery_open;
@@ -182,6 +245,11 @@ void ui_apply_state(Toolbar *t, UiState s) {
             b->enabled = s.editing;
             b->active = false;
             break;
+        case UI_FIT:
+            /* A view control, not an edit: always available, running or not. */
+            b->enabled = true;
+            b->active = false;
+            break;
         case UI_GRAVITY:
             /* Works mid-run, like the G key. */
             b->enabled = true;
@@ -191,10 +259,21 @@ void ui_apply_state(Toolbar *t, UiState s) {
             b->enabled = true;
             b->active = false;
             break;
+        case UI_HELP:
+            b->enabled = true;
+            b->active = s.help_open;
+            break;
+        case UI_PAUSE:
+            b->enabled = s.running;
+            b->active = s.paused;
+            b->label = s.paused ? "RESUME" : "PAUSE";
+            break;
         case UI_RUN:
             b->enabled = true;
             b->active = s.running;
-            b->label = s.running ? "STOP" : "RUN";
+            /* A jam is not a pause: say so on the one control that is still
+             * worth pressing. */
+            b->label = s.running ? (s.jammed ? "JAMMED" : "STOP") : "RUN";
             break;
         case UI_NONE:
         case UI_ACTION_COUNT:

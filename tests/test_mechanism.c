@@ -12,6 +12,8 @@
 #include "../src/synth.h"
 #include "../src/joints.h"
 #include "../src/templates.h"
+#include "../src/status.h"
+#include "../src/scene.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -715,14 +717,18 @@ static UiState blank_ui_state(void) {
     s.can_redo = false;
     s.gravity_on = false;
     s.running = false;
+    s.jammed = false;
+    s.paused = false;
     return s;
 }
 
 static void test_toolbar_layout_is_well_formed(void) {
     Toolbar t;
-    ui_init(&t);
+    ui_init(&t, 900);
 
-    check_true("toolbar has every requested button", t.count == 20);
+    /* One button per action, so a command can never be added to the enum
+     * without a button (and a tooltip, and a hotkey) to go with it. */
+    check_true("the toolbar has a button for every action", t.count == UI_ACTION_COUNT - 1);
 
     bool all_inside = true, no_overlap = true, all_have_labels = true;
     for (int i = 0; i < t.count; i++) {
@@ -746,7 +752,7 @@ static void test_toolbar_layout_is_well_formed(void) {
 
 static void test_toolbar_hit_testing(void) {
     Toolbar t;
-    ui_init(&t);
+    ui_init(&t, 900);
 
     bool centers_hit = true;
     for (int i = 0; i < t.count; i++) {
@@ -768,7 +774,7 @@ static void test_toolbar_hit_testing(void) {
 
 static void test_toolbar_enablement_rules(void) {
     Toolbar t;
-    ui_init(&t);
+    ui_init(&t, 900);
 
     /* Nothing selected: the actions that need a selection are all off. */
     UiState s = blank_ui_state();
@@ -851,7 +857,7 @@ static void test_toolbar_enablement_rules(void) {
 
 static void test_toolbar_disables_editing_while_running(void) {
     Toolbar t;
-    ui_init(&t);
+    ui_init(&t, 900);
 
     UiState s = blank_ui_state();
     s.editing = false;
@@ -2262,7 +2268,7 @@ static void test_joint_deletion_cascades(void) {
  * nobody can learn from, and the stroke font only draws what it knows. */
 static void test_every_button_has_a_tooltip(void) {
     Toolbar t;
-    ui_init(&t);
+    ui_init(&t, 900);
     bool all_present = true, all_sane = true, all_drawable = true;
     for (int i = 0; i < t.count; i++) {
         const char *tip = t.buttons[i].tip;
@@ -2273,7 +2279,9 @@ static void test_every_button_has_a_tooltip(void) {
             bool ok = (*c >= 'A' && *c <= 'Z') || (*c >= 'a' && *c <= 'z') ||
                        (*c >= '0' && *c <= '9') ||
                        *c == ' ' || *c == '.' || *c == ',' || *c == '-' ||
-                       *c == '/' || *c == '+' || *c == ':';
+                       *c == '/' || *c == '+' || *c == ':' || *c == ';' ||
+                       *c == '(' || *c == ')' || *c == '!' || *c == '?' ||
+                       *c == '%' || *c == '\'' || *c == '<' || *c == '>';
             if (!ok) all_drawable = false;
         }
     }
@@ -2293,7 +2301,7 @@ static void test_every_button_has_a_tooltip(void) {
 
 static void test_cam_button_enablement(void) {
     Toolbar t;
-    ui_init(&t);
+    ui_init(&t, 900);
 
     /* The cam tool takes no selection at all -- that was the whole problem
      * with the old version -- so it is offered whenever you can edit. */
@@ -2362,7 +2370,278 @@ static void test_cam_button_enablement(void) {
     check_true("ARMS is disabled while running", !button_for(&t, UI_ARMS)->enabled);
 }
 
+/* --------------------------------------------------------------------------
+ * The status log -- the app's message channel
+ * ----------------------------------------------------------------------- */
+
+static void test_status_log_keeps_the_newest_messages(void) {
+    StatusLog log;
+    status_init(&log);
+    check_true("a fresh log has nothing to show", log.count == 0 && !log.sticky_set);
+
+    status_push(&log, STATUS_INFO, 1000, "one");
+    status_push(&log, STATUS_WARN, 1000, "two");
+    status_push(&log, STATUS_INFO, 1000, "three");
+    status_push(&log, STATUS_INFO, 1000, "four");
+
+    const StatusMessage *shown[STATUS_HISTORY];
+    int n = status_visible(&log, 1000, shown, STATUS_HISTORY);
+    check_true("the log holds its last three messages", n == STATUS_HISTORY);
+    check_true("the newest message comes first", strcmp(shown[0]->text, "four") == 0);
+    check_true("the oldest one was dropped", strcmp(shown[2]->text, "two") == 0);
+}
+
+static void test_repeating_a_message_restamps_it(void) {
+    StatusLog log;
+    status_init(&log);
+    status_push(&log, STATUS_WARN, 1000, "select a pin first");
+    status_push(&log, STATUS_WARN, 4000, "select a pin first");
+
+    check_true("saying the same thing twice does not scroll the log", log.count == 1);
+    check_true("but it does restamp it", log.recent[0].stamp_ms == 4000);
+}
+
+static void test_messages_fade_and_stickies_do_not(void) {
+    StatusLog log;
+    status_init(&log);
+    status_push(&log, STATUS_INFO, 1000, "wheel radius 92");
+
+    const StatusMessage *shown[STATUS_HISTORY];
+    check_true("a fresh message is solid", status_alpha(&log.recent[0], 1000) == 255);
+    check_true("it is still up part-way through",
+                status_visible(&log, 1000 + STATUS_FADE_MS / 2, shown, STATUS_HISTORY) == 1);
+    check_true("and gone after its time",
+                status_visible(&log, 1000 + STATUS_FADE_MS + 1, shown, STATUS_HISTORY) == 0);
+
+    /* A jam is a condition, not a moment: it holds until it is cleared. */
+    status_set_sticky(&log, STATUS_ERROR, "JAMMED");
+    check_true("a sticky message stays set", log.sticky_set);
+    status_clear_sticky(&log);
+    check_true("until it is cleared", !log.sticky_set);
+}
+
+/* The hotkeys go through ui_action_enabled and the toolbar draws from
+ * ui_apply_state. If those two ever disagreed, a key would work where its
+ * button was greyed out -- which is how the keyboard used to fail silently. */
+static void test_keys_and_buttons_agree_about_what_is_allowed(void) {
+    /* Three states worth checking: nothing selected, a full selection while
+     * editing, and the same while running. */
+    UiState states[3];
+    states[0] = blank_ui_state();
+
+    states[1] = blank_ui_state();
+    states[1].selected_connector_count = 3;
+    states[1].selected_link = 0;
+    states[1].selected_link_driven = true;
+    states[1].selected_link_can_drive = true;
+    states[1].has_selection = true;
+    states[1].can_undo = true;
+    states[1].can_redo = true;
+
+    states[2] = states[1];
+    states[2].editing = false;
+    states[2].running = true;
+    states[2].paused = true;
+
+    bool agree = true;
+    for (int si = 0; si < 3; si++) {
+        Toolbar t;
+        ui_init(&t, 900);
+        ui_apply_state(&t, states[si]);
+        for (int i = 0; i < t.count; i++) {
+            if (ui_action_enabled(&t, t.buttons[i].action) != t.buttons[i].enabled) agree = false;
+            if (strcmp(ui_action_label(&t, t.buttons[i].action), t.buttons[i].label) != 0) agree = false;
+            if (ui_action_tip(&t, t.buttons[i].action) != t.buttons[i].tip) agree = false;
+        }
+        /* An action with no button reads as not allowed, rather than as a key
+         * that quietly does whatever it likes. */
+        if (ui_action_enabled(&t, UI_NONE)) agree = false;
+    }
+    check_true("every hotkey obeys the same rule its button does", agree);
+}
+
+static void test_run_button_says_when_it_jammed(void) {
+    Toolbar t;
+    ui_init(&t, 900);
+    UiState s = blank_ui_state();
+    s.editing = false;
+    s.running = true;
+    ui_apply_state(&t, s);
+    check_true("RUN reads STOP while it is running",
+                strcmp(button_for(&t, UI_RUN)->label, "STOP") == 0);
+
+    s.jammed = true;
+    ui_apply_state(&t, s);
+    check_true("and JAMMED once it has stopped dead",
+                strcmp(button_for(&t, UI_RUN)->label, "JAMMED") == 0);
+    check_true("RUN is still pressable when jammed", button_for(&t, UI_RUN)->enabled);
+}
+
+/* --------------------------------------------------------------------------
+ * Saving and reopening a mechanism
+ * ----------------------------------------------------------------------- */
+
+/* Something with one of everything in it, including a deleted part, so the
+ * round trip has to cope with tombstones as well as live entities. */
+static void build_kitchen_sink(Mechanism *m) {
+    mechanism_init(m);
+
+    /* A crank on ground, driven by a motor, with a traced coupler point. */
+    int ground = mechanism_add_connector(m, (Vec2){ 100, 300 }, true);
+    int crank_pin = mechanism_add_connector(m, (Vec2){ 160, 300 }, false);
+    int coupler_tip = mechanism_add_connector(m, (Vec2){ 260, 260 }, false);
+    int crank_ids[2] = { ground, crank_pin };
+    int coupler_ids[2] = { crank_pin, coupler_tip };
+    int crank = mechanism_add_link(m, crank_ids, 2);
+    int coupler = mechanism_add_link(m, coupler_ids, 2);
+    mechanism_toggle_driven(m, crank, 123.5);
+    mechanism_set_traced(m, coupler_tip, true);
+    mechanism_set_rigid(m, coupler, false);
+
+    /* A pin sliding on a rail between two anchors. */
+    int rail_a = mechanism_add_connector(m, (Vec2){ 300, 400 }, true);
+    int rail_b = mechanism_add_connector(m, (Vec2){ 500, 400 }, true);
+    int slide = mechanism_add_connector(m, (Vec2){ 400, 400 }, false);
+    mechanism_add_slider(m, slide, rail_a, rail_b);
+
+    /* A meshed pair of wheels. */
+    int wheel_a = mechanism_add_wheel(m, (Vec2){ 700, 300 }, 80.0);
+    int wheel_b = mechanism_add_wheel(m, (Vec2){ 860, 300 }, 50.0);
+    mechanism_mesh_wheels(m, wheel_a, wheel_b);
+
+    /* A cam with a profile that is not the default one. */
+    int cam_centre = mechanism_add_connector(m, (Vec2){ 200, 700 }, true);
+    int shaft = mechanism_add_connector(m, (Vec2){ 230, 700 }, false);
+    int follower = mechanism_add_connector(m, (Vec2){ 200, 620 }, false);
+    int cam_ids[2] = { cam_centre, shaft };
+    int cam_body = mechanism_add_link(m, cam_ids, 2);
+    mechanism_toggle_driven(m, cam_body, 90.0);
+    int cam_id = mechanism_add_cam(m, cam_body, cam_centre, follower);
+    cam_fill_motion_law(&m->cams[cam_id], 60.0, 25.0, 90.0, 60.0, 120.0);
+
+    /* And a part that has been deleted, so ids in memory have a hole in them. */
+    int spare = mechanism_add_connector(m, (Vec2){ 999, 999 }, false);
+    mechanism_delete_connector(m, spare);
+}
+
+static void test_scene_round_trip_preserves_the_mechanism(void) {
+    Mechanism original;
+    build_kitchen_sink(&original);
+    SolverParams params = solver_default_params();
+    params.gravity = (Vec2){ 0.0, 250.0 };
+
+    const char *path = "tests/tmp_round_trip.linkage";
+    char err[256] = { 0 };
+    check_true("the mechanism saves", scene_save(&original, &params, path, err, sizeof err));
+
+    Mechanism reopened;
+    mechanism_init(&reopened);
+    SolverParams reopened_params = solver_default_params();
+    check_true("and reopens", scene_load(&reopened, &reopened_params, path, err, sizeof err));
+
+    /* Tombstones are not written, so the file is dense: what must match is
+     * every LIVE part, in order. */
+    int live_connectors = 0, live_links = 0;
+    for (int i = 0; i < original.connector_count; i++) {
+        if (original.connectors[i].alive) live_connectors++;
+    }
+    for (int i = 0; i < original.link_count; i++) if (original.links[i].alive) live_links++;
+
+    check_true("every pin came back", reopened.connector_count == live_connectors);
+    check_true("every body came back", reopened.link_count == live_links);
+    check_true("the slider came back", reopened.slider_count == 1);
+    check_true("the mesh came back", reopened.gear_count == 1);
+    check_true("the cam came back", reopened.cam_count == 1);
+    check_true("gravity came back", reopened_params.gravity.y == params.gravity.y);
+
+    int seen = 0;
+    for (int i = 0; i < original.connector_count; i++) {
+        const Connector *a = &original.connectors[i];
+        if (!a->alive) continue;
+        const Connector *b = &reopened.connectors[seen++];
+        check_true_quiet(a->pos.x == b->pos.x && a->pos.y == b->pos.y);
+        check_true_quiet(a->is_anchor == b->is_anchor);
+        check_true_quiet(a->traced == b->traced);
+    }
+    check_true("pins came back where they were, anchored and traced as they were",
+                seen == live_connectors);
+
+    seen = 0;
+    for (int i = 0; i < original.link_count; i++) {
+        const Link *a = &original.links[i];
+        if (!a->alive) continue;
+        const Link *b = &reopened.links[seen++];
+        check_true_quiet(a->connector_count == b->connector_count);
+        check_true_quiet(a->rigid == b->rigid);
+        check_true_quiet(a->is_driven == b->is_driven);
+        check_true_quiet(a->motor_speed_deg_s == b->motor_speed_deg_s);
+        check_true_quiet(a->wheel_radius == b->wheel_radius);
+        check_true_quiet(a->driven_externally == b->driven_externally);
+    }
+    check_true("bodies kept their shape, their motor and their size", seen == live_links);
+
+    bool profile_matches = true;
+    for (int k = 0; k < CAM_PROFILE_SAMPLES; k++) {
+        if (original.cams[0].pitch_r[k] != reopened.cams[0].pitch_r[k]) profile_matches = false;
+    }
+    check_true("the drawn cam profile came back exactly", profile_matches);
+    check_close("and its base radius with it",
+                 reopened.cams[0].base_radius, original.cams[0].base_radius, 1e-12);
+
+    /* The real test of a reopened file: does it MOVE the same way? */
+    SolverParams sim = solver_default_params();
+    solver_freeze(&original);
+    solver_freeze(&reopened);
+    for (int step = 0; step < 60; step++) {
+        solver_advance(&original, 1.0 / 60.0, sim);
+        solver_advance(&reopened, 1.0 / 60.0, sim);
+    }
+    bool same_motion = true;
+    seen = 0;
+    for (int i = 0; i < original.connector_count; i++) {
+        if (!original.connectors[i].alive) continue;
+        Vec2 a = original.connectors[i].pos, b = reopened.connectors[seen++].pos;
+        if (fabs(a.x - b.x) > 1e-9 || fabs(a.y - b.y) > 1e-9) same_motion = false;
+    }
+    check_true("and a second of simulation runs identically from both", same_motion);
+
+    mechanism_free(&original);
+    mechanism_free(&reopened);
+    remove(path);
+}
+
+static void test_a_damaged_file_costs_nothing(void) {
+    const char *path = "tests/tmp_damaged.linkage";
+    FILE *f = fopen(path, "w");
+    /* The body names pin 9, which does not exist. */
+    fprintf(f, "LINKAGE 1\n" "C 10 20 0 0\n" "C 30 40 0 0\n" "L 2 0 9 1 0 -1 0 0\n");
+    fclose(f);
+
+    /* Something worth keeping is already open. */
+    Mechanism m;
+    mechanism_init(&m);
+    mechanism_add_connector(&m, (Vec2){ 5, 5 }, true);
+    SolverParams params = solver_default_params();
+
+    char err[256] = { 0 };
+    check_true("a damaged file is refused", !scene_load(&m, &params, path, err, sizeof err));
+    check_true("and it says so", err[0] != '\0');
+    check_true("and what was open is untouched", m.connector_count == 1 && m.connectors[0].alive);
+    mechanism_free(&m);
+    remove(path);
+
+    check_true("so is a file that is not a mechanism at all",
+                !scene_load(&m, &params, "Makefile", err, sizeof err));
+}
+
 int main(void) {
+    test_scene_round_trip_preserves_the_mechanism();
+    test_a_damaged_file_costs_nothing();
+    test_status_log_keeps_the_newest_messages();
+    test_repeating_a_message_restamps_it();
+    test_messages_fade_and_stickies_do_not();
+    test_keys_and_buttons_agree_about_what_is_allowed();
+    test_run_button_says_when_it_jammed();
     test_four_bar_reduces_to_closed_form();
     test_ternary_link_rigidity();
     test_dead_center_singularity_is_solved();

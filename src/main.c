@@ -3,6 +3,9 @@
 #include <stdbool.h>
 #include <math.h>
 #include <stdlib.h>
+#include <stdarg.h>
+#include <string.h>
+#include <unistd.h>
 
 #include "mechanism.h"
 #include "solver.h"
@@ -11,14 +14,21 @@
 #include "ui.h"
 #include "synth.h"
 #include "templates.h"
+#include "status.h"
+#include "scene.h"
 
-#define CANVAS_W 900
-#define CANVAS_H 700
-#define PLOT_H 200
-#define WIN_H (CANVAS_H + PLOT_H)
-#define WIN_W (UI_TOOLBAR_W + CANVAS_W)
+/* The window opens at this size and can be resized freely from there. It used
+ * to be fixed, which meant a laptop screen shorter than WIN_H simply lost the
+ * plot panel off the bottom with no way to get it back. */
+#define WIN_DEFAULT_W (UI_TOOLBAR_W + 900)
+#define WIN_DEFAULT_H 900
+#define WIN_MIN_W 700
+#define WIN_MIN_H 520
+#define PLOT_FRACTION 0.22       /* of the window height ... */
+#define PLOT_MIN_H 120           /* ... between these */
+#define PLOT_MAX_H 240
 
-#define CONNECTOR_HIT_RADIUS 10.0
+#define CONNECTOR_HIT_RADIUS 10.0     /* screen pixels; never smaller than the dot drawn */
 #define LINK_EDGE_HIT_DIST 6.0
 #define DRAG_THRESHOLD 4.0
 #define DEFAULT_MOTOR_SPEED_DEG_S 90.0
@@ -26,6 +36,11 @@
 #define ZOOM_MIN 0.1
 #define ZOOM_MAX 10.0
 #define ZOOM_STEP 1.1
+#define VIEW_PAN_STEP 60.0        /* screen pixels per arrow-key press */
+#define SIM_RATE_MIN 0.1          /* slow enough to watch a linkage pass through a dead centre */
+#define SIM_RATE_MAX 4.0
+#define SIM_RATE_STEP 1.25
+#define SIM_STEP_DT (1.0 / 60.0)  /* one frame, when stepping by hand */
 #define DEFAULT_GRAVITY_MAGNITUDE 400.0 /* world-units/s^2; a qualitative default, not physically calibrated */
 #define CAM_HIT_DIST 6.0
 #define JOINT_HIT_DIST 7.0       /* pitch circles, Geneva rims, slider rails */
@@ -45,6 +60,8 @@
 #define GALLERY_TILE_W 190
 #define GALLERY_TILE_H 150
 #define GALLERY_PAD 10
+#define GALLERY_TITLE_H 26
+#define GALLERY_FOOTER_H 22
 #define PATH_TARGET_POINTS 64        /* the drawn path, resampled for four-bar fitting */
 #define PATH_POOR_FIT_FRACTION 0.05  /* above this, say the linkage isn't up to the path */
 #define PATH_TARGET_FRACTION 0.0025  /* stop adding arms below this share of the path's size */
@@ -53,12 +70,89 @@
  * positions are handled in world space; only rendering and raw SDL mouse
  * coordinates cross this boundary. The pan starts at the canvas's left edge
  * so world (0,0) is the top-left of the drawing area, not of the window. */
+static double clampd(double v, double lo, double hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+/* Screen sizes for the things you point at and the numbers you read.
+ *
+ * These used to be plain multiples of the zoom, which is right for a pitch
+ * circle or a cam profile -- those ARE sizes in the world -- but wrong for a
+ * pin, a ground symbol or a dimension label. At ZOOM_MIN a pin was half a
+ * pixel across; at ZOOM_MAX it was a fifty-pixel blob five times wider than
+ * the ten-pixel target you actually had to hit. Clamping keeps a handle
+ * handle-sized and a numeral readable at every zoom. */
+static double handle_radius(double zoom)  { return clampd(5.0 * zoom, 3.0, 9.0); }
+static double hatch_size(double zoom)     { return clampd(8.0 * zoom, 6.0, 14.0); }
+static double pin_ring_radius(double zoom){ return clampd(7.0 * zoom, 5.0, 12.0); }
+static double label_height(double zoom)   { return clampd(10.0 * zoom, 7.0, 14.0); }
+
 static Vec2 screen_to_world(Vec2 screen, Vec2 pan, double zoom) {
     return (Vec2){ (screen.x - pan.x) / zoom, (screen.y - pan.y) / zoom };
 }
 
 static Vec2 world_to_screen(Vec2 world, Vec2 pan, double zoom) {
     return (Vec2){ world.x * zoom + pan.x, world.y * zoom + pan.y };
+}
+
+/* Where everything is, recomputed whenever the window changes size. Every
+ * position that used to be written in terms of compile-time canvas constants
+ * comes from here instead, so one resize moves the lot together. */
+typedef struct {
+    int win_w, win_h;
+    UiRect canvas;   /* the drawing area, right of the toolbar */
+    UiRect plot;     /* the time-series panel below it */
+} Layout;
+
+static Layout layout_for(int win_w, int win_h) {
+    Layout l;
+    l.win_w = win_w;
+    l.win_h = win_h;
+
+    int plot_h = (int)clampd(PLOT_FRACTION * win_h, PLOT_MIN_H, PLOT_MAX_H);
+    if (plot_h > win_h / 2) plot_h = win_h / 2;       /* never more than half */
+    int canvas_w = win_w - UI_TOOLBAR_W;
+    if (canvas_w < 1) canvas_w = 1;
+    int canvas_h = win_h - plot_h;
+    if (canvas_h < 1) canvas_h = 1;
+
+    l.canvas = (UiRect){ UI_TOOLBAR_W, 0, canvas_w, canvas_h };
+    l.plot   = (UiRect){ UI_TOOLBAR_W, canvas_h, canvas_w, plot_h };
+    return l;
+}
+
+static Vec2 rect_centre(UiRect r) {
+    return (Vec2){ r.x + r.w / 2.0, r.y + r.h / 2.0 };
+}
+
+#define APP_PATH_MAX 1024
+
+/* Asking for a file name.
+ *
+ * SDL has no file dialog, and a design tool with five numbered slots would be
+ * worse than one where files have names. So: a one-line prompt drawn on the
+ * canvas, in the same stroke font as everything else. The confirmations
+ * (overwrite, quit with unsaved work) are the same overlay with nothing to
+ * type into. */
+typedef enum {
+    PROMPT_NONE,
+    PROMPT_SAVE,
+    PROMPT_OPEN,
+    PROMPT_EXPORT,
+    PROMPT_OVERWRITE,   /* "that file exists" */
+    PROMPT_QUIT         /* "you have unsaved changes" */
+} PromptKind;
+
+typedef struct {
+    PromptKind kind;
+    char title[128];
+    char hint[160];
+    char text[APP_PATH_MAX];      /* what has been typed so far */
+    char pending[APP_PATH_MAX];   /* the path a confirmation is about */
+} Prompt;
+
+static bool prompt_takes_typing(PromptKind k) {
+    return k == PROMPT_SAVE || k == PROMPT_OPEN || k == PROMPT_EXPORT;
 }
 
 typedef enum { APP_EDIT, APP_RUNNING } AppState;
@@ -74,7 +168,8 @@ typedef enum {
     DRAG_PENDING_EMPTY,
     DRAG_BOX_SELECT,
     DRAG_DRAW_CAM,
-    DRAG_DRAW_PATH
+    DRAG_DRAW_PATH,
+    DRAG_PAN
 } DragMode;
 
 /* Bounded stacks of full mechanism snapshots (mechanism_clone). Simple and
@@ -98,6 +193,13 @@ typedef struct {
 
     DragMode drag_mode;
     Vec2 drag_start, drag_last, drag_current;
+    /* Panning is screen-space: the mechanism does not move, the window does. */
+    Vec2 pan_last_screen;
+    /* Whether this drag has taken its undo snapshot yet. A plain click on an
+     * already-selected pin used to snapshot the whole mechanism before knowing
+     * anything would move, so clicking about filled the undo history with
+     * steps that undo to the same picture. */
+    bool drag_pushed_undo;
 
     /* CAM is a drawing tool: arm it, then drag out the cam's outline. The
      * stroke is collected in world space and handed to the cam as its
@@ -128,6 +230,8 @@ typedef struct {
     int frame_link_count;
     bool jammed;
 
+    Layout layout;
+
     Vec2 view_pan;
     double view_zoom;
 
@@ -135,7 +239,26 @@ typedef struct {
      * plot has a real time axis (frames are not uniform in length). */
     double sim_time;
 
+    /* Watching, as opposed to just running it. RUN/STOP alone meant the only
+     * way to look closely at a fast mechanism was to stop it, which throws it
+     * back to its starting pose. */
+    bool paused;
+    bool step_once;       /* advance exactly one frame, then pause again */
+    double sim_rate;      /* 1.0 is real time */
+
     bool gallery_open;
+    int gallery_page;
+    bool help_open;
+
+    /* Everything the app has to say, shown on the canvas. */
+    StatusLog status;
+
+    /* The document. `current_path` is empty until the mechanism has been
+     * saved or opened; `dirty` is whether it has been edited since. */
+    char current_path[APP_PATH_MAX];
+    bool dirty;
+    Prompt prompt;
+    SDL_Window *window;   /* only so the title bar can show the file name */
 
     Toolbar toolbar;
 } App;
@@ -238,6 +361,74 @@ static Vec2 effective_gravity(const App *a) {
 }
 
 /* --------------------------------------------------------------------------
+ * Talking to the user
+ * ----------------------------------------------------------------------- */
+
+/* Says something, once, in both places it could be read: the canvas, where
+ * the user is actually looking, and stdout, where all of this used to go on
+ * its own -- invisible to anyone who launched the app from a file manager or
+ * whose window covers the terminal it was started from. */
+static void app_message(App *a, StatusLevel level, const char *fmt, ...) {
+    char text[STATUS_MAX_TEXT];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(text, sizeof text, fmt, args);
+    va_end(args);
+
+    status_push(&a->status, level, SDL_GetTicks(), text);
+    printf("%s\n", text);
+}
+
+/* --------------------------------------------------------------------------
+ * The document: naming it, saving it, opening it
+ * ----------------------------------------------------------------------- */
+
+static const char *path_basename(const char *path) {
+    const char *slash = strrchr(path, '/');
+    return slash ? slash + 1 : path;
+}
+
+/* Where a typed name actually lands.
+ *
+ * An absolute path is taken as given. A bare name goes in the working
+ * directory -- unless that is not writable, which is exactly what happens when
+ * the app is launched from a file manager and inherits "/" as its working
+ * directory. Then it goes in the home directory instead, and the message says
+ * where, rather than the write simply failing somewhere unseen. */
+static void resolve_path(const char *typed, char *out, size_t out_size) {
+    if (typed[0] == '/') {
+        snprintf(out, out_size, "%s", typed);
+        return;
+    }
+    const char *home = getenv("HOME");
+    if (typed[0] == '~' && typed[1] == '/' && home) {
+        snprintf(out, out_size, "%s/%s", home, typed + 2);
+        return;
+    }
+    if (access(".", W_OK) == 0 || !home) {
+        snprintf(out, out_size, "%s", typed);
+        return;
+    }
+    snprintf(out, out_size, "%s/%s", home, typed);
+}
+
+/* Adds `.linkage` unless the name already carries an extension of its own. */
+static void ensure_extension(char *path, size_t size, const char *ext) {
+    const char *base = path_basename(path);
+    if (strrchr(base, '.')) return;
+    size_t len = strlen(path);
+    snprintf(path + len, size - len, "%s", ext);
+}
+
+static void app_update_title(App *a) {
+    if (!a->window) return;
+    char title[APP_PATH_MAX + 64];
+    const char *name = a->current_path[0] ? path_basename(a->current_path) : "untitled";
+    snprintf(title, sizeof title, "Linkage Design - %s%s", name, a->dirty ? " *" : "");
+    SDL_SetWindowTitle(a->window, title);
+}
+
+/* --------------------------------------------------------------------------
  * Undo / redo
  * ----------------------------------------------------------------------- */
 
@@ -267,6 +458,8 @@ static void clear_stack(Mechanism *stack, int *count) {
 static void push_undo(App *a) {
     push_snapshot(a->undo_stack, &a->undo_count, &a->mech);
     clear_stack(a->redo_stack, &a->redo_count);
+    a->dirty = true;
+    app_update_title(a);
 }
 
 /* Drops the most recent undo snapshot without restoring it -- for the
@@ -279,7 +472,7 @@ static void discard_last_undo(App *a) {
 
 static void app_undo(App *a) {
     if (a->undo_count <= 0) {
-        printf("Nothing to undo.\n");
+        app_message(a, STATUS_WARN, "Nothing to undo.");
         return;
     }
     push_snapshot(a->redo_stack, &a->redo_count, &a->mech);
@@ -287,12 +480,14 @@ static void app_undo(App *a) {
     pop_snapshot(a->undo_stack, &a->undo_count, &restored);
     mechanism_free(&a->mech);
     a->mech = restored;
-    printf("Undo.\n");
+    a->dirty = true;
+    app_update_title(a);
+    app_message(a, STATUS_INFO, "Undo.");
 }
 
 static void app_redo(App *a) {
     if (a->redo_count <= 0) {
-        printf("Nothing to redo.\n");
+        app_message(a, STATUS_WARN, "Nothing to redo.");
         return;
     }
     /* Deliberately not push_undo(): redoing must not clear the redo stack. */
@@ -301,7 +496,128 @@ static void app_redo(App *a) {
     pop_snapshot(a->redo_stack, &a->redo_count, &restored);
     mechanism_free(&a->mech);
     a->mech = restored;
-    printf("Redo.\n");
+    a->dirty = true;
+    app_update_title(a);
+    app_message(a, STATUS_INFO, "Redo.");
+}
+
+/* --------------------------------------------------------------------------
+ * The file prompt
+ * ----------------------------------------------------------------------- */
+
+static void prompt_close(App *a) {
+    if (prompt_takes_typing(a->prompt.kind)) SDL_StopTextInput();
+    a->prompt.kind = PROMPT_NONE;
+    a->prompt.text[0] = '\0';
+}
+
+static void prompt_open(App *a, PromptKind kind, const char *title, const char *hint,
+                         const char *initial) {
+    prompt_close(a);
+    a->prompt.kind = kind;
+    snprintf(a->prompt.title, sizeof a->prompt.title, "%s", title);
+    snprintf(a->prompt.hint, sizeof a->prompt.hint, "%s", hint);
+    snprintf(a->prompt.text, sizeof a->prompt.text, "%s", initial ? initial : "");
+    if (prompt_takes_typing(kind)) SDL_StartTextInput();
+}
+
+static void app_save_to(App *a, const char *typed) {
+    char path[APP_PATH_MAX];
+    resolve_path(typed, path, sizeof path);
+    ensure_extension(path, sizeof path, SCENE_EXTENSION);
+
+    char err[256] = { 0 };
+    if (!scene_save(&a->mech, &a->params, path, err, sizeof err)) {
+        app_message(a, STATUS_ERROR, "%s", err);
+        return;
+    }
+    snprintf(a->current_path, sizeof a->current_path, "%s", path);
+    a->dirty = false;
+    app_update_title(a);
+    app_message(a, STATUS_INFO, "Saved to %s", path);
+}
+
+static void app_open_from(App *a, const char *typed) {
+    char path[APP_PATH_MAX];
+    resolve_path(typed, path, sizeof path);
+    ensure_extension(path, sizeof path, SCENE_EXTENSION);
+
+    char err[256] = { 0 };
+    if (!scene_load(&a->mech, &a->params, path, err, sizeof err)) {
+        app_message(a, STATUS_ERROR, "%s", err);
+        return;
+    }
+    /* A file just opened is a different mechanism, not an edit of this one:
+     * the history of what was here before no longer applies to it. */
+    clear_stack(a->undo_stack, &a->undo_count);
+    clear_stack(a->redo_stack, &a->redo_count);
+    a->gravity_set_by_user = (a->params.gravity.x != 0.0 || a->params.gravity.y != 0.0);
+    a->path_ghost_count = 0;
+    snprintf(a->current_path, sizeof a->current_path, "%s", path);
+    a->dirty = false;
+    app_update_title(a);
+    app_message(a, STATUS_INFO, "Opened %s", path);
+}
+
+static void app_export_to(App *a, const char *path) {
+    SolverParams export_params = a->params;
+    export_params.gravity = effective_gravity(a);
+    if (export_blender_script(&a->mech, export_params, path)) {
+        app_message(a, STATUS_INFO,
+                     "Exported %d animation frames to %s -- run it inside Blender's Scripting "
+                     "tab (or blender --python %s), then press Space to play.",
+                     EXPORT_FRAMES, path, path);
+    } else {
+        app_message(a, STATUS_ERROR, "Could not write %s.", path);
+    }
+}
+
+/* What a prompt does when Return is pressed. */
+static void prompt_commit(App *a) {
+    PromptKind kind = a->prompt.kind;
+    char typed[APP_PATH_MAX];
+    snprintf(typed, sizeof typed, "%s", a->prompt.text);
+    char pending[APP_PATH_MAX];
+    snprintf(pending, sizeof pending, "%s", a->prompt.pending);
+
+    if (prompt_takes_typing(kind) && typed[0] == '\0') {
+        app_message(a, STATUS_WARN, "No name given, so nothing was written.");
+        prompt_close(a);
+        return;
+    }
+    prompt_close(a);
+
+    switch (kind) {
+    case PROMPT_SAVE:
+        app_save_to(a, typed);
+        break;
+    case PROMPT_OPEN:
+        app_open_from(a, typed);
+        break;
+    case PROMPT_EXPORT: {
+        char path[APP_PATH_MAX];
+        resolve_path(typed, path, sizeof path);
+        ensure_extension(path, sizeof path, ".py");
+        /* EXPORT used to write over whatever was there without a word. */
+        if (scene_file_exists(path)) {
+            char title[160];
+            snprintf(title, sizeof title, "%s ALREADY EXISTS", path_basename(path));
+            prompt_open(a, PROMPT_OVERWRITE, title,
+                         "PRESS Y TO WRITE OVER IT, ESC TO KEEP IT", NULL);
+            snprintf(a->prompt.pending, sizeof a->prompt.pending, "%s", path);
+        } else {
+            app_export_to(a, path);
+        }
+        break;
+    }
+    case PROMPT_OVERWRITE:
+        app_export_to(a, pending);
+        break;
+    case PROMPT_QUIT:
+        /* Handled by the event loop, which owns whether the app is running. */
+    case PROMPT_NONE:
+        break;
+    }
 }
 
 /* --------------------------------------------------------------------------
@@ -310,8 +626,10 @@ static void app_redo(App *a) {
  * ----------------------------------------------------------------------- */
 
 static void app_add_joint(App *a) {
-    Vec2 center = { UI_TOOLBAR_W + CANVAS_W / 2.0, WIN_H / 2.0 };
-    Vec2 p = screen_to_world(center, a->view_pan, a->view_zoom);
+    /* The middle of the canvas -- which is not the middle of the window, and
+     * used to be neither: JOINT dropped its pin a hundred pixels below where
+     * every other insert put one. */
+    Vec2 p = screen_to_world(rect_centre(a->layout.canvas), a->view_pan, a->view_zoom);
     push_undo(a);
     clear_selection(&a->mech);
     int id = mechanism_add_connector(&a->mech, p, false);
@@ -322,7 +640,7 @@ static void app_link_selected(App *a) {
     int ids[256];
     int n = gather_selected_connectors(&a->mech, ids, 256);
     if (n < 2) {
-        printf("Select at least 2 connectors before linking.\n");
+        app_message(a, STATUS_WARN, "Select at least 2 connectors before linking.");
         return;
     }
     push_undo(a);
@@ -336,7 +654,10 @@ static void app_link_selected(App *a) {
 }
 
 static void app_toggle_anchor(App *a) {
-    if (!has_selection(&a->mech)) return;
+    if (!has_selection(&a->mech)) {
+        app_message(a, STATUS_WARN, "Select one or more pins first, then ANCHOR grounds them.");
+        return;
+    }
     push_undo(a);
     for (int i = 0; i < a->mech.connector_count; i++) {
         if (a->mech.connectors[i].alive && a->mech.connectors[i].selected) {
@@ -348,11 +669,11 @@ static void app_toggle_anchor(App *a) {
 static void app_toggle_motor(App *a) {
     int lid = find_single_selected_link(&a->mech);
     if (lid < 0) {
-        printf("Select exactly one link before toggling a motor.\n");
+        app_message(a, STATUS_WARN, "Select exactly one link before toggling a motor.");
         return;
     }
     if (!a->mech.links[lid].is_driven && link_anchor_count(&a->mech, lid) != 1) {
-        printf("A driven link needs exactly one anchor connector.\n");
+        app_message(a, STATUS_WARN, "A driven link needs exactly one anchor connector.");
         return;
     }
     push_undo(a);
@@ -362,11 +683,11 @@ static void app_toggle_motor(App *a) {
     if (wheel && !a->mech.links[lid].is_driven) mechanism_orient_train_from(&a->mech, lid);
     if (!mechanism_toggle_driven(&a->mech, lid, DEFAULT_MOTOR_SPEED_DEG_S)) {
         discard_last_undo(a);
-        printf("A driven link needs exactly one anchor connector.\n");
+        app_message(a, STATUS_WARN, "A driven link needs exactly one anchor connector.");
         return;
     }
     if (wheel && a->mech.links[lid].is_driven) {
-        printf("This wheel now drives; the rest of its train follows from it.\n");
+        app_message(a, STATUS_INFO, "This wheel now drives; the rest of its train follows from it.");
     }
 }
 
@@ -440,7 +761,7 @@ static void app_create_cam(App *a, const Vec2 *outline, int n, Vec2 fallback_cen
     int cam_id = mechanism_add_cam(&a->mech, link_id, centre_id, follower_id);
     if (cam_id < 0) {
         discard_last_undo(a);
-        printf("Could not create a cam there.\n");
+        app_message(a, STATUS_WARN, "Could not create a cam there.");
         return;
     }
     Cam *cam = &a->mech.cams[cam_id];
@@ -449,8 +770,8 @@ static void app_create_cam(App *a, const Vec2 *outline, int n, Vec2 fallback_cen
         Vec2 *local = malloc((size_t)n * sizeof(Vec2));
         for (int i = 0; i < n; i++) local[i] = vec2_sub(outline[i], centre);
         if (!cam_set_from_drawn_outline(cam, local, n)) {
-            printf("Couldn't read a profile from that outline -- using a default cam. "
-                    "Try drawing a single loop right around the centre.\n");
+            app_message(a, STATUS_WARN, "Couldn't read a profile from that outline -- using a default cam. "
+                    "Try drawing a single loop right around the centre.");
         }
         free(local);
     }
@@ -465,12 +786,12 @@ static void app_create_cam(App *a, const Vec2 *outline, int n, Vec2 fallback_cen
      * rather than flashing the airborne colour until the first frame. */
     cam->in_contact = true;
     cam->selected = true;
-    printf("Cam added: base radius %.1f, lift %.1f. Press R to run. "
-            "Select the cam to reshape it: +/- lift, [ and ] timing.\n",
+    app_message(a, STATUS_INFO, "Cam added: base radius %.1f, lift %.1f. Press R to run. "
+            "Select the cam to reshape it: +/- lift, [ and ] timing.",
             cam->base_radius, cam->lift);
     if (cam_is_undercut(cam)) {
-        printf("Warning: this cam undercuts -- it has a concave notch tighter than "
-                "the roller, so it could not be cut to give this motion.\n");
+        app_message(a, STATUS_WARN, "Warning: this cam undercuts -- it has a concave notch tighter than "
+                "the roller, so it could not be cut to give this motion.");
     }
 }
 
@@ -550,8 +871,7 @@ static bool gear_roles(const Mechanism *m, int *pinion_link, int *pinion_centre,
 
 /* Where a freshly inserted assembly should land. */
 static Vec2 app_view_centre(const App *a) {
-    return screen_to_world((Vec2){ UI_TOOLBAR_W + CANVAS_W / 2.0, CANVAS_H / 2.0 },
-                            a->view_pan, a->view_zoom);
+    return screen_to_world(rect_centre(a->layout.canvas), a->view_pan, a->view_zoom);
 }
 
 /* Each of these three buttons builds a complete, running assembly if you have
@@ -567,10 +887,10 @@ static void app_add_slider(App *a) {
         push_undo(a);
         if (mechanism_add_slider(&a->mech, pin, ra, rb) < 0) {
             discard_last_undo(a);
-            printf("Those three don't make a slider.\n");
+            app_message(a, STATUS_WARN, "Those three don't make a slider.");
             return;
         }
-        printf("Slider added: that pin now runs along the line through the other two.\n");
+        app_message(a, STATUS_INFO, "Slider added: that pin now runs along the line through the other two.");
         return;
     }
 
@@ -590,14 +910,18 @@ static void app_add_slider(App *a) {
     mechanism_add_slider(&a->mech, pist, r1, r2);
     mechanism_set_traced(&a->mech, pist, true);
     a->mech.connectors[crk].selected = true;
-    printf("Crank-slider added. Drag the crank pin to change the stroke, or either "
-            "rail anchor to aim the slide.\n");
+    app_message(a, STATUS_INFO, "Crank-slider added. Drag the crank pin to change the stroke, or either "
+            "rail anchor to aim the slide.");
 }
 
-/* Pans and zooms so the whole mechanism is on screen. Only ever zooms out --
- * a train that has grown past the edge should come into view without the rest
- * of the canvas suddenly changing scale under a mechanism that already fitted. */
-static void app_fit_view(App *a) {
+/* Pans and zooms so the whole mechanism is on screen.
+ *
+ * `allow_zoom_in` is the difference between the two callers. Asked for by
+ * hand (the FIT button, F), it should fill the canvas with whatever is there.
+ * Called for you because a wheel was just placed past the edge, it must only
+ * ever zoom OUT -- the canvas changing scale under a mechanism that already
+ * fitted is not what you asked for by pressing GEAR. */
+static void app_fit_view(App *a, bool allow_zoom_in) {
     const Mechanism *m = &a->mech;
     double x0 = 1e30, y0 = 1e30, x1 = -1e30, y1 = -1e30;
     bool any = false;
@@ -625,19 +949,24 @@ static void app_fit_view(App *a) {
             if (c.y + rs[k] > y1) y1 = c.y + rs[k];
         }
     }
-    if (!any) return;
+    if (!any) {
+        app_message(a, STATUS_WARN, "There is nothing on the canvas to fit the view to yet.");
+        return;
+    }
 
     const double margin = 40.0;
     double w = (x1 - x0) + 2 * margin, h = (y1 - y0) + 2 * margin;
     if (w < 1.0) w = 1.0;
     if (h < 1.0) h = 1.0;
-    double zoom = fmin((double)CANVAS_W / w, (double)CANVAS_H / h);
-    if (zoom > a->view_zoom) zoom = a->view_zoom;   /* never zoom in */
+    double zoom = fmin((double)a->layout.canvas.w / w, (double)a->layout.canvas.h / h);
+    if (zoom > ZOOM_MAX) zoom = ZOOM_MAX;
+    if (!allow_zoom_in && zoom > a->view_zoom) zoom = a->view_zoom;
     if (zoom < ZOOM_MIN) zoom = ZOOM_MIN;
     a->view_zoom = zoom;
     Vec2 mid = { (x0 + x1) / 2.0, (y0 + y1) / 2.0 };
-    a->view_pan.x = UI_TOOLBAR_W + CANVAS_W / 2.0 - mid.x * zoom;
-    a->view_pan.y = CANVAS_H / 2.0 - mid.y * zoom;
+    Vec2 centre = rect_centre(a->layout.canvas);
+    a->view_pan.x = centre.x - mid.x * zoom;
+    a->view_pan.y = centre.y - mid.y * zoom;
 }
 
 /* Every alive wheel that is currently selected, in link order. */
@@ -698,13 +1027,13 @@ static void app_add_gear(App *a) {
         }
         if (meshed == 0) {
             discard_last_undo(a);
-            printf("Those wheels are meshed already, or the second one is turned by "
-                    "something else -- a wheel takes its motion from one place.\n");
+            app_message(a, STATUS_WARN, "Those wheels are meshed already, or the second one is turned by "
+                    "something else -- a wheel takes its motion from one place.");
             return;
         }
-        app_fit_view(a);
-        printf("Meshed %d pair%s; each driven wheel slid into contact with its driver.%s "
-                "Press M on a wheel to make it the one that drives.\n",
+        app_fit_view(a, false);
+        app_message(a, STATUS_INFO, "Meshed %d pair%s; each driven wheel slid into contact with its driver.%s "
+                "Press M on a wheel to make it the one that drives.",
                 meshed, meshed == 1 ? "" : "s",
                 refused ? " Some were already meshed and were left alone." : "");
         return;
@@ -721,11 +1050,11 @@ static void app_add_gear(App *a) {
         Vec2 b1 = a->mech.connectors[bar->connector_ids[1]].pos;
         if (mechanism_add_rack(&a->mech, pl, pc, ol, oref, vec2_sub(b1, b0)) < 0) {
             discard_last_undo(a);
-            printf("Those two don't make a rack and pinion.\n");
+            app_message(a, STATUS_WARN, "Those two don't make a rack and pinion.");
             return;
         }
-        printf("Rack and pinion made. The pinion's pitch radius is how far it stands "
-                "off the bar, so sliding the bar retimes it.\n");
+        app_message(a, STATUS_INFO, "Rack and pinion made. The pinion's pitch radius is how far it stands "
+                "off the bar, so sliding the bar retimes it.");
         return;
     }
 
@@ -733,14 +1062,14 @@ static void app_add_gear(App *a) {
     push_undo(a);
     double r = DEFAULT_WHEEL_RADIUS;
     int link = mechanism_add_wheel(&a->mech, free_wheel_spot(a, r), r);
-    if (link < 0) { discard_last_undo(a); printf("Couldn't place a wheel.\n"); return; }
+    if (link < 0) { discard_last_undo(a); app_message(a, STATUS_WARN, "Couldn't place a wheel."); return; }
     clear_selection(&a->mech);
     a->mech.links[link].selected = true;
     int mark = mechanism_wheel_mark(&a->mech, link);
     if (mark >= 0) mechanism_set_traced(&a->mech, mark, true);
-    app_fit_view(a);   /* wheels step outwards to find space; keep them in view */
-    printf("Wheel added, radius %.0f. +/- resizes it, M makes it the driver, and "
-            "selecting two or more wheels and pressing GEAR meshes them.\n", r);
+    app_fit_view(a, false);   /* wheels step outwards to find space; keep them in view */
+    app_message(a, STATUS_INFO, "Wheel added, radius %.0f. +/- resizes it, M makes it the driver, and "
+            "selecting two or more wheels and pressing GEAR meshes them.", r);
 }
 
 static void app_add_geneva(App *a) {
@@ -755,10 +1084,10 @@ static void app_add_geneva(App *a) {
             int whl = driven_a ? lb : la, whl_c = driven_a ? ids[1] : ids[0];
             push_undo(a);
             int gid = mechanism_add_geneva(&a->mech, drv, drv_c, whl, whl_c, GENEVA_DEFAULT_SLOTS);
-            if (gid < 0) { discard_last_undo(a); printf("Those two don't make a Geneva.\n"); return; }
+            if (gid < 0) { discard_last_undo(a); app_message(a, STATUS_WARN, "Those two don't make a Geneva."); return; }
             a->mech.genevas[gid].selected = true;
-            printf("Geneva added, %d slots. Select the wheel and use +/- to change the "
-                    "slot count.\n", a->mech.genevas[gid].slot_count);
+            app_message(a, STATUS_INFO, "Geneva added, %d slots. Select the wheel and use +/- to change the "
+                    "slot count.", a->mech.genevas[gid].slot_count);
             return;
         }
     }
@@ -784,8 +1113,8 @@ static void app_add_geneva(App *a) {
     int gid = mechanism_add_geneva(&a->mech, drv, dc, whl, wc, slots);
     mechanism_set_traced(&a->mech, mark, true);
     if (gid >= 0) a->mech.genevas[gid].selected = true;
-    printf("Geneva added, %d slots -- one turn of the motor indexes it %.0f degrees. "
-            "Use +/- to change the slot count, or drag a centre to resize it.\n",
+    app_message(a, STATUS_INFO, "Geneva added, %d slots -- one turn of the motor indexes it %.0f degrees. "
+            "Use +/- to change the slot count, or drag a centre to resize it.",
             slots, 360.0 / slots);
 }
 
@@ -793,8 +1122,8 @@ static void app_toggle_cam_draw(App *a) {
     a->cam_draw_armed = !a->cam_draw_armed;
     a->cam_stroke_count = 0;
     if (a->cam_draw_armed) {
-        printf("Cam tool armed: drag on the canvas to draw the cam's outline "
-                "(or click once for a default cam). Escape cancels.\n");
+        app_message(a, STATUS_INFO, "Cam tool armed: drag on the canvas to draw the cam's outline "
+                "(or click once for a default cam). Escape cancels.");
     }
 }
 
@@ -804,8 +1133,8 @@ static void app_adjust_cam_lift(App *a, double factor) {
     push_undo(a);
     Cam *c = &a->mech.cams[cid];
     cam_scale_lift(c, factor);
-    printf("Cam lift: %.1f\n", c->lift);
-    if (cam_is_undercut(c)) printf("Warning: this cam now undercuts.\n");
+    app_message(a, STATUS_INFO, "Cam lift: %.1f", c->lift);
+    if (cam_is_undercut(c)) app_message(a, STATUS_WARN, "Warning: this cam now undercuts.");
 }
 
 /* Rotating the profile against the shaft is cam timing: same motion, earlier
@@ -815,7 +1144,7 @@ static void app_adjust_cam_timing(App *a, double delta_rad) {
     if (cid < 0) return;
     push_undo(a);
     cam_rotate_profile(&a->mech.cams[cid], delta_rad);
-    printf("Cam timing shifted by %.0f deg.\n", delta_rad * 180.0 / M_PI);
+    app_message(a, STATUS_INFO, "Cam timing shifted by %.0f deg.", delta_rad * 180.0 / M_PI);
 }
 
 /* +/- on a selected wheel changes its own size. Nothing else moves except a
@@ -829,7 +1158,7 @@ static void app_adjust_wheel_radius(App *a, double factor) {
     push_undo(a);
     mechanism_set_wheel_radius(&a->mech, wheels[0], r * factor);
     mechanism_refresh_joint_sizes(&a->mech);
-    printf("Wheel radius %.0f.\n", a->mech.links[wheels[0]].wheel_radius);
+    app_message(a, STATUS_INFO, "Wheel radius %.0f.", a->mech.links[wheels[0]].wheel_radius);
 }
 
 /* +/- on a selected Geneva changes the number of slots, which is the whole
@@ -841,35 +1170,81 @@ static void app_adjust_geneva_slots(App *a, int delta) {
     int n = gv->slot_count + delta;
     if (n < GENEVA_MIN_SLOTS) n = GENEVA_MIN_SLOTS;
     if (n > GENEVA_MAX_SLOTS) n = GENEVA_MAX_SLOTS;
-    if (n == gv->slot_count) return;
+    if (n == gv->slot_count) {
+        app_message(a, STATUS_WARN, "A Geneva holds between %d and %d slots.",
+                    GENEVA_MIN_SLOTS, GENEVA_MAX_SLOTS);
+        return;
+    }
     push_undo(a);
     a->mech.genevas[vi].slot_count = n;
     mechanism_refresh_joint_sizes(&a->mech);
-    printf("Geneva: %d slots, indexing %.0f degrees a turn.\n", n, 360.0 / n);
+    app_message(a, STATUS_INFO, "Geneva: %d slots, indexing %.0f degrees a turn.", n, 360.0 / n);
 }
 
-/* The gallery is a grid of tiles laid over the canvas. */
-static UiRect gallery_panel(void) {
-    int rows = (templates_count() + GALLERY_COLS - 1) / GALLERY_COLS;
+/* The gallery is a grid of tiles laid over the canvas.
+ *
+ * It pages rather than growing without limit: the panel is clipped to the
+ * canvas when it is drawn, so a gallery taller than the window used to put its
+ * last row somewhere it could be neither seen nor clicked. */
+static int gallery_rows_per_page(const App *a) {
+    int avail = a->layout.canvas.h - GALLERY_TITLE_H - GALLERY_FOOTER_H - 2 * GALLERY_PAD;
+    int rows = avail / (GALLERY_TILE_H + GALLERY_PAD);
+    if (rows < 1) rows = 1;
+    int total = (templates_count() + GALLERY_COLS - 1) / GALLERY_COLS;
+    if (rows > total) rows = total;
+    return rows;
+}
+
+static int gallery_per_page(const App *a) { return gallery_rows_per_page(a) * GALLERY_COLS; }
+
+static int gallery_page_count(const App *a) {
+    int per = gallery_per_page(a);
+    return (templates_count() + per - 1) / per;
+}
+
+static int gallery_page_first(const App *a) { return a->gallery_page * gallery_per_page(a); }
+
+/* How many tiles this page actually shows -- the last one is usually short. */
+static int gallery_page_size(const App *a) {
+    int left = templates_count() - gallery_page_first(a);
+    int per = gallery_per_page(a);
+    return left < per ? left : per;
+}
+
+static UiRect gallery_panel(const App *a) {
+    int shown = gallery_page_size(a);
+    int rows = (shown + GALLERY_COLS - 1) / GALLERY_COLS;
+    if (rows < 1) rows = 1;
     int w = GALLERY_COLS * GALLERY_TILE_W + (GALLERY_COLS + 1) * GALLERY_PAD;
-    int h = rows * GALLERY_TILE_H + (rows + 1) * GALLERY_PAD + 26;
-    return (UiRect){ UI_TOOLBAR_W + (CANVAS_W - w) / 2, (CANVAS_H - h) / 2, w, h };
+    int h = rows * GALLERY_TILE_H + (rows + 1) * GALLERY_PAD + GALLERY_TITLE_H;
+    if (gallery_page_count(a) > 1) h += GALLERY_FOOTER_H;
+    UiRect canvas = a->layout.canvas;
+    return (UiRect){ canvas.x + (canvas.w - w) / 2, canvas.y + (canvas.h - h) / 2, w, h };
 }
 
-static UiRect gallery_tile(int index) {
-    UiRect panel = gallery_panel();
-    int col = index % GALLERY_COLS, row = index / GALLERY_COLS;
+/* `index` is a template id, not a slot: tiles on other pages have no rect. */
+static UiRect gallery_tile(const App *a, int index) {
+    UiRect panel = gallery_panel(a);
+    int slot = index - gallery_page_first(a);
+    int col = slot % GALLERY_COLS, row = slot / GALLERY_COLS;
     return (UiRect){ panel.x + GALLERY_PAD + col * (GALLERY_TILE_W + GALLERY_PAD),
-                      panel.y + 26 + GALLERY_PAD + row * (GALLERY_TILE_H + GALLERY_PAD),
+                      panel.y + GALLERY_TITLE_H + GALLERY_PAD + row * (GALLERY_TILE_H + GALLERY_PAD),
                       GALLERY_TILE_W, GALLERY_TILE_H };
 }
 
-static int gallery_hit(int x, int y) {
-    for (int i = 0; i < templates_count(); i++) {
-        UiRect r = gallery_tile(i);
+static int gallery_hit(const App *a, int x, int y) {
+    int first = gallery_page_first(a);
+    for (int i = first; i < first + gallery_page_size(a); i++) {
+        UiRect r = gallery_tile(a, i);
         if (x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h) return i;
     }
     return -1;
+}
+
+static void gallery_turn_page(App *a, int delta) {
+    int pages = gallery_page_count(a);
+    if (pages <= 1) return;
+    a->gallery_page = (a->gallery_page + delta % pages + pages) % pages;
 }
 
 /* Draws a real miniature of a template by building it, measuring it, and
@@ -940,10 +1315,78 @@ static void draw_template_preview(SDL_Renderer *ren, int index, UiRect tile, boo
                 hot ? 255 : 205, hot ? 225 : 210, hot ? 70 : 220, 255);
 }
 
+/* The keys that have no button, so the help can list them too. Everything
+ * else in the overlay is read straight off the toolbar, which is what keeps
+ * the two from drifting apart. */
+typedef struct { const char *keys, *what; } KeyNote;
+
+static const KeyNote EXTRA_KEYS[] = {
+    { "CLICK EMPTY",   "PLACE A PIN THERE" },
+    { "DRAG EMPTY",    "BOX-SELECT PINS" },
+    { "SHIFT-CLICK",   "ADD TO OR REMOVE FROM THE SELECTION" },
+    { "DRAG A PIN",    "MOVE THE WHOLE SELECTION" },
+    { "MIDDLE-DRAG",   "PAN THE VIEW" },
+    { "WHEEL",         "ZOOM ABOUT THE POINTER" },
+    { "ARROWS",        "PAN (TURN GALLERY PAGES)" },
+    { "0",             "RESET THE VIEW TO 1:1" },
+    { "+ -",           "RESIZE OR RETIME WHATEVER IS SELECTED" },
+    { "[ ]",           "SHIFT A SELECTED CAM'S TIMING" },
+    { ".",             "STEP ONE FRAME WHILE PAUSED" },
+    { "< >",           "RUN SLOWER OR FASTER" },
+    { "SHIFT+CMD+S",   "SAVE UNDER A NEW NAME" },
+    { "ESC",           "CANCEL, OR CLEAR THE SELECTION" },
+};
+#define EXTRA_KEY_COUNT ((int)(sizeof EXTRA_KEYS / sizeof EXTRA_KEYS[0]))
+
+/* Every command in one place. The toolbar half is generated from the buttons
+ * themselves, so a command can never be added without appearing here. */
+static void draw_help(SDL_Renderer *ren, const App *a) {
+    UiRect canvas = a->layout.canvas;
+    UiRect panel = { canvas.x + 20, canvas.y + 16, canvas.w - 40, canvas.h - 32 };
+    if (panel.w < 200 || panel.h < 160) return;
+    render_rect_filled(ren, panel, 22, 23, 28, 246);
+    render_rect_outline(ren, panel, 110, 118, 140, 255);
+
+    const char *title = "EVERY COMMAND. PRESS H OR ESC TO CLOSE.";
+    double tw = render_text_width(10.0, title);
+    render_text(ren, (Vec2){ panel.x + (panel.w - tw) / 2.0, panel.y + 12.0 }, 10.0, title,
+                 220, 225, 235, 255);
+
+    const double row = 15.0, text_h = 8.5;
+    double top = panel.y + 38.0;
+    double col_w = (panel.w - 48.0) / 2.0;
+    int rows_per_col = (int)((panel.h - 56.0) / row);
+    if (rows_per_col < 1) rows_per_col = 1;
+
+    int total = a->toolbar.count + 1 + EXTRA_KEY_COUNT;   /* +1 for the divider */
+    for (int i = 0; i < total; i++) {
+        int col = i / rows_per_col, r = i % rows_per_col;
+        if (col > 1) break;                       /* two columns is all there is room for */
+        double x = panel.x + 20.0 + col * (col_w + 8.0);
+        double y = top + r * row;
+
+        const char *keys, *what;
+        if (i < a->toolbar.count) {
+            keys = a->toolbar.buttons[i].hint;
+            what = a->toolbar.buttons[i].label;
+        } else if (i == a->toolbar.count) {
+            render_text(ren, (Vec2){ x, y }, text_h, "MOUSE AND THE REST", 150, 156, 172, 255);
+            continue;
+        } else {
+            const KeyNote *n = &EXTRA_KEYS[i - a->toolbar.count - 1];
+            keys = n->keys;
+            what = n->what;
+        }
+        render_text(ren, (Vec2){ x, y }, text_h, keys, 255, 225, 110, 255);
+        render_text(ren, (Vec2){ x + 96.0, y }, text_h, what, 200, 206, 218, 255);
+    }
+}
+
 static void app_toggle_gallery(App *a) {
     a->gallery_open = !a->gallery_open;
+    a->gallery_page = 0;
     if (a->gallery_open) {
-        printf("Template gallery: click a mechanism to drop it on the canvas. Escape closes.\n");
+        app_message(a, STATUS_INFO, "Template gallery: click a mechanism to drop it on the canvas. Escape closes.");
     }
 }
 
@@ -953,23 +1396,21 @@ static void app_insert_template(App *a, int index) {
     push_undo(a);
     clear_selection(&a->mech);
 
-    Vec2 centre = screen_to_world((Vec2){ UI_TOOLBAR_W + CANVAS_W / 2.0, CANVAS_H / 2.0 },
-                                   a->view_pan, a->view_zoom);
-    t->build(&a->mech, centre, 1.0);
+    t->build(&a->mech, app_view_centre(a), 1.0);
     a->gallery_open = false;
-    printf("Inserted %s -- %s. Press R to run it.\n", t->name, t->blurb);
+    app_message(a, STATUS_INFO, "Inserted %s -- %s. Press R to run it.", t->name, t->blurb);
 }
 
 static void app_arm_path_tool(App *a, PathTool tool) {
     a->path_tool = (a->path_tool == tool) ? PATH_TOOL_NONE : tool;
     a->path_stroke_count = 0;
     if (a->path_tool == PATH_TOOL_LINKAGE) {
-        printf("Linkage tool armed: draw a curve and a four-bar will be fitted to it -- "
+        app_message(a, STATUS_INFO, "Linkage tool armed: draw a curve and a four-bar will be fitted to it -- "
                 "five parts and one motor, but only the curves a four-bar can trace. "
-                "Escape cancels.\n");
+                "Escape cancels.");
     } else if (a->path_tool == PATH_TOOL_ARMS) {
-        printf("Arms tool armed: draw any curve at all and a chain of rotating arms "
-                "will be built to redraw it exactly. Escape cancels.\n");
+        app_message(a, STATUS_INFO, "Arms tool armed: draw any curve at all and a chain of rotating arms "
+                "will be built to redraw it exactly. Escape cancels.");
     }
 }
 
@@ -1003,15 +1444,15 @@ static void app_build_fourier_chain(App *a, Vec2 anchor, const FourierArm *arms,
 
     if (built < 1) {
         discard_last_undo(a);
-        printf("That path decomposed to nothing usable.\n");
+        app_message(a, STATUS_WARN, "That path decomposed to nothing usable.");
         return;
     }
 
     mechanism_set_traced(&a->mech, previous, true);
     a->mech.connectors[previous].selected = true;
 
-    printf("Built a %d-arm drawing machine for that %s path. Average miss %.2f units "
-            "(%.2f%% of its size). Press R to watch it draw.\n",
+    app_message(a, STATUS_INFO, "Built a %d-arm drawing machine for that %s path. Average miss %.2f units "
+            "(%.2f%% of its size). Press R to watch it draw.",
             built, closed ? "closed" : "open", rms, size > 0.0 ? 100.0 * rms / size : 0.0);
 }
 
@@ -1021,7 +1462,7 @@ static void app_build_fourier_chain(App *a, Vec2 anchor, const FourierArm *arms,
 static void app_build_four_bar(App *a, const FourBar *fb, double error, double size) {
     Vec2 crank_end, coupler_end, traced;
     if (!fourbar_pose(fb, 0.0, &crank_end, &coupler_end, &traced)) {
-        printf("The fitted linkage could not be assembled; nothing was added.\n");
+        app_message(a, STATUS_WARN, "The fitted linkage could not be assembled; nothing was added.");
         return;
     }
 
@@ -1046,20 +1487,20 @@ static void app_build_four_bar(App *a, const FourBar *fb, double error, double s
     a->mech.connectors[tip].selected = true;
 
     double percent = (size > 0.0) ? 100.0 * error / size : 0.0;
-    printf("Fitted a four-bar: crank %.1f, coupler %.1f, rocker %.1f, ground %.1f. "
-            "Average miss %.2f units (%.2f%% of the path). Press R to watch it trace.\n",
+    app_message(a, STATUS_INFO, "Fitted a four-bar: crank %.1f, coupler %.1f, rocker %.1f, ground %.1f. "
+            "Average miss %.2f units (%.2f%% of the path). Press R to watch it trace.",
             fb->crank, fb->coupler, fb->rocker, vec2_dist(fb->ground_a, fb->ground_b),
             error, percent);
     if (error > size * PATH_POOR_FIT_FRACTION) {
-        printf("That path is outside what a four-bar can trace. Undo and use ARMS "
-                "for a machine that will follow it exactly.\n");
+        app_message(a, STATUS_WARN, "That path is outside what a four-bar can trace. Undo and use ARMS "
+                "for a machine that will follow it exactly.");
     }
 }
 
 static void app_synthesize_linkage(App *a) {
     int n = a->path_stroke_count;
     if (n < 4) {
-        printf("That stroke is too short to fit a linkage to.\n");
+        app_message(a, STATUS_WARN, "That stroke is too short to fit a linkage to.");
         return;
     }
     bool closed = synth_stroke_is_closed(a->path_stroke, n);
@@ -1072,11 +1513,11 @@ static void app_synthesize_linkage(App *a) {
     synth_resample(a->path_stroke, n, closed, target, PATH_TARGET_POINTS);
     double size = synth_path_size(a->path_stroke, n);
 
-    printf("Searching for a four-bar that traces that %s path...\n", closed ? "closed" : "open");
+    app_message(a, STATUS_INFO, "Searching for a four-bar that traces that %s path...", closed ? "closed" : "open");
     FourBar fb;
     double error = 0.0;
     if (!synth_fit_four_bar(target, PATH_TARGET_POINTS, closed, synth_default_params(), &fb, &error)) {
-        printf("No four-bar linkage could be fitted to that path. Try ARMS instead.\n");
+        app_message(a, STATUS_WARN, "No four-bar linkage could be fitted to that path. Try ARMS instead.");
         return;
     }
     app_build_four_bar(a, &fb, error, size);
@@ -1085,7 +1526,7 @@ static void app_synthesize_linkage(App *a) {
 static void app_synthesize_arms(App *a) {
     int n = a->path_stroke_count;
     if (n < 4) {
-        printf("That stroke is too short to build a mechanism from.\n");
+        app_message(a, STATUS_WARN, "That stroke is too short to build a mechanism from.");
         return;
     }
 
@@ -1103,7 +1544,7 @@ static void app_synthesize_arms(App *a) {
     int count = synth_fourier_fit(a->path_stroke, n, closed, SYNTH_MAX_ARMS,
                                    size * PATH_TARGET_FRACTION, &anchor, arms, &rms);
     if (count < 1) {
-        printf("Couldn't read a usable path from that stroke.\n");
+        app_message(a, STATUS_WARN, "Couldn't read a usable path from that stroke.");
         return;
     }
     app_build_fourier_chain(a, anchor, arms, count, rms, size, closed);
@@ -1112,21 +1553,24 @@ static void app_synthesize_arms(App *a) {
 static void app_toggle_vary(App *a) {
     int lid = find_single_selected_link(&a->mech);
     if (lid < 0) {
-        printf("Select exactly one link before toggling its length.\n");
+        app_message(a, STATUS_WARN, "Select exactly one link before toggling its length.");
         return;
     }
     if (a->mech.links[lid].is_driven) {
-        printf("A driven link's shape is always rigid; turn its motor off first.\n");
+        app_message(a, STATUS_WARN, "A driven link's shape is always rigid; turn its motor off first.");
         return;
     }
     push_undo(a);
     bool now_rigid = !a->mech.links[lid].rigid;
     mechanism_set_rigid(&a->mech, lid, now_rigid);
-    printf("Link length is now %s.\n", now_rigid ? "fixed" : "variable");
+    app_message(a, STATUS_INFO, "Link length is now %s.", now_rigid ? "fixed" : "variable");
 }
 
 static void app_toggle_trace(App *a) {
-    if (!has_selection(&a->mech)) return;
+    if (!has_selection(&a->mech)) {
+        app_message(a, STATUS_WARN, "Select one or more pins first, then TRACE records where they go.");
+        return;
+    }
     push_undo(a);
     for (int i = 0; i < a->mech.connector_count; i++) {
         if (a->mech.connectors[i].alive && a->mech.connectors[i].selected) {
@@ -1137,14 +1581,26 @@ static void app_toggle_trace(App *a) {
 
 static void app_adjust_motor_speed(App *a, double step) {
     int lid = find_single_selected_link(&a->mech);
-    if (lid < 0 || !a->mech.links[lid].is_driven) return;
-    push_undo(a);
+    if (lid < 0 || !a->mech.links[lid].is_driven) {
+        /* The end of the +/- chain, so this is what "+ did nothing" means:
+         * nothing that has a size or a speed is selected. */
+        app_message(a, STATUS_WARN, "+ and - resize whatever is selected: a wheel, a cam's lift, "
+                     "a Geneva's slots, or a motor's speed. Select one of those first.");
+        return;
+    }
+    /* Retiming a motor mid-run is the one edit worth making while watching,
+     * and the solver reads the speed fresh every frame. No snapshot for it
+     * though: an undo taken mid-run would restore running positions. */
+    if (a->state == APP_EDIT) push_undo(a);
     a->mech.links[lid].motor_speed_deg_s += step;
-    printf("Motor speed: %.1f deg/s\n", a->mech.links[lid].motor_speed_deg_s);
+    app_message(a, STATUS_INFO, "Motor speed: %.1f deg/s", a->mech.links[lid].motor_speed_deg_s);
 }
 
 static void app_delete_selection(App *a) {
-    if (!has_selection(&a->mech)) return;
+    if (!has_selection(&a->mech)) {
+        app_message(a, STATUS_WARN, "Nothing is selected, so there is nothing to delete.");
+        return;
+    }
     push_undo(a);
     for (int i = 0; i < a->mech.link_count; i++) {
         if (a->mech.links[i].alive && a->mech.links[i].selected) mechanism_delete_link(&a->mech, i);
@@ -1174,26 +1630,50 @@ static void app_toggle_gravity(App *a) {
     a->gravity_set_by_user = true;
     if (a->params.gravity.x == 0.0 && a->params.gravity.y == 0.0) {
         a->params.gravity = (Vec2){ 0.0, DEFAULT_GRAVITY_MAGNITUDE };
-        printf("Gravity ON.\n");
+        app_message(a, STATUS_INFO, "Gravity ON.");
     } else {
         a->params.gravity = (Vec2){ 0.0, 0.0 };
-        printf("Gravity OFF.\n");
+        app_message(a, STATUS_INFO, "Gravity OFF.");
     }
 }
 
+/* Asks for a name first. It used to write "linkage_export.py" in whatever the
+ * working directory happened to be, over whatever was already called that. */
 static void app_export(App *a) {
-    const char *path = "linkage_export.py";
-    /* Export the motion the app would actually show, including gravity
-     * applying automatically to a motorless mechanism. */
-    SolverParams export_params = a->params;
-    export_params.gravity = effective_gravity(a);
-    if (export_blender_script(&a->mech, export_params, path)) {
-        printf("Exported %d animation frames to %s -- run it inside Blender's Scripting tab "
-                "(or `blender --python %s`), then press Space to play.\n",
-                EXPORT_FRAMES, path, path);
+    char suggestion[APP_PATH_MAX];
+    if (a->current_path[0]) {
+        snprintf(suggestion, sizeof suggestion, "%s", path_basename(a->current_path));
+        char *dot = strrchr(suggestion, '.');
+        if (dot) *dot = '\0';
+        size_t len = strlen(suggestion);
+        snprintf(suggestion + len, sizeof suggestion - len, ".py");
     } else {
-        printf("Failed to write %s\n", path);
+        snprintf(suggestion, sizeof suggestion, "linkage_export.py");
     }
+    prompt_open(a, PROMPT_EXPORT, "EXPORT A BLENDER SCRIPT AS",
+                 "TYPE A FILE NAME, RETURN TO WRITE IT, ESC TO CANCEL", suggestion);
+}
+
+static void app_save(App *a) {
+    /* Once it has a name, SAVE means save. Without one, ask for it. */
+    if (a->current_path[0]) {
+        app_save_to(a, a->current_path);
+        return;
+    }
+    prompt_open(a, PROMPT_SAVE, "SAVE THE MECHANISM AS",
+                 "TYPE A FILE NAME, RETURN TO SAVE, ESC TO CANCEL", "mechanism.linkage");
+}
+
+static void app_save_as(App *a) {
+    prompt_open(a, PROMPT_SAVE, "SAVE THE MECHANISM AS",
+                 "TYPE A FILE NAME, RETURN TO SAVE, ESC TO CANCEL",
+                 a->current_path[0] ? path_basename(a->current_path) : "mechanism.linkage");
+}
+
+static void app_open(App *a) {
+    prompt_open(a, PROMPT_OPEN, "OPEN A MECHANISM",
+                 "TYPE A FILE NAME, RETURN TO OPEN, ESC TO CANCEL",
+                 a->current_path[0] ? path_basename(a->current_path) : "mechanism.linkage");
 }
 
 static void app_start_run(App *a) {
@@ -1210,11 +1690,14 @@ static void app_start_run(App *a) {
     a->jammed = false;
 
     if (!a->gravity_set_by_user && !mechanism_has_driven_link(&a->mech)) {
-        printf("No motor in this mechanism -- running it under gravity. "
-                "Use the GRAVITY button (or G) to control gravity yourself.\n");
+        app_message(a, STATUS_WARN, "No motor in this mechanism -- running it under gravity. "
+                "Use the GRAVITY button (or G) to control gravity yourself.");
     }
 
     a->sim_time = 0.0;
+    a->paused = false;
+    a->step_once = false;
+    status_clear_sticky(&a->status);
     solver_freeze(&a->mech);
     mechanism_clear_traces(&a->mech);
     a->drag_mode = DRAG_NONE;
@@ -1234,7 +1717,34 @@ static void app_stop_run(App *a) {
     a->frame_angles = NULL;
     a->frame_link_count = 0;
     a->jammed = false;
+    status_clear_sticky(&a->status);
     a->state = APP_EDIT;
+}
+
+static void app_toggle_pause(App *a) {
+    if (a->state != APP_RUNNING) {
+        app_message(a, STATUS_WARN, "Nothing is running to pause. Press R to start it.");
+        return;
+    }
+    a->paused = !a->paused;
+    a->step_once = false;
+    app_message(a, STATUS_INFO, a->paused
+                 ? "Paused. Space runs on again; . steps one frame at a time."
+                 : "Running.");
+}
+
+static void app_step_frame(App *a) {
+    if (a->state != APP_RUNNING) {
+        app_message(a, STATUS_WARN, "Nothing is running to step. Press R to start it.");
+        return;
+    }
+    a->paused = true;      /* stepping is what you do while paused */
+    a->step_once = true;
+}
+
+static void app_adjust_sim_rate(App *a, double factor) {
+    a->sim_rate = clampd(a->sim_rate * factor, SIM_RATE_MIN, SIM_RATE_MAX);
+    app_message(a, STATUS_INFO, "Simulation speed %.2fx real time.", a->sim_rate);
 }
 
 static void app_toggle_run(App *a) {
@@ -1242,8 +1752,25 @@ static void app_toggle_run(App *a) {
     else app_stop_run(a);
 }
 
+/* The view is not the mechanism: this puts the canvas back where the app
+ * started, rather than wherever the parts happen to be. */
+static void app_reset_view(App *a) {
+    a->view_pan = (Vec2){ UI_TOOLBAR_W, 0 };
+    a->view_zoom = 1.0;
+    app_message(a, STATUS_INFO, "View reset to 1:1.");
+}
+
+/* Pans by a screen-space amount. Panning is the one view operation that needs
+ * no world coordinates at all -- the mechanism does not move, the window does. */
+static void app_pan_by(App *a, double dx, double dy) {
+    a->view_pan.x += dx;
+    a->view_pan.y += dy;
+}
+
 static void app_dispatch(App *a, UiAction action) {
     switch (action) {
+    case UI_OPEN:     app_open(a); break;
+    case UI_SAVE:     app_save(a); break;
     case UI_TEMPLATE: app_toggle_gallery(a); break;
     case UI_JOINT:   app_add_joint(a); break;
     case UI_ANCHOR:  app_toggle_anchor(a); break;
@@ -1261,12 +1788,18 @@ static void app_dispatch(App *a, UiAction action) {
     case UI_UNDO:    app_undo(a); break;
     case UI_REDO:    app_redo(a); break;
     case UI_GRAVITY: app_toggle_gravity(a); break;
+    case UI_FIT:     app_fit_view(a, true); break;
     case UI_CLEAR:
+        /* Traces only. The drawn target path is not a trace -- it is what you
+         * asked the machine for, and wiping it takes away the one thing the
+         * result can be judged against. It clears when a new path is drawn. */
         mechanism_clear_traces(&a->mech);
-        a->path_ghost_count = 0; /* the drawn target is a guide like any trace */
+        app_message(a, STATUS_INFO, "Traces cleared.");
         break;
     case UI_EXPORT:  app_export(a); break;
     case UI_RUN:     app_toggle_run(a); break;
+    case UI_PAUSE:   app_toggle_pause(a); break;
+    case UI_HELP:    a->help_open = !a->help_open; break;
     case UI_NONE:
     case UI_ACTION_COUNT:
         break;
@@ -1307,30 +1840,96 @@ static UiState app_ui_state(const App *a) {
     Vec2 g = effective_gravity(a);
     s.gravity_on = (g.x != 0.0 || g.y != 0.0);
     s.gallery_open = a->gallery_open;
-    {
-        int pin, ra, rb, pl, pc, ol, oref;
-        bool rack;
-        /* Always offered: with nothing selected they draw a whole assembly. */
-        (void)slider_roles(&a->mech, &pin, &ra, &rb);
-        (void)gear_roles(&a->mech, &pl, &pc, &ol, &oref, &rack);
-        s.can_make_slider = true;
-        s.can_make_gear = true;
-        s.can_make_geneva = true;
-    }
+    s.jammed = a->jammed;
+    s.paused = a->paused;
+    s.help_open = a->help_open;
+    /* Always offered: with nothing selected each one draws a whole working
+     * assembly, so there is no selection they could be waiting for. */
+    s.can_make_slider = true;
+    s.can_make_gear = true;
+    s.can_make_geneva = true;
     return s;
+}
+
+/* Every command goes through here, from the toolbar and from the keyboard
+ * alike, so the two can never disagree about what is allowed. A refused
+ * command explains itself in the same words the button's tooltip uses -- the
+ * keyboard used to fail silently while the button beside it greyed out. */
+static void app_try_action(App *a, UiAction action) {
+    /* The buttons' flags are refreshed once a frame for drawing; an event
+     * earlier in this same frame may have changed the selection since. */
+    ui_apply_state(&a->toolbar, app_ui_state(a));
+
+    if (ui_action_enabled(&a->toolbar, action)) {
+        app_dispatch(a, action);
+        return;
+    }
+    const char *label = ui_action_label(&a->toolbar, action);
+    if (a->state == APP_RUNNING) {
+        app_message(a, STATUS_WARN,
+                     "%s is an edit and the simulation is running. Press R (or STOP) first.", label);
+    } else {
+        app_message(a, STATUS_WARN, "%s: %s", label, ui_action_tip(&a->toolbar, action));
+    }
+}
+
+/* The keyboard half of the toolbar. Every command that has a button is named
+ * here and nowhere else, so a key and its button stay one command with one
+ * set of rules. Returns UI_NONE for keys that are not toolbar commands. */
+static UiAction action_for_key(SDL_Keycode k, bool cmd, bool shift) {
+    if (cmd) {
+        /* Held with a modifier, a letter is a different key. C used to wipe
+         * every trace on Cmd+C, which is the shortcut for the opposite. */
+        switch (k) {
+        case SDLK_z: return shift ? UI_REDO : UI_UNDO;
+        case SDLK_y: return UI_REDO;
+        case SDLK_s: return UI_SAVE;    /* Shift+Cmd+S is handled as "save as" */
+        case SDLK_o: return UI_OPEN;
+        default:     return UI_NONE;
+        }
+    }
+    switch (k) {
+    case SDLK_n:         return UI_TEMPLATE;
+    case SDLK_j:         return UI_JOINT;
+    case SDLK_a:         return UI_ANCHOR;
+    case SDLK_l:         return UI_LINK;
+    case SDLK_m:         return UI_MOTOR;
+    case SDLK_s:         return UI_SLIDER;
+    case SDLK_o:         return UI_GEAR;
+    case SDLK_w:         return UI_GENEVA;
+    case SDLK_k:         return UI_CAM;
+    case SDLK_p:         return UI_LINKAGE;
+    case SDLK_b:         return UI_ARMS;
+    case SDLK_v:         return UI_VARY;
+    case SDLK_t:         return UI_TRACE;
+    case SDLK_e:         return UI_EXPORT;
+    case SDLK_f:         return UI_FIT;
+    case SDLK_c:         return UI_CLEAR;
+    case SDLK_h:         return UI_HELP;
+    case SDLK_SLASH:     return UI_HELP;   /* '?' is shift-slash */
+    case SDLK_g:         return UI_GRAVITY;
+    case SDLK_r:         return UI_RUN;
+    case SDLK_DELETE:
+    case SDLK_BACKSPACE: return UI_DELETE;
+    default:             return UI_NONE;
+    }
 }
 
 static void draw_mechanism(SDL_Renderer *ren, const Mechanism *m, DragMode drag_mode, Vec2 drag_start, Vec2 drag_current,
                             Vec2 view_pan, double view_zoom) {
+    /* Traces first, behind the parts. Projected into a scratch buffer and
+     * drawn as one run: these are the longest thing on the canvas by far. */
+    static Vec2 trace_screen[MECHANISM_TRACE_MAX];
     for (int i = 0; i < m->connector_count; i++) {
         const Connector *c = &m->connectors[i];
         if (!c->alive || !c->traced || c->path_count < 2) continue;
         Uint8 tr, tg, tb;
         render_trace_color(i, &tr, &tg, &tb);
-        for (int k = 1; k < c->path_count; k++) {
-            render_line(ren, world_to_screen(c->path[k - 1], view_pan, view_zoom),
-                        world_to_screen(c->path[k], view_pan, view_zoom), tr, tg, tb, 255);
+        int n = c->path_count < MECHANISM_TRACE_MAX ? c->path_count : MECHANISM_TRACE_MAX;
+        for (int k = 0; k < n; k++) {
+            trace_screen[k] = world_to_screen(c->path[k], view_pan, view_zoom);
         }
+        render_polyline(ren, trace_screen, n, tr, tg, tb, 255);
     }
 
     for (int ci = 0; ci < m->cam_count; ci++) {
@@ -1355,13 +1954,19 @@ static void draw_mechanism(SDL_Renderer *ren, const Mechanism *m, DragMode drag_
 
         if (cam->follower_connector_id >= 0 && m->connectors[cam->follower_connector_id].alive) {
             Vec2 f = world_to_screen(m->connectors[cam->follower_connector_id].pos, view_pan, view_zoom);
-            if (cam->in_contact) render_circle(ren, f, cam->roller_radius * view_zoom, 120, 215, 140, 255);
-            else render_circle(ren, f, cam->roller_radius * view_zoom, 235, 110, 90, 255);
+            /* Touching is solid, floating is hollow. Green against red is
+             * exactly the pair that reads as one colour to some people. */
+            double rr = cam->roller_radius * view_zoom;
+            if (cam->in_contact) render_circle(ren, f, rr, 120, 215, 140, 255);
+            else {
+                render_circle_outline(ren, f, rr, 235, 110, 90, 255);
+                render_circle_outline(ren, f, rr - 2.0, 235, 110, 90, 255);
+            }
         }
 
         /* Base radius and lift, in the same seven-segment numerals the link
          * lengths use. */
-        double dh = 10.0 * view_zoom;
+        double dh = label_height(view_zoom);
         render_number(ren, (Vec2){ centre.x + 6.0, centre.y + 8.0 }, 0.0, dh,
                       cam->base_radius, 160, 150, 185, 255);
         render_number(ren, (Vec2){ centre.x + 6.0, centre.y + 8.0 + dh * 1.5 }, 0.0, dh,
@@ -1388,7 +1993,7 @@ static void draw_mechanism(SDL_Renderer *ren, const Mechanism *m, DragMode drag_
                            world_to_screen(e1, view_pan, view_zoom), 6.0, rr, rg, rb, 255);
         if (m->connectors[sl->pin_connector_id].alive) {
             Vec2 pin = world_to_screen(m->connectors[sl->pin_connector_id].pos, view_pan, view_zoom);
-            render_circle_outline(ren, pin, 7.0 * view_zoom, 130, 190, 235, 255);
+            render_circle_outline(ren, pin, pin_ring_radius(view_zoom), 130, 190, 235, 255);
         }
     }
 
@@ -1408,8 +2013,11 @@ static void draw_mechanism(SDL_Renderer *ren, const Mechanism *m, DragMode drag_
         else { cr = 120; cg = 130; cb = 145; }                   /* loose, not meshed yet */
 
         Vec2 c0 = world_to_screen(m->connectors[centre].pos, view_pan, view_zoom);
-        render_circle_outline(ren, c0, r * view_zoom, cr, cg, cb, 255);
-        double dh = 10.0 * view_zoom;
+        /* Dashed means "something else turns this one" -- the same fact the
+         * olive colour carries, said a second way. */
+        if (l->driven_externally) render_dashed_circle(ren, c0, r * view_zoom, cr, cg, cb, 255);
+        else render_circle_outline(ren, c0, r * view_zoom, cr, cg, cb, 255);
+        double dh = label_height(view_zoom);
         render_number(ren, (Vec2){ c0.x + 5.0, c0.y - r * view_zoom - dh - 4.0 },
                       0.0, dh, r, cr, cg, cb, 255);
     }
@@ -1457,7 +2065,7 @@ static void draw_mechanism(SDL_Renderer *ren, const Mechanism *m, DragMode drag_
         }
         /* The slot count, which is the one number that decides how it indexes. */
         Vec2 wc = world_to_screen(m->connectors[gv->wheel_center_id].pos, view_pan, view_zoom);
-        double dh = 10.0 * view_zoom;
+        double dh = label_height(view_zoom);
         render_number(ren, (Vec2){ wc.x + 5.0, wc.y - wheel_r * view_zoom - dh - 4.0 },
                       0.0, dh, (double)gv->slot_count, cr, cg, cb, 255);
     }
@@ -1475,6 +2083,19 @@ static void draw_mechanism(SDL_Renderer *ren, const Mechanism *m, DragMode drag_
         else if (l->is_driven) { r = 230; g = 90; b = 70; }
         else if (!l->rigid) { r = 110; g = 210; b = 140; }
         else { r = 140; g = 150; b = 165; }
+        /* A body with n pins is drawn as all n(n-1)/2 edges between them, but
+         * labelling every one buries a five-pin plate under ten numerals. Only
+         * the longest edge -- the body's overall size -- gets a dimension. */
+        int label_i = -1, label_j = -1;
+        double longest = -1.0;
+        for (int i = 0; i < l->connector_count; i++) {
+            for (int j = i + 1; j < l->connector_count; j++) {
+                double d = vec2_dist(m->connectors[l->connector_ids[i]].pos,
+                                      m->connectors[l->connector_ids[j]].pos);
+                if (d > longest) { longest = d; label_i = i; label_j = j; }
+            }
+        }
+
         for (int i = 0; i < l->connector_count; i++) {
             for (int j = i + 1; j < l->connector_count; j++) {
                 Vec2 world_a = m->connectors[l->connector_ids[i]].pos;
@@ -1490,7 +2111,10 @@ static void draw_mechanism(SDL_Renderer *ren, const Mechanism *m, DragMode drag_
                 /* Only label a link the number actually fits alongside. A
                  * drawing machine has dozens of short arms, and labelling
                  * every one buries the mechanism in numerals. */
-                if (dir_len > 1e-6 && dir_len > render_number_width(10.0 * view_zoom, length) + 8.0) {
+                double digit_height = label_height(view_zoom);
+                bool label_this = (i == label_i && j == label_j);
+                if (label_this && dir_len > 1e-6 &&
+                    dir_len > render_number_width(digit_height, length) + 8.0) {
                     Vec2 dir_unit = vec2_scale(dir, 1.0 / dir_len);
                     double angle = atan2(dir_unit.y, dir_unit.x);
                     /* Keep text reading left-to-right rather than upside down
@@ -1500,8 +2124,7 @@ static void draw_mechanism(SDL_Renderer *ren, const Mechanism *m, DragMode drag_
                         dir_unit = vec2_scale(dir_unit, -1.0);
                     }
                     Vec2 perp_unit = vec2_perp(dir_unit); /* consistent side once dir_unit is normalized above */
-                    double digit_height = 10.0 * view_zoom;
-                    double gap = 6.0 * view_zoom;
+                    double gap = clampd(6.0 * view_zoom, 4.0, 9.0);
                     double text_width = render_number_width(digit_height, length);
                     Vec2 start = {
                         mid.x - dir_unit.x * (text_width / 2.0) + perp_unit.x * gap,
@@ -1522,8 +2145,11 @@ static void draw_mechanism(SDL_Renderer *ren, const Mechanism *m, DragMode drag_
         else if (c->traced) { render_trace_color(i, &r, &g, &b); }
         else { r = 220; g = 220; b = 220; }
         Vec2 sp = world_to_screen(c->pos, view_pan, view_zoom);
-        render_circle(ren, sp, 5.0 * view_zoom, r, g, b, 255);
-        if (c->is_anchor) render_ground_hatch(ren, sp, 8.0 * view_zoom, r, g, b, 255);
+        double hr = handle_radius(view_zoom);
+        render_circle(ren, sp, hr, r, g, b, 255);
+        /* Selected pins get a ring as well as the yellow. */
+        if (c->selected) render_circle_outline(ren, sp, hr + 3.0, 255, 225, 70, 255);
+        if (c->is_anchor) render_ground_hatch(ren, sp, hatch_size(view_zoom), r, g, b, 255);
     }
 
     if (drag_mode == DRAG_BOX_SELECT) {
@@ -1537,6 +2163,157 @@ static void draw_mechanism(SDL_Renderer *ren, const Mechanism *m, DragMode drag_
     }
 }
 
+/* One place where a key press becomes something happening. Everything that is
+ * a toolbar command goes through app_try_action; what is left is the handful
+ * of keys that have no button -- the view, the modifiers on a selection, and
+ * cancelling out of whatever is armed. */
+/* While a prompt is up it has the keyboard to itself: nothing else should be
+ * happening to the mechanism behind a question you are part-way through
+ * answering. Returns whether the key was the prompt's. */
+static bool prompt_handle_key(App *a, SDL_Keycode k) {
+    if (a->prompt.kind == PROMPT_NONE) return false;
+
+    if (k == SDLK_ESCAPE) {
+        prompt_close(a);
+        app_message(a, STATUS_INFO, "Cancelled.");
+        return true;
+    }
+    if (prompt_takes_typing(a->prompt.kind)) {
+        if (k == SDLK_RETURN || k == SDLK_KP_ENTER) { prompt_commit(a); return true; }
+        if (k == SDLK_BACKSPACE) {
+            size_t len = strlen(a->prompt.text);
+            if (len > 0) a->prompt.text[len - 1] = '\0';
+            return true;
+        }
+        return true;   /* everything else is typing, or nothing at all */
+    }
+    /* A confirmation: one key means yes, anything else waits. */
+    if (k == SDLK_y || k == SDLK_RETURN || k == SDLK_KP_ENTER) { prompt_commit(a); return true; }
+    return true;
+}
+
+static void app_handle_key(App *a, const SDL_KeyboardEvent *key) {
+    SDL_Keycode k = key->keysym.sym;
+    SDL_Keymod mod = SDL_GetModState();
+    bool cmd = (mod & (KMOD_CTRL | KMOD_GUI)) != 0;
+    bool shift = (mod & KMOD_SHIFT) != 0;
+
+    if (prompt_handle_key(a, k)) return;
+
+    /* Save-as is the one command with no button of its own: SAVE means save
+     * once the mechanism has a name, and this is how you give it another. */
+    if (cmd && shift && k == SDLK_s) {
+        if (a->state == APP_EDIT) app_save_as(a);
+        return;
+    }
+
+    /* Auto-repeat used to fire the command again on every repeat: holding J
+     * sprayed joints (and undo snapshots), holding N strobed the gallery, and
+     * holding K armed and disarmed the cam tool a dozen times. Only the keys
+     * that mean "more of this" want repeating. */
+    bool repeatable = (k == SDLK_EQUALS || k == SDLK_KP_PLUS ||
+                        k == SDLK_MINUS  || k == SDLK_KP_MINUS ||
+                        k == SDLK_LEFTBRACKET || k == SDLK_RIGHTBRACKET ||
+                        k == SDLK_LEFT || k == SDLK_RIGHT || k == SDLK_UP || k == SDLK_DOWN);
+    if (key->repeat && !repeatable) return;
+
+    UiAction action = action_for_key(k, cmd, shift);
+    if (action != UI_NONE) {
+        app_try_action(a, action);
+        return;
+    }
+
+    /* While the gallery is up, the arrows page it rather than moving a view
+     * nobody can see. */
+    if (a->gallery_open && (k == SDLK_LEFT || k == SDLK_RIGHT)) {
+        gallery_turn_page(a, k == SDLK_RIGHT ? 1 : -1);
+        return;
+    }
+
+    /* View controls, which work whatever the app is doing. */
+    switch (k) {
+    case SDLK_0:     app_reset_view(a); return;
+    case SDLK_SPACE: app_toggle_pause(a); return;
+    case SDLK_PERIOD:
+        /* Shifted, the same key means "faster": > and . on one keycap. */
+        if (shift) app_adjust_sim_rate(a, SIM_RATE_STEP);
+        else app_step_frame(a);
+        return;
+    case SDLK_COMMA:
+        if (shift) app_adjust_sim_rate(a, 1.0 / SIM_RATE_STEP);
+        return;
+    case SDLK_LEFT:  app_pan_by(a,  VIEW_PAN_STEP, 0.0); return;
+    case SDLK_RIGHT: app_pan_by(a, -VIEW_PAN_STEP, 0.0); return;
+    case SDLK_UP:    app_pan_by(a, 0.0,  VIEW_PAN_STEP); return;
+    case SDLK_DOWN:  app_pan_by(a, 0.0, -VIEW_PAN_STEP); return;
+    default: break;
+    }
+
+    if (a->state != APP_EDIT) {
+        /* Changing a running motor's speed is allowed -- watching a mechanism
+         * and asking "what if it turned faster" is the same action. */
+        if (k == SDLK_EQUALS || k == SDLK_KP_PLUS) {
+            app_adjust_motor_speed(a, MOTOR_SPEED_STEP_DEG_S);
+            return;
+        }
+        if (k == SDLK_MINUS || k == SDLK_KP_MINUS) {
+            app_adjust_motor_speed(a, -MOTOR_SPEED_STEP_DEG_S);
+            return;
+        }
+        /* The rest are edits. They used to do nothing at all here, which reads
+         * exactly like a key that does not exist. */
+        if (k == SDLK_ESCAPE || k == SDLK_LEFTBRACKET || k == SDLK_RIGHTBRACKET) {
+            app_message(a, STATUS_WARN,
+                         "That changes the mechanism, and the simulation is running. "
+                         "Press R (or STOP) first.");
+        }
+        return;
+    }
+
+    switch (k) {
+    case SDLK_LEFTBRACKET:  app_adjust_cam_timing(a, -CAM_TIMING_STEP); return;
+    case SDLK_RIGHTBRACKET: app_adjust_cam_timing(a, CAM_TIMING_STEP); return;
+
+    /* +/- means "more of whatever is selected". */
+    case SDLK_EQUALS:
+    case SDLK_KP_PLUS:
+        if (find_single_selected_cam(&a->mech) >= 0) app_adjust_cam_lift(a, CAM_LIFT_SCALE);
+        else if (gather_selected_wheels(&a->mech, NULL, 0) == 1) app_adjust_wheel_radius(a, WHEEL_RESIZE_STEP);
+        else if (find_single_selected_geneva(&a->mech) >= 0) app_adjust_geneva_slots(a, 1);
+        else app_adjust_motor_speed(a, MOTOR_SPEED_STEP_DEG_S);
+        return;
+    case SDLK_MINUS:
+    case SDLK_KP_MINUS:
+        if (find_single_selected_cam(&a->mech) >= 0) app_adjust_cam_lift(a, 1.0 / CAM_LIFT_SCALE);
+        else if (gather_selected_wheels(&a->mech, NULL, 0) == 1) app_adjust_wheel_radius(a, 1.0 / WHEEL_RESIZE_STEP);
+        else if (find_single_selected_geneva(&a->mech) >= 0) app_adjust_geneva_slots(a, -1);
+        else app_adjust_motor_speed(a, -MOTOR_SPEED_STEP_DEG_S);
+        return;
+
+    case SDLK_ESCAPE:
+        /* Backs out of one thing at a time, innermost first. */
+        if (a->help_open) {
+            a->help_open = false;
+        } else if (a->gallery_open) {
+            a->gallery_open = false;
+        } else if (a->cam_draw_armed) {
+            a->cam_draw_armed = false;
+            a->cam_stroke_count = 0;
+            app_message(a, STATUS_INFO, "Cam tool cancelled.");
+        } else if (a->path_tool != PATH_TOOL_NONE) {
+            a->path_tool = PATH_TOOL_NONE;
+            a->path_stroke_count = 0;
+            app_message(a, STATUS_INFO, "Path tool cancelled.");
+        } else {
+            clear_selection(&a->mech);
+        }
+        return;
+
+    default:
+        return;
+    }
+}
+
 int main(void) {
     /* Line-buffer stdout so the running commentary still appears in order
      * when it is redirected to a file, not just when it goes to a terminal. */
@@ -1547,13 +2324,28 @@ int main(void) {
         return 1;
     }
 
+    /* Open no bigger than the screen it has to fit on. The old fixed size was
+     * taller than a 1280x800 laptop display, which put the plot panel out of
+     * reach on a window that could not then be resized. */
+    int start_w = WIN_DEFAULT_W, start_h = WIN_DEFAULT_H;
+    SDL_Rect usable;
+    if (SDL_GetDisplayUsableBounds(0, &usable) == 0) {
+        if (start_w > usable.w) start_w = usable.w;
+        if (start_h > usable.h) start_h = usable.h;
+    }
+    if (start_w < WIN_MIN_W) start_w = WIN_MIN_W;
+    if (start_h < WIN_MIN_H) start_h = WIN_MIN_H;
+
     SDL_Window *win = SDL_CreateWindow("Linkage Design",
-        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, WIN_W, WIN_H, SDL_WINDOW_SHOWN);
+        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, start_w, start_h,
+        SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
     if (!win) {
         fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
         SDL_Quit();
         return 1;
     }
+
+    SDL_SetWindowMinimumSize(win, WIN_MIN_W, WIN_MIN_H);
 
     SDL_Renderer *ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED);
     if (!ren) {
@@ -1563,59 +2355,15 @@ int main(void) {
         return 1;
     }
 
-    printf("Linkage Design - mechanism editor\n");
-    printf("  Every command below is also a button in the toolbar down the left edge.\n");
-    printf("  Edit mode:\n");
-    printf("    Click empty space: place a connector      Drag empty space: box-select\n");
-    printf("    Click a connector: select it (Shift: add/remove)   Drag a selected connector: move selection\n");
-    printf("    Click a link's edge: select that link\n");
-    printf("    N: TEMPLATE gallery -- pick a famous mechanism and drop it in\n");
-    printf("    J: place a connector at the centre of the view\n");
-    printf("    L: link selected connectors     A: toggle anchor on selected connectors\n");
-    printf("    M: toggle motor on selected link (needs exactly one anchor)   +/-: motor speed\n");
-    printf("    S/O/W: SLIDER, GEAR, GENEVA. With nothing selected each one draws a\n");
-    printf("       whole working assembly -- motor and all -- into the middle of the\n");
-    printf("       view; drag any part of it to change its proportions. With the right\n");
-    printf("       parts already selected it joins those instead:\n");
-    printf("         SLIDER: 3 connectors -- the two farthest apart are the rail, the\n");
-    printf("                 third is the pin that runs along it\n");
-    printf("         GEAR:   2 grounded centres for a gear pair, or a grounded centre\n");
-    printf("                 plus a point on a free bar for a rack and pinion\n");
-    printf("         GENEVA: the motor's centre and the wheel's centre\n");
-    printf("       GEAR works differently from the other two, because gears are\n");
-    printf("       built rather than dropped in whole:\n");
-    printf("         press it with nothing selected: ONE wheel, on its own, clear of\n");
-    printf("           whatever is already there and meshed with nothing\n");
-    printf("         select two or more wheels and press it: they mesh, in order\n");
-    printf("       A wheel is a disc, not a bar -- a hub and a mark on its RIM, and\n");
-    printf("       that mark is the point TRACE plots. Click anywhere on a wheel to\n");
-    printf("       select it, and SHIFT-CLICK to add a second -- that is how two wheels\n");
-    printf("       get chosen for meshing. +/- resize a wheel alone, and M makes it the one\n");
-    printf("       that drives (its whole train turns round to suit). Meshed wheels\n");
-    printf("       slide along until they touch, so dragging one swings it round its\n");
-    printf("       partner rather than pulling the teeth apart.\n");
-    printf("       Click a Geneva wheel or a slider rail to select that joint, and\n");
-    printf("       +/- changes a Geneva's slot count.\n");
-    printf("    K: cam tool -- then DRAG on the canvas to draw the cam's outline (or\n");
-    printf("       click once for a default cam). The centre, motor and roller follower\n");
-    printf("       are all created for you. Click a cam's outline to select it:\n");
-    printf("       +/- resize its lift, [ and ] shift its timing.\n");
-    printf("    Two path tools: draw a curve and get a machine that traces it.\n");
-    printf("      P: LINKAGE -- fits a four-bar. Five parts and one motor, but only\n");
-    printf("         the curves four-bars can trace (beans, ellipses, figure-eights).\n");
-    printf("      B: ARMS -- a chain of rotating arms. Traces ANY curve exactly,\n");
-    printf("         at the cost of dozens of parts. Use it for stars, hearts, etc.\n");
-    printf("       Close the loop for a repeating cycle; leave it open and the pen\n");
-    printf("       sweeps out along it and back.\n");
-    printf("    V: toggle selected link's length between fixed and variable (green = variable)\n");
-    printf("    T: toggle path tracing on selected connectors\n");
-    printf("    E: export mechanism to a Blender Python script\n");
-    printf("    Delete/Backspace: delete selection     Escape: clear selection\n");
-    printf("    Cmd/Ctrl+Z: undo     Shift+Cmd/Ctrl+Z or Cmd/Ctrl+Y: redo\n");
-    printf("  Scroll wheel: zoom in/out (centered on cursor)\n");
-    printf("  C: clear all traces (works while running too)\n");
-    printf("  G: toggle gravity (on automatically when the mechanism has no motor)\n");
-    printf("  R: run/stop simulation\n");
+    /* The terminal gets a pointer, not a manual. Every one of these commands
+     * has a button with its key on it and a tooltip saying what it wants, and
+     * H lists the lot inside the window -- which is where someone who started
+     * the app by double-clicking it can actually read them. */
+    printf("Linkage Design - a 2D mechanism editor.\n");
+    printf("  Press H in the window for every key and what it does.\n");
+    printf("  Every command is also a button down the left edge, with its key on it.\n");
+    printf("  Cmd/Ctrl+S saves the mechanism, Cmd/Ctrl+O opens one, E exports it to Blender.\n");
+    printf("  Anything the program has to say now appears on the canvas as well as here.\n");
 
     App app;
     mechanism_init(&app.mech);
@@ -1626,6 +2374,8 @@ int main(void) {
     app.state = APP_EDIT;
     app.drag_mode = DRAG_NONE;
     app.drag_start = app.drag_last = app.drag_current = (Vec2){ 0, 0 };
+    app.pan_last_screen = (Vec2){ 0, 0 };
+    app.drag_pushed_undo = false;
     app.pre_run_positions = NULL;
     app.pre_run_count = 0;
     app.frame_positions = NULL;
@@ -1635,18 +2385,37 @@ int main(void) {
     app.view_pan = (Vec2){ UI_TOOLBAR_W, 0 };
     app.view_zoom = 1.0;
     app.sim_time = 0.0;
+    app.paused = false;
+    app.step_once = false;
+    app.sim_rate = 1.0;
     app.cam_draw_armed = false;
     app.cam_stroke = NULL;
     app.cam_stroke_count = 0;
     app.cam_stroke_capacity = 0;
     app.path_tool = PATH_TOOL_NONE;
     app.gallery_open = false;
+    app.gallery_page = 0;
+    app.help_open = false;
     app.path_stroke = NULL;
     app.path_stroke_count = 0;
     app.path_stroke_capacity = 0;
     app.path_ghost_count = 0;
     app.path_ghost_closed = false;
-    ui_init(&app.toolbar);
+    app.current_path[0] = '\0';
+    app.dirty = false;
+    app.prompt.kind = PROMPT_NONE;
+    app.prompt.text[0] = '\0';
+    app.prompt.pending[0] = '\0';
+    app.window = win;
+    status_init(&app.status);
+    /* Everything -- app maths, SDL mouse coordinates, drawing -- stays in
+     * window POINTS, and the renderer scales that to whatever pixels the
+     * display actually has. That is what makes the window sharp on a Retina
+     * screen without a single coordinate conversion anywhere else. */
+    SDL_RenderSetLogicalSize(ren, start_w, start_h);
+    app.layout = layout_for(start_w, start_h);
+    ui_init(&app.toolbar, app.layout.win_h);
+    app_update_title(&app);
 
     Uint32 hover_since = 0;   /* when the cursor settled on the hovered button */
     int mouse_x = 0, mouse_y = 0;
@@ -1656,11 +2425,44 @@ int main(void) {
     while (running) {
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
-            if (ev.type == SDL_QUIT) {
-                running = false;
+            if (ev.type == SDL_TEXTINPUT) {
+                if (prompt_takes_typing(app.prompt.kind)) {
+                    size_t len = strlen(app.prompt.text);
+                    snprintf(app.prompt.text + len, sizeof app.prompt.text - len, "%s", ev.text.text);
+                }
+            } else if (app.prompt.kind != PROMPT_NONE &&
+                        (ev.type == SDL_MOUSEBUTTONDOWN || ev.type == SDL_MOUSEBUTTONUP ||
+                         ev.type == SDL_MOUSEWHEEL)) {
+                /* The canvas is behind a question; clicking it would edit a
+                 * mechanism the user cannot currently see the whole of. */
+            } else if (ev.type == SDL_QUIT) {
+                /* Unsaved work is not thrown away without being asked. */
+                if (app.dirty && app.prompt.kind != PROMPT_QUIT) {
+                    prompt_open(&app, PROMPT_QUIT, "THIS MECHANISM HAS UNSAVED CHANGES",
+                                 "PRESS Y TO QUIT ANYWAY, ESC TO GO BACK AND SAVE IT", NULL);
+                } else {
+                    running = false;
+                }
+            } else if (ev.type == SDL_WINDOWEVENT && ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
+                int w = ev.window.data1, h = ev.window.data2;
+                SDL_RenderSetLogicalSize(ren, w, h);
+                app.layout = layout_for(w, h);
+                ui_init(&app.toolbar, app.layout.win_h);
+            } else if (ev.type == SDL_MOUSEBUTTONDOWN && ev.button.button == SDL_BUTTON_MIDDLE) {
+                /* Panning works in every mode, including mid-run: it is the
+                 * window moving, not the mechanism. */
+                app.drag_mode = DRAG_PAN;
+                app.pan_last_screen = (Vec2){ (double)ev.button.x, (double)ev.button.y };
+            } else if (ev.type == SDL_MOUSEBUTTONUP && ev.button.button == SDL_BUTTON_MIDDLE) {
+                if (app.drag_mode == DRAG_PAN) app.drag_mode = DRAG_NONE;
             } else if (ev.type == SDL_MOUSEMOTION) {
                 mouse_x = ev.motion.x;
                 mouse_y = ev.motion.y;
+                if (app.drag_mode == DRAG_PAN) {
+                    app_pan_by(&app, ev.motion.x - app.pan_last_screen.x,
+                                      ev.motion.y - app.pan_last_screen.y);
+                    app.pan_last_screen = (Vec2){ (double)ev.motion.x, (double)ev.motion.y };
+                }
                 {
                     /* A tooltip waits for the cursor to settle, so sweeping
                      * down the strip doesn't flash a panel per button. */
@@ -1675,6 +2477,12 @@ int main(void) {
                     Vec2 p = screen_to_world((Vec2){ (double)ev.motion.x, (double)ev.motion.y }, app.view_pan, app.view_zoom);
                     if (app.drag_mode == DRAG_MOVE_CONNECTORS) {
                         Vec2 delta = vec2_sub(p, app.drag_last);
+                        /* Snapshot on the first real movement, not on the press:
+                         * a click that moves nothing leaves no history behind. */
+                        if (!app.drag_pushed_undo && vec2_len(delta) > 0.0) {
+                            push_undo(&app);
+                            app.drag_pushed_undo = true;
+                        }
                         for (int i = 0; i < app.mech.connector_count; i++) {
                             if (app.mech.connectors[i].alive && app.mech.connectors[i].selected) {
                                 app.mech.connectors[i].pos = vec2_add(app.mech.connectors[i].pos, delta);
@@ -1700,86 +2508,15 @@ int main(void) {
                         app.toolbar.pressed >= 0) {
                 int released_on = ui_hit_test(&app.toolbar, ev.button.x, ev.button.y);
                 const UiButton *b = &app.toolbar.buttons[app.toolbar.pressed];
-                if (released_on == app.toolbar.pressed && b->enabled) app_dispatch(&app, b->action);
+                /* Through app_try_action, so pressing a greyed-out button says
+                 * what it wants rather than doing nothing at all. */
+                if (released_on == app.toolbar.pressed) app_try_action(&app, b->action);
                 app.toolbar.pressed = -1;
-            } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_c) {
-                mechanism_clear_traces(&app.mech); /* works in both edit and running mode */
-                app.path_ghost_count = 0;
-            } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_g) {
-                app_toggle_gravity(&app);
-            } else if (ev.type == SDL_KEYDOWN && app.state == APP_EDIT) {
-                SDL_Keycode k = ev.key.keysym.sym;
-                SDL_Keymod mod = SDL_GetModState();
-                bool cmd = (mod & (KMOD_CTRL | KMOD_GUI)) != 0;
-                if (k == SDLK_z && cmd) {
-                    if (mod & KMOD_SHIFT) app_redo(&app);
-                    else app_undo(&app);
-                } else if (k == SDLK_y && cmd) {
-                    app_redo(&app);
-                } else if (k == SDLK_n) {
-                    app_toggle_gallery(&app);
-                } else if (k == SDLK_j) {
-                    app_add_joint(&app);
-                } else if (k == SDLK_l) {
-                    app_link_selected(&app);
-                } else if (k == SDLK_a) {
-                    app_toggle_anchor(&app);
-                } else if (k == SDLK_m) {
-                    app_toggle_motor(&app);
-                } else if (k == SDLK_s) {
-                    app_add_slider(&app);
-                } else if (k == SDLK_o) {
-                    app_add_gear(&app);
-                } else if (k == SDLK_w) {
-                    app_add_geneva(&app);
-                } else if (k == SDLK_k) {
-                    app_toggle_cam_draw(&app);
-                } else if (k == SDLK_p) {
-                    app_arm_path_tool(&app, PATH_TOOL_LINKAGE);
-                } else if (k == SDLK_b) {
-                    app_arm_path_tool(&app, PATH_TOOL_ARMS);
-                } else if (k == SDLK_LEFTBRACKET) {
-                    app_adjust_cam_timing(&app, -CAM_TIMING_STEP);
-                } else if (k == SDLK_RIGHTBRACKET) {
-                    app_adjust_cam_timing(&app, CAM_TIMING_STEP);
-                } else if (k == SDLK_v) {
-                    app_toggle_vary(&app);
-                } else if (k == SDLK_EQUALS || k == SDLK_KP_PLUS) {
-                    /* +/- means "more of whatever is selected". */
-                    if (find_single_selected_cam(&app.mech) >= 0) app_adjust_cam_lift(&app, CAM_LIFT_SCALE);
-                    else if (gather_selected_wheels(&app.mech, NULL, 0) == 1) app_adjust_wheel_radius(&app, WHEEL_RESIZE_STEP);
-                    else if (find_single_selected_geneva(&app.mech) >= 0) app_adjust_geneva_slots(&app, 1);
-                    else app_adjust_motor_speed(&app, MOTOR_SPEED_STEP_DEG_S);
-                } else if (k == SDLK_MINUS || k == SDLK_KP_MINUS) {
-                    if (find_single_selected_cam(&app.mech) >= 0) app_adjust_cam_lift(&app, 1.0 / CAM_LIFT_SCALE);
-                    else if (gather_selected_wheels(&app.mech, NULL, 0) == 1) app_adjust_wheel_radius(&app, 1.0 / WHEEL_RESIZE_STEP);
-                    else if (find_single_selected_geneva(&app.mech) >= 0) app_adjust_geneva_slots(&app, -1);
-                    else app_adjust_motor_speed(&app, -MOTOR_SPEED_STEP_DEG_S);
-                } else if (k == SDLK_t) {
-                    app_toggle_trace(&app);
-                } else if (k == SDLK_e) {
-                    app_export(&app);
-                } else if (k == SDLK_DELETE || k == SDLK_BACKSPACE) {
-                    app_delete_selection(&app);
-                } else if (k == SDLK_ESCAPE) {
-                    if (app.gallery_open) {
-                        app.gallery_open = false;
-                    } else if (app.cam_draw_armed) {
-                        app.cam_draw_armed = false;
-                        app.cam_stroke_count = 0;
-                        printf("Cam tool cancelled.\n");
-                    } else if (app.path_tool != PATH_TOOL_NONE) {
-                        app.path_tool = PATH_TOOL_NONE;
-                        app.path_stroke_count = 0;
-                        printf("Path tool cancelled.\n");
-                    } else {
-                        clear_selection(&app.mech);
-                    }
-                } else if (k == SDLK_r) {
-                    app_start_run(&app);
-                }
-            } else if (ev.type == SDL_KEYDOWN && app.state == APP_RUNNING) {
-                if (ev.key.keysym.sym == SDLK_r) app_stop_run(&app);
+            } else if (ev.type == SDL_KEYDOWN) {
+                bool quitting = (app.prompt.kind == PROMPT_QUIT) &&
+                                 (ev.key.keysym.sym == SDLK_y || ev.key.keysym.sym == SDLK_RETURN);
+                app_handle_key(&app, &ev.key);
+                if (quitting) running = false;
             } else if (ev.type == SDL_MOUSEWHEEL) {
                 int mx, my;
                 SDL_GetMouseState(&mx, &my);
@@ -1796,9 +2533,14 @@ int main(void) {
                     app.view_pan.y = screen_mouse.y - world_before.y * new_zoom;
                     app.view_zoom = new_zoom;
                 }
+            } else if (app.help_open && ev.type == SDL_MOUSEBUTTONDOWN &&
+                        ev.button.button == SDL_BUTTON_LEFT) {
+                /* A click anywhere puts the key list away, rather than landing
+                 * on the mechanism hidden behind it. */
+                app.help_open = false;
             } else if (app.state == APP_EDIT && ev.type == SDL_MOUSEBUTTONDOWN && ev.button.button == SDL_BUTTON_LEFT &&
                         app.gallery_open) {
-                int tile = gallery_hit(ev.button.x, ev.button.y);
+                int tile = gallery_hit(&app, ev.button.x, ev.button.y);
                 if (tile >= 0) app_insert_template(&app, tile);
                 else app.gallery_open = false;   /* a click outside dismisses it */
             } else if (app.state == APP_EDIT && ev.type == SDL_MOUSEBUTTONDOWN && ev.button.button == SDL_BUTTON_LEFT &&
@@ -1807,6 +2549,7 @@ int main(void) {
                 app.drag_mode = DRAG_DRAW_PATH;
                 app.drag_start = p;
                 app.path_stroke_count = 0;
+                app.path_ghost_count = 0;   /* the previous target, superseded */
                 stroke_push(&app.path_stroke, &app.path_stroke_count, &app.path_stroke_capacity, p);
             } else if (app.state == APP_EDIT && ev.type == SDL_MOUSEBUTTONDOWN && ev.button.button == SDL_BUTTON_LEFT &&
                         app.cam_draw_armed) {
@@ -1815,10 +2558,17 @@ int main(void) {
                 app.drag_start = p;
                 app.cam_stroke_count = 0;
                 stroke_push(&app.cam_stroke, &app.cam_stroke_count, &app.cam_stroke_capacity, p);
-            } else if (app.state == APP_EDIT && ev.type == SDL_MOUSEBUTTONDOWN && ev.button.button == SDL_BUTTON_LEFT) {
+            } else if (ev.type == SDL_MOUSEBUTTONDOWN && ev.button.button == SDL_BUTTON_LEFT) {
+                /* Selecting works while running too: you have to be able to
+                 * point at the motor you want to speed up. Nothing that MOVES
+                 * a part is allowed -- see `editing` below. */
+                bool editing = (app.state == APP_EDIT);
                 Vec2 p = screen_to_world((Vec2){ (double)ev.button.x, (double)ev.button.y }, app.view_pan, app.view_zoom);
                 bool shift = (SDL_GetModState() & KMOD_SHIFT) != 0;
-                int hit_conn = mechanism_pick_connector(&app.mech, p, CONNECTOR_HIT_RADIUS / app.view_zoom);
+                /* Aim at what is drawn: at high zoom the dot is bigger than a
+                 * flat ten-pixel target, and clicking it used to miss. */
+                double hit_px = fmax(CONNECTOR_HIT_RADIUS, handle_radius(app.view_zoom) + 2.0);
+                int hit_conn = mechanism_pick_connector(&app.mech, p, hit_px / app.view_zoom);
                 if (hit_conn >= 0) {
                     if (shift) {
                         app.mech.connectors[hit_conn].selected = !app.mech.connectors[hit_conn].selected;
@@ -1828,9 +2578,11 @@ int main(void) {
                             clear_selection(&app.mech);
                             app.mech.connectors[hit_conn].selected = true;
                         }
-                        push_undo(&app);
-                        app.drag_mode = DRAG_MOVE_CONNECTORS;
-                        app.drag_last = p;
+                        if (editing) {
+                            app.drag_mode = DRAG_MOVE_CONNECTORS;
+                            app.drag_pushed_undo = false;
+                            app.drag_last = p;
+                        }
                     }
                 } else {
                     /* Bars first, then the joints drawn behind them: a cam
@@ -1850,40 +2602,31 @@ int main(void) {
                                     ? -1 : mechanism_pick_geneva(&app.mech, p, jt);
                     int hit_slid = (hit_link >= 0 || hit_cam >= 0 || hit_gear >= 0 || hit_gen >= 0)
                                     ? -1 : mechanism_pick_slider(&app.mech, p, jt);
-                    if (hit_link >= 0) {
-                        clear_selection(&app.mech);
-                        app.mech.links[hit_link].selected = true;
-                        app.drag_mode = DRAG_NONE;
-                    } else if (hit_cam >= 0) {
-                        clear_selection(&app.mech);
-                        app.mech.cams[hit_cam].selected = true;
-                        app.drag_mode = DRAG_NONE;
-                    } else if (hit_wheel >= 0) {
-                        /* Shift adds to the selection, which is how two or
-                         * more wheels get chosen for meshing. */
+                    /* Shift extends the selection whatever was clicked. It
+                     * used to do so only for pins and wheels, so the rule you
+                     * learn meshing two wheels quietly failed on a bar. */
+                    bool *flag = NULL;
+                    if (hit_link >= 0)       flag = &app.mech.links[hit_link].selected;
+                    else if (hit_cam >= 0)   flag = &app.mech.cams[hit_cam].selected;
+                    else if (hit_wheel >= 0) flag = &app.mech.links[hit_wheel].selected;
+                    else if (hit_gear >= 0)  flag = &app.mech.gears[hit_gear].selected;
+                    else if (hit_gen >= 0)   flag = &app.mech.genevas[hit_gen].selected;
+                    else if (hit_slid >= 0)  flag = &app.mech.sliders[hit_slid].selected;
+
+                    if (flag) {
                         if (shift) {
-                            app.mech.links[hit_wheel].selected = !app.mech.links[hit_wheel].selected;
+                            *flag = !*flag;
                         } else {
                             clear_selection(&app.mech);
-                            app.mech.links[hit_wheel].selected = true;
+                            *flag = true;
                         }
                         app.drag_mode = DRAG_NONE;
-                    } else if (hit_gear >= 0) {
-                        clear_selection(&app.mech);
-                        app.mech.gears[hit_gear].selected = true;
-                        app.drag_mode = DRAG_NONE;
-                    } else if (hit_gen >= 0) {
-                        clear_selection(&app.mech);
-                        app.mech.genevas[hit_gen].selected = true;
-                        app.drag_mode = DRAG_NONE;
-                    } else if (hit_slid >= 0) {
-                        clear_selection(&app.mech);
-                        app.mech.sliders[hit_slid].selected = true;
-                        app.drag_mode = DRAG_NONE;
-                    } else {
+                    } else if (editing) {
                         app.drag_mode = DRAG_PENDING_EMPTY;
                         app.drag_start = p;
                         app.drag_current = p;
+                    } else {
+                        clear_selection(&app.mech);
                     }
                 }
             } else if (app.state == APP_EDIT && ev.type == SDL_MOUSEBUTTONUP && ev.button.button == SDL_BUTTON_LEFT &&
@@ -1921,6 +2664,18 @@ int main(void) {
                             c->selected = true;
                         }
                     }
+                    /* A body entirely inside the box is inside the box: drawing
+                     * round a mechanism and pressing DELETE should take the
+                     * bars with the pins. */
+                    for (int li = 0; li < app.mech.link_count; li++) {
+                        Link *l = &app.mech.links[li];
+                        if (!l->alive) continue;
+                        bool all_in = true;
+                        for (int k = 0; k < l->connector_count && all_in; k++) {
+                            if (!app.mech.connectors[l->connector_ids[k]].selected) all_in = false;
+                        }
+                        if (all_in) l->selected = true;
+                    }
                 }
                 app.drag_mode = DRAG_NONE;
             }
@@ -1930,8 +2685,12 @@ int main(void) {
         double dt = (double)(now - last_ticks) / 1000.0;
         last_ticks = now;
 
-        if (app.state == APP_RUNNING && !app.jammed) {
+        if (app.state == APP_RUNNING && !app.jammed && (!app.paused || app.step_once)) {
             if (dt > 0.05) dt = 0.05; /* clamp huge stalls (e.g. window drag) */
+            /* Paused-and-stepping advances one fixed frame; otherwise real
+             * time, scaled by whatever speed is set. */
+            dt = app.step_once ? SIM_STEP_DT : dt * app.sim_rate;
+            app.step_once = false;
 
             for (int i = 0; i < app.pre_run_count; i++) app.frame_positions[i] = app.mech.connectors[i].pos;
             for (int i = 0; i < app.frame_link_count; i++) app.frame_angles[i] = app.mech.links[i].accumulated_angle_rad;
@@ -1947,8 +2706,14 @@ int main(void) {
                 for (int i = 0; i < app.pre_run_count; i++) app.mech.connectors[i].pos = app.frame_positions[i];
                 for (int i = 0; i < app.frame_link_count; i++) app.mech.links[i].accumulated_angle_rad = app.frame_angles[i];
                 app.jammed = true;
-                printf("Mechanism jammed: a fixed-length link would have to change length here. "
-                        "Press STOP (or R), then adjust the geometry (or press VARY to let a link's length vary).\n");
+                /* A condition that is still true, not a moment that has
+                 * passed: it stays up until the run is stopped or restarted. */
+                status_set_sticky(&app.status, STATUS_ERROR,
+                                   "JAMMED: A FIXED-LENGTH LINK WOULD HAVE TO CHANGE LENGTH HERE");
+                app_message(&app, STATUS_ERROR,
+                             "Mechanism jammed: a fixed-length link would have to change length here. "
+                             "Press STOP (or R), then adjust the geometry (or press VARY to let a "
+                             "link's length vary).");
             } else {
                 app.sim_time += dt;
                 mechanism_trace_step(&app.mech, app.sim_time);
@@ -1969,7 +2734,8 @@ int main(void) {
 
         /* Keep the mechanism inside the canvas so long links can't draw over
          * the toolbar. */
-        SDL_Rect canvas_clip = { UI_TOOLBAR_W, 0, CANVAS_W, CANVAS_H };
+        SDL_Rect canvas_clip = { app.layout.canvas.x, app.layout.canvas.y,
+                                  app.layout.canvas.w, app.layout.canvas.h };
         SDL_RenderSetClipRect(ren, &canvas_clip);
         draw_mechanism(ren, &app.mech, app.drag_mode, app.drag_start, app.drag_current, app.view_pan, app.view_zoom);
 
@@ -2002,46 +2768,120 @@ int main(void) {
                         150, 200, 255, 255);
         }
 
+        /* What the simulation is doing right now. Paused used to look exactly
+         * like jammed, which looked exactly like a motor set to zero. */
+        if (app.state == APP_RUNNING && !app.jammed) {
+            char banner[96];
+            if (app.paused) snprintf(banner, sizeof banner, "PAUSED - SPACE RUNS ON, . STEPS");
+            else snprintf(banner, sizeof banner, "RUNNING AT %.2fX - < AND > CHANGE IT", app.sim_rate);
+            double bw = render_text_width(8.5, banner);
+            render_text(ren, (Vec2){ app.layout.canvas.x + app.layout.canvas.w - bw - 12.0, 12.0 },
+                        8.5, banner, app.paused ? 245 : 130, app.paused ? 195 : 200,
+                        app.paused ? 90 : 150, 255);
+        }
+
         if (app.path_tool != PATH_TOOL_NONE) {
             const char *hint = (app.path_tool == PATH_TOOL_LINKAGE)
                 ? "DRAW A PATH FOR A FOUR-BAR LINKAGE TO TRACE   ESC TO CANCEL"
                 : "DRAW ANY PATH FOR A CHAIN OF ARMS TO REDRAW   ESC TO CANCEL";
             double w = render_text_width(9.0, hint);
-            render_text(ren, (Vec2){ UI_TOOLBAR_W + (CANVAS_W - w) / 2.0, 16.0 }, 9.0, hint,
-                        150, 200, 255, 255);
+            render_text(ren, (Vec2){ app.layout.canvas.x + (app.layout.canvas.w - w) / 2.0, 16.0 },
+                        9.0, hint, 150, 200, 255, 255);
         }
         if (app.cam_draw_armed) {
             const char *hint = "DRAG TO DRAW THE CAM OUTLINE   CLICK FOR A DEFAULT CAM   ESC TO CANCEL";
             double w = render_text_width(9.0, hint);
-            render_text(ren, (Vec2){ UI_TOOLBAR_W + (CANVAS_W - w) / 2.0, 16.0 }, 9.0, hint,
-                        200, 175, 235, 255);
+            render_text(ren, (Vec2){ app.layout.canvas.x + (app.layout.canvas.w - w) / 2.0, 16.0 },
+                        9.0, hint, 200, 175, 235, 255);
         }
+        /* An empty canvas used to say nothing at all, with every instruction
+         * in a terminal the user may never have seen. */
+        if (!app.gallery_open && !app.help_open && app.prompt.kind == PROMPT_NONE &&
+            !mechanism_has_any_part(&app.mech)) {
+            const char *l1 = "CLICK TO PLACE A PIN, OR PRESS N FOR A GALLERY OF MECHANISMS";
+            const char *l2 = "PRESS H FOR EVERY KEY";
+            double w1 = render_text_width(10.0, l1), w2 = render_text_width(9.0, l2);
+            Vec2 mid = { app.layout.canvas.x + app.layout.canvas.w / 2.0,
+                          app.layout.canvas.y + app.layout.canvas.h / 2.0 };
+            render_text(ren, (Vec2){ mid.x - w1 / 2.0, mid.y - 14.0 }, 10.0, l1, 120, 126, 140, 255);
+            render_text(ren, (Vec2){ mid.x - w2 / 2.0, mid.y + 10.0 }, 9.0, l2, 100, 106, 120, 255);
+        }
+
         if (app.gallery_open) {
-            UiRect panel = gallery_panel();
+            UiRect panel = gallery_panel(&app);
             render_rect_filled(ren, panel, 24, 25, 30, 255);
             render_rect_outline(ren, panel, 90, 95, 110, 255);
             const char *title = "PICK A MECHANISM";
             double tw = render_text_width(10.0, title);
             render_text(ren, (Vec2){ panel.x + (panel.w - tw) / 2.0, panel.y + 8.0 }, 10.0, title,
                         205, 210, 220, 255);
-            for (int i = 0; i < templates_count(); i++) {
-                UiRect tile = gallery_tile(i);
-                bool hot = (gallery_hit(mouse_x, mouse_y) == i);
+            int first = gallery_page_first(&app);
+            for (int i = first; i < first + gallery_page_size(&app); i++) {
+                UiRect tile = gallery_tile(&app, i);
+                bool hot = (gallery_hit(&app, mouse_x, mouse_y) == i);
                 render_rect_filled(ren, tile, hot ? 44 : 34, hot ? 46 : 36, hot ? 54 : 42, 255);
                 render_rect_outline(ren, tile, hot ? 255 : 66, hot ? 225 : 70, hot ? 70 : 80, 255);
                 draw_template_preview(ren, i, tile, hot);
             }
+            int pages = gallery_page_count(&app);
+            if (pages > 1) {
+                char footer[64];
+                snprintf(footer, sizeof footer, "PAGE %d OF %d - ARROW KEYS TO TURN",
+                          app.gallery_page + 1, pages);
+                double fw = render_text_width(8.0, footer);
+                render_text(ren, (Vec2){ panel.x + (panel.w - fw) / 2.0,
+                                          panel.y + panel.h - GALLERY_FOOTER_H + 4.0 },
+                            8.0, footer, 150, 155, 168, 255);
+            }
+        }
+
+        if (app.help_open) draw_help(ren, &app);
+
+        /* The prompt sits over the canvas: it is a question about the whole
+         * mechanism, not about any part of it. */
+        if (app.prompt.kind != PROMPT_NONE) {
+            UiRect canvas = app.layout.canvas;
+            int w = canvas.w - 120; if (w > 640) w = 640; if (w < 240) w = 240;
+            UiRect panel = { canvas.x + (canvas.w - w) / 2, canvas.y + canvas.h / 3, w, 104 };
+            render_rect_filled(ren, panel, 26, 27, 33, 245);
+            render_rect_outline(ren, panel, 120, 130, 155, 255);
+
+            double tw = render_text_width(10.0, app.prompt.title);
+            render_text(ren, (Vec2){ panel.x + (panel.w - tw) / 2.0, panel.y + 14.0 },
+                        10.0, app.prompt.title, 215, 220, 232, 255);
+
+            if (prompt_takes_typing(app.prompt.kind)) {
+                /* The typed name, with a caret blinking on the end of it. */
+                UiRect field = { panel.x + 16, panel.y + 40, panel.w - 32, 26 };
+                render_rect_filled(ren, field, 16, 17, 21, 255);
+                render_rect_outline(ren, field, 80, 86, 100, 255);
+                double text_w = render_text_width(10.0, app.prompt.text);
+                double x = field.x + 8.0;
+                if (text_w > field.w - 16.0) x -= (text_w - (field.w - 16.0));  /* scroll left */
+                render_text(ren, (Vec2){ x, field.y + 8.0 }, 10.0, app.prompt.text,
+                            235, 238, 245, 255);
+                if ((SDL_GetTicks() / 500) % 2 == 0) {
+                    double cx = x + text_w + 2.0;
+                    render_line(ren, (Vec2){ cx, field.y + 6.0 }, (Vec2){ cx, field.y + 20.0 },
+                                235, 238, 245, 255);
+                }
+            }
+
+            double hw = render_text_width(8.0, app.prompt.hint);
+            render_text(ren, (Vec2){ panel.x + (panel.w - hw) / 2.0, panel.y + panel.h - 22.0 },
+                        8.0, app.prompt.hint, 150, 156, 170, 255);
         }
 
         SDL_RenderSetClipRect(ren, NULL);
 
-        render_plot(ren, &app.mech, (UiRect){ UI_TOOLBAR_W, CANVAS_H, CANVAS_W, PLOT_H });
-        render_toolbar(ren, &app.toolbar, WIN_H);
+        render_status(ren, &app.status, app.layout.canvas, SDL_GetTicks());
+        render_plot(ren, &app.mech, app.layout.plot);
+        render_toolbar(ren, &app.toolbar, app.layout.win_h);
         /* Last of all, so it sits over the canvas and the panels. */
         if (app.toolbar.hover >= 0 && app.toolbar.hover < app.toolbar.count &&
             SDL_GetTicks() - hover_since > TOOLTIP_DELAY_MS) {
             const UiButton *hb = &app.toolbar.buttons[app.toolbar.hover];
-            render_tooltip(ren, hb->rect, hb->tip, WIN_W, WIN_H);
+            render_tooltip(ren, hb->rect, hb->tip, app.layout.win_w, app.layout.win_h);
         }
 
         SDL_RenderPresent(ren);

@@ -133,6 +133,10 @@ bool mechanism_set_driven_about(Mechanism *m, int link_id, int pivot_connector_i
  * (see the Link.rigid comment above). No-op on an invalid/dead link id. */
 void mechanism_set_rigid(Mechanism *m, int link_id, bool rigid);
 
+/* Whether there is anything at all in the mechanism -- an empty canvas is
+ * worth saying something about. */
+bool mechanism_has_any_part(const Mechanism *m);
+
 /* Whether any live link is currently driven by a motor. A mechanism with
  * none has nothing making it move on its own. */
 bool mechanism_has_driven_link(const Mechanism *m);
@@ -146,6 +150,13 @@ void mechanism_set_traced(Mechanism *m, int connector_id, bool traced);
  * traced connector -- call when a simulation run starts so each run's
  * trace begins fresh. */
 void mechanism_clear_traces(Mechanism *m);
+
+/* The most samples one traced connector keeps. A run records one per frame,
+ * so an unbounded path is ~3600 points a minute, every one of them redrawn
+ * every frame: leave a drawing machine running and the app slows to a crawl.
+ * At the cap the path is thinned by half instead, which keeps the whole
+ * history -- just at coarser resolution. */
+#define MECHANISM_TRACE_MAX 12000
 
 /* Appends the current position of every traced, alive connector to its path,
  * stamped with `sim_time` (seconds since the run started). Call once per

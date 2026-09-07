@@ -5,6 +5,7 @@
 #include "vec2.h"
 #include "ui.h"
 #include "mechanism.h"
+#include "status.h"
 
 void render_line(SDL_Renderer *ren, Vec2 a, Vec2 b, Uint8 red, Uint8 green, Uint8 blue, Uint8 alpha);
 void render_circle(SDL_Renderer *ren, Vec2 center, double radius, Uint8 red, Uint8 green, Uint8 blue, Uint8 alpha);
@@ -46,6 +47,39 @@ double render_text_width(double height, const char *text);
 /* Draws the whole toolbar strip (background, buttons, labels, hotkey hints
  * and group separators) down the left edge, `strip_height` tall. */
 void render_toolbar(SDL_Renderer *ren, const Toolbar *t, int strip_height);
+
+/* A circle drawn as dashes -- a guide, or a state ("this wheel is meshed")
+ * that should not rest on colour alone. */
+void render_dashed_circle(SDL_Renderer *ren, Vec2 center, double radius,
+                           Uint8 red, Uint8 green, Uint8 blue, Uint8 alpha);
+
+/* Draws `count` points as one connected run, in a handful of calls rather
+ * than one per segment. */
+void render_polyline(SDL_Renderer *ren, const Vec2 *pts, int count,
+                      Uint8 red, Uint8 green, Uint8 blue, Uint8 alpha);
+
+/* Draws the status messages over `canvas`: the sticky condition banner across
+ * its top, and the recent messages stacked up from its bottom-left corner,
+ * fading with age. */
+void render_status(SDL_Renderer *ren, const StatusLog *log, UiRect canvas, unsigned int now_ms);
+
+/* Word-wrapping. RENDER_WRAP_LINE_CHARS is the widest line render_wrap_text
+ * will produce; longer words are simply cut at that length. */
+#define RENDER_WRAP_LINE_CHARS 96
+#define RENDER_WRAP_MAX_LINES 12
+
+/* Breaks `text` into at most `max_lines` lines no wider than `max_width` when
+ * drawn at `height`, on word boundaries. Returns the line count and, through
+ * `widest_out` (may be NULL), the width of the longest line -- enough to size
+ * a panel around it. */
+int render_wrap_text(double height, double max_width, const char *text,
+                      char lines[][RENDER_WRAP_LINE_CHARS], int max_lines, double *widest_out);
+
+/* Wraps `text` to `max_width` and draws it from `top_left` down, `line_height`
+ * apart. Returns the height drawn. */
+double render_text_wrapped(SDL_Renderer *ren, Vec2 top_left, double height, double line_height,
+                            double max_width, const char *text,
+                            Uint8 red, Uint8 green, Uint8 blue, Uint8 alpha);
 
 /* A hover tooltip for `anchor` (the button being pointed at), wrapped to fit
  * and kept inside the window. Drawn last, over everything else. */

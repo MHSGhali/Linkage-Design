@@ -10,6 +10,7 @@
 #define UI_TOOLBAR_W 140
 #define UI_BUTTON_W 120
 #define UI_BUTTON_H 30
+#define UI_BUTTON_MIN_H 18      /* how far buttons squeeze to fit a short window */
 #define UI_BUTTON_GAP 4
 #define UI_GROUP_GAP 10
 #define UI_MARGIN 10
@@ -17,6 +18,8 @@
 
 typedef enum {
     UI_NONE = 0,
+    UI_OPEN,
+    UI_SAVE,
     UI_TEMPLATE,
     UI_JOINT,
     UI_ANCHOR,
@@ -33,10 +36,13 @@ typedef enum {
     UI_DELETE,
     UI_UNDO,
     UI_REDO,
+    UI_FIT,
     UI_GRAVITY,
     UI_CLEAR,
     UI_EXPORT,
     UI_RUN,
+    UI_PAUSE,
+    UI_HELP,
     UI_ACTION_COUNT
 } UiAction;
 
@@ -81,10 +87,15 @@ typedef struct {
     bool can_undo, can_redo;
     bool gravity_on;              /* gravity is in effect (incl. the motorless default) */
     bool running;
+    bool jammed;                  /* the run stopped dead on a rigid link */
+    bool paused;                  /* running, but holding still to be looked at */
+    bool help_open;               /* the key list is showing */
 } UiState;
 
-/* Builds the fixed button layout. Call once at startup. */
-void ui_init(Toolbar *t);
+/* Builds the button layout to fit a strip `strip_height` tall (the window's
+ * height). Call at startup and again whenever the window is resized: with a
+ * fixed layout the buttons below the fold were simply unreachable. */
+void ui_init(Toolbar *t, int strip_height);
 
 /* Index of the button containing (x, y), or -1. Ignores `enabled` -- the
  * caller decides what to do about a disabled button. */
@@ -93,6 +104,14 @@ int ui_hit_test(const Toolbar *t, int x, int y);
 /* Whether (x, y) is anywhere in the toolbar strip (including its gaps), i.e.
  * whether the canvas should ignore this event. */
 bool ui_contains(const Toolbar *t, int x, int y);
+
+/* Whether `action`'s button is enabled right now, and its label and hover
+ * text. The hotkeys go through these so a key can never disagree with the
+ * button beside it -- and so a refused key can explain itself in the same
+ * words the button's tooltip uses. Unknown actions read as disabled. */
+bool ui_action_enabled(const Toolbar *t, UiAction action);
+const char *ui_action_label(const Toolbar *t, UiAction action);
+const char *ui_action_tip(const Toolbar *t, UiAction action);
 
 /* Refreshes every button's enabled/active flags (and the Run button's label)
  * from the current app state. Call once per frame before drawing. */

@@ -352,6 +352,13 @@ void mechanism_set_rigid(Mechanism *m, int link_id, bool rigid) {
     l->rigid = rigid;
 }
 
+bool mechanism_has_any_part(const Mechanism *m) {
+    for (int i = 0; i < m->connector_count; i++) {
+        if (m->connectors[i].alive) return true;
+    }
+    return false;
+}
+
 bool mechanism_has_driven_link(const Mechanism *m) {
     for (int li = 0; li < m->link_count; li++) {
         if (m->links[li].alive && m->links[li].is_driven) return true;
@@ -436,6 +443,18 @@ void mechanism_trace_step(Mechanism *m, double sim_time) {
     for (int i = 0; i < m->connector_count; i++) {
         Connector *c = &m->connectors[i];
         if (!c->alive || !c->traced) continue;
+        /* At the cap, drop every other sample rather than the oldest ones: a
+         * shorter, coarser record of the whole run is more use than a precise
+         * record of the last few seconds of it. */
+        if (c->path_count >= MECHANISM_TRACE_MAX) {
+            int kept = 0;
+            for (int k = 0; k < c->path_count; k += 2) {
+                c->path[kept] = c->path[k];
+                c->path_time[kept] = c->path_time[k];
+                kept++;
+            }
+            c->path_count = kept;
+        }
         /* path and path_time are parallel, so they share one capacity and
          * have to grow together. */
         if (c->path_count >= c->path_capacity) {

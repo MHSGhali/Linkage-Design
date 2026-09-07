@@ -192,6 +192,50 @@ void render_number(SDL_Renderer *ren, Vec2 top_left, double angle, double digit_
     }
 }
 
+void render_dashed_circle(SDL_Renderer *ren, Vec2 center, double radius,
+                           Uint8 red, Uint8 green, Uint8 blue, Uint8 alpha) {
+    if (radius < 1.0) return;
+    /* Enough segments to look round, and an odd stride so the gaps land
+     * differently from any dashed line crossing it. */
+    int segments = (int)(radius * 1.2);
+    if (segments < 24) segments = 24;
+    if (segments > 240) segments = 240;
+    for (int i = 0; i < segments; i += 2) {
+        double a0 = (2.0 * M_PI * i) / segments;
+        double a1 = (2.0 * M_PI * (i + 1)) / segments;
+        render_line(ren,
+                    (Vec2){ center.x + radius * cos(a0), center.y + radius * sin(a0) },
+                    (Vec2){ center.x + radius * cos(a1), center.y + radius * sin(a1) },
+                    red, green, blue, alpha);
+    }
+}
+
+/* Draws a connected run of points in one call rather than one call per
+ * segment. Traces are thousands of segments long and are redrawn every frame,
+ * which is where a long run used to spend its time. */
+#define POLYLINE_BATCH 512
+
+void render_polyline(SDL_Renderer *ren, const Vec2 *pts, int count,
+                      Uint8 red, Uint8 green, Uint8 blue, Uint8 alpha) {
+    if (count < 2) return;
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(ren, red, green, blue, alpha);
+
+    SDL_FPoint batch[POLYLINE_BATCH];
+    int i = 0;
+    while (i < count - 1) {
+        int n = 0;
+        /* Batches overlap by a point so the joins are not left undrawn. */
+        while (n < POLYLINE_BATCH && i + n < count) {
+            batch[n] = (SDL_FPoint){ (float)pts[i + n].x, (float)pts[i + n].y };
+            n++;
+        }
+        SDL_RenderDrawLinesF(ren, batch, n);
+        if (n < 2) break;
+        i += n - 1;
+    }
+}
+
 /* ---------------------------------------------------------------------------
  * Stroke alphabet for UI labels.
  *
@@ -276,10 +320,39 @@ static const float SLASH_PTS[] = { 1.0f, 0.0f, 0.0f, 2.0f };
 static const float MINUS_PTS[] = { 0.0f, 1.0f, 1.0f, 1.0f };
 static const float DOT_PTS[]   = { 0.35f, 2.0f, 0.55f, 2.0f };
 static const float COMMA_PTS[] = { 0.55f, 1.9f, 0.25f, 2.3f };
+/* Punctuation, so a status message can be shown on the canvas in the same
+ * words it is printed in. Anything missing here would silently render as a
+ * blank space (see glyph_for), which is worse than saying nothing. */
+static const float COLON_PTS[]  = { 0.35f,0.75f, 0.6f,0.75f, BREAK_STROKE, 0.35f,1.75f, 0.6f,1.75f };
+static const float SEMI_PTS[]   = { 0.35f,0.75f, 0.6f,0.75f, BREAK_STROKE, 0.55f,1.7f, 0.25f,2.1f };
+static const float BANG_PTS[]   = { 0.5f,0.0f, 0.5f,1.35f, BREAK_STROKE, 0.4f,1.9f, 0.6f,1.9f };
+static const float QUERY_PTS[]  = { 0.1f,0.45f, 0.3f,0.05f, 0.7f,0.05f, 0.95f,0.4f, 0.85f,0.8f,
+                                    0.5f,1.05f, 0.5f,1.35f, BREAK_STROKE, 0.4f,1.9f, 0.6f,1.9f };
+static const float LPAREN_PTS[] = { 0.7f,0.0f, 0.35f,0.5f, 0.35f,1.5f, 0.7f,2.0f };
+static const float RPAREN_PTS[] = { 0.3f,0.0f, 0.65f,0.5f, 0.65f,1.5f, 0.3f,2.0f };
+static const float APOS_PTS[]   = { 0.5f,0.05f, 0.42f,0.55f };
+static const float LT_PTS[]     = { 0.85f,0.35f, 0.15f,1.0f, 0.85f,1.65f };
+static const float GT_PTS[]     = { 0.15f,0.35f, 0.85f,1.0f, 0.15f,1.65f };
+static const float PERCENT_PTS[] = { 0.95f,0.1f, 0.05f,1.9f,
+                                     BREAK_STROKE, 0.05f,0.5f, 0.3f,0.2f, 0.55f,0.5f, 0.3f,0.8f, 0.05f,0.5f,
+                                     BREAK_STROKE, 0.45f,1.5f, 0.7f,1.2f, 0.95f,1.5f, 0.7f,1.8f, 0.45f,1.5f };
+
 static const Glyph SLASH_GLYPH = { SLASH_PTS, (int)(sizeof SLASH_PTS / sizeof SLASH_PTS[0]) };
 static const Glyph MINUS_GLYPH = { MINUS_PTS, (int)(sizeof MINUS_PTS / sizeof MINUS_PTS[0]) };
 static const Glyph DOT_GLYPH   = { DOT_PTS,   (int)(sizeof DOT_PTS / sizeof DOT_PTS[0]) };
 static const Glyph COMMA_GLYPH = { COMMA_PTS, (int)(sizeof COMMA_PTS / sizeof COMMA_PTS[0]) };
+#define MARK_GLYPH(name, pts) \
+    static const Glyph name = { pts, (int)(sizeof pts / sizeof pts[0]) }
+MARK_GLYPH(COLON_GLYPH,   COLON_PTS);
+MARK_GLYPH(SEMI_GLYPH,    SEMI_PTS);
+MARK_GLYPH(BANG_GLYPH,    BANG_PTS);
+MARK_GLYPH(QUERY_GLYPH,   QUERY_PTS);
+MARK_GLYPH(LPAREN_GLYPH,  LPAREN_PTS);
+MARK_GLYPH(RPAREN_GLYPH,  RPAREN_PTS);
+MARK_GLYPH(APOS_GLYPH,    APOS_PTS);
+MARK_GLYPH(PERCENT_GLYPH, PERCENT_PTS);
+MARK_GLYPH(LT_GLYPH,      LT_PTS);
+MARK_GLYPH(GT_GLYPH,      GT_PTS);
 
 static const Glyph *mark_for(char c) {
     switch (c) {
@@ -287,6 +360,16 @@ static const Glyph *mark_for(char c) {
     case '-': return &MINUS_GLYPH;
     case '.': return &DOT_GLYPH;
     case ',': return &COMMA_GLYPH;
+    case ':': return &COLON_GLYPH;
+    case ';': return &SEMI_GLYPH;
+    case '!': return &BANG_GLYPH;
+    case '?': return &QUERY_GLYPH;
+    case '(': return &LPAREN_GLYPH;
+    case ')': return &RPAREN_GLYPH;
+    case '\'': return &APOS_GLYPH;
+    case '%': return &PERCENT_GLYPH;
+    case '<': return &LT_GLYPH;
+    case '>': return &GT_GLYPH;
     default:  return NULL;
     }
 }
@@ -432,6 +515,10 @@ static const Uint8 TRACE_PALETTE[][3] = {
     { 225, 130, 205 },
     { 200, 210,  90 },
     { 120, 165, 245 },
+    { 245, 140, 120 },
+    { 150, 220, 200 },
+    { 190, 160, 240 },
+    { 220, 205, 140 },
 };
 #define TRACE_PALETTE_COUNT ((int)(sizeof TRACE_PALETTE / sizeof TRACE_PALETTE[0]))
 
@@ -448,6 +535,60 @@ static bool connector_is_plottable(const Connector *c) {
 }
 
 /* ---------------------------------------------------------------------------
+ * Status messages
+ * ------------------------------------------------------------------------ */
+#define STATUS_TEXT_H 10.0
+#define STATUS_LINE_H 15.0
+#define STATUS_PAD 10.0
+#define STATUS_BANNER_H 26.0
+
+void render_status(SDL_Renderer *ren, const StatusLog *log, UiRect canvas, unsigned int now_ms) {
+    /* A condition that is still true goes across the top, where it cannot be
+     * mistaken for something that has already happened. */
+    if (log->sticky_set) {
+        Uint8 r, g, b;
+        status_level_color(log->sticky_level, &r, &g, &b);
+        UiRect bar = { canvas.x, canvas.y, canvas.w, (int)STATUS_BANNER_H };
+        render_rect_filled(ren, bar, 40, 26, 26, 235);
+        render_line(ren, (Vec2){ bar.x, bar.y + bar.h - 0.5 },
+                    (Vec2){ bar.x + bar.w, bar.y + bar.h - 0.5 }, r, g, b, 255);
+        double w = render_text_width(STATUS_TEXT_H, log->sticky);
+        render_text(ren, (Vec2){ canvas.x + (canvas.w - w) / 2.0,
+                                 canvas.y + (STATUS_BANNER_H - STATUS_TEXT_H) / 2.0 },
+                    STATUS_TEXT_H, log->sticky, r, g, b, 255);
+    }
+
+    /* Everything else stacks up from the bottom-left corner, newest lowest --
+     * nearest the mouse, and out of the way of the mechanism itself. */
+    const StatusMessage *shown[STATUS_HISTORY];
+    int n = status_visible(log, now_ms, shown, STATUS_HISTORY);
+    double max_w = canvas.w - 2 * STATUS_PAD;
+    double y = canvas.y + canvas.h - STATUS_PAD - STATUS_TEXT_H;
+
+    for (int i = 0; i < n; i++) {
+        Uint8 r, g, b;
+        status_level_color(shown[i]->level, &r, &g, &b);
+        int alpha = status_alpha(shown[i], now_ms);
+        /* Older lines dim further, so the newest reads first. */
+        if (i > 0) alpha = (alpha * 55) / 100;
+        if (alpha <= 0) continue;
+
+        char lines[RENDER_WRAP_MAX_LINES][RENDER_WRAP_LINE_CHARS];
+        double widest = 0.0;
+        int lc = render_wrap_text(STATUS_TEXT_H, max_w, shown[i]->text, lines,
+                                   RENDER_WRAP_MAX_LINES, &widest);
+        y -= (lc - 1) * STATUS_LINE_H;
+        if (y < canvas.y + STATUS_BANNER_H) break;
+
+        for (int k = 0; k < lc; k++) {
+            render_text(ren, (Vec2){ canvas.x + STATUS_PAD, y + k * STATUS_LINE_H },
+                        STATUS_TEXT_H, lines[k], r, g, b, (Uint8)alpha);
+        }
+        y -= STATUS_LINE_H;
+    }
+}
+
+/* ---------------------------------------------------------------------------
  * Hover tooltips
  * ------------------------------------------------------------------------ */
 #define TIP_TEXT_H 10.0
@@ -456,23 +597,27 @@ static bool connector_is_plottable(const Connector *c) {
 #define TIP_MAX_W 300.0
 #define TIP_MAX_LINES 8
 
-void render_tooltip(SDL_Renderer *ren, UiRect anchor, const char *text, int win_w, int win_h) {
-    if (!text || !*text) return;
-
-    /* Break the text into lines that fit, on word boundaries. */
-    char lines[TIP_MAX_LINES][96];
+/* Breaks `text` into lines no wider than `max_width`, on word boundaries.
+ * Shared by tooltips, the status log and the help overlay -- everything that
+ * has a paragraph to fit into a box. Returns the number of lines written. */
+int render_wrap_text(double height, double max_width, const char *text,
+                      char lines[][RENDER_WRAP_LINE_CHARS], int max_lines, double *widest_out) {
     int line_count = 0;
     double widest = 0.0;
+    if (!text || !*text || max_lines <= 0) {
+        if (widest_out) *widest_out = 0.0;
+        return 0;
+    }
     const char *p = text;
-    while (*p && line_count < TIP_MAX_LINES) {
+    while (*p && line_count < max_lines) {
         int len = 0, last_space = -1;
-        char buf[96];
+        char buf[RENDER_WRAP_LINE_CHARS];
         while (*p == ' ') p++;
         while (p[len] && len < (int)sizeof buf - 1) {
             buf[len] = p[len];
             if (p[len] == ' ') last_space = len;
             buf[len + 1] = '\0';
-            if (render_text_width(TIP_TEXT_H, buf) > TIP_MAX_W) {
+            if (render_text_width(height, buf) > max_width) {
                 if (last_space > 0) { len = last_space; buf[len] = '\0'; }
                 break;
             }
@@ -480,12 +625,36 @@ void render_tooltip(SDL_Renderer *ren, UiRect anchor, const char *text, int win_
         }
         buf[len] = '\0';
         if (len == 0) break;
-        snprintf(lines[line_count], sizeof lines[0], "%s", buf);
-        double w = render_text_width(TIP_TEXT_H, lines[line_count]);
+        snprintf(lines[line_count], RENDER_WRAP_LINE_CHARS, "%s", buf);
+        double w = render_text_width(height, lines[line_count]);
         if (w > widest) widest = w;
         line_count++;
         p += len;
     }
+    if (widest_out) *widest_out = widest;
+    return line_count;
+}
+
+double render_text_wrapped(SDL_Renderer *ren, Vec2 top_left, double height, double line_height,
+                            double max_width, const char *text,
+                            Uint8 red, Uint8 green, Uint8 blue, Uint8 alpha) {
+    char lines[RENDER_WRAP_MAX_LINES][RENDER_WRAP_LINE_CHARS];
+    double widest = 0.0;
+    int n = render_wrap_text(height, max_width, text, lines, RENDER_WRAP_MAX_LINES, &widest);
+    for (int i = 0; i < n; i++) {
+        render_text(ren, (Vec2){ top_left.x, top_left.y + i * line_height }, height, lines[i],
+                     red, green, blue, alpha);
+    }
+    (void)widest;
+    return n * line_height;
+}
+
+void render_tooltip(SDL_Renderer *ren, UiRect anchor, const char *text, int win_w, int win_h) {
+    if (!text || !*text) return;
+
+    char lines[TIP_MAX_LINES][RENDER_WRAP_LINE_CHARS];
+    double widest = 0.0;
+    int line_count = render_wrap_text(TIP_TEXT_H, TIP_MAX_W, text, lines, TIP_MAX_LINES, &widest);
     if (line_count == 0) return;
 
     UiRect panel = {
