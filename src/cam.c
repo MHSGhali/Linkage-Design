@@ -3,6 +3,7 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include "xalloc.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -172,7 +173,7 @@ void cam_sample_surface(const Cam *c, Vec2 *out, int count) {
 bool cam_is_undercut(const Cam *c) {
     if (c->roller_radius <= 0.0) return false;
 
-    Vec2 *pts = malloc((size_t)UNDERCUT_SAMPLES * sizeof(Vec2));
+    Vec2 *pts = xmalloc((size_t)UNDERCUT_SAMPLES * sizeof(Vec2));
     if (!pts) return false;
     cam_sample_surface(c, pts, UNDERCUT_SAMPLES);
 

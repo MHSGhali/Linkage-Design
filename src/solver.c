@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "linalg.h"
+#include "xalloc.h"
 
 /* Two kinds of constraint share one least-squares problem.
  *
@@ -134,7 +135,7 @@ void solver_freeze(Mechanism *m) {
         if ((l->is_driven || l->driven_externally) &&
             l->pivot_connector_id >= 0 && l->pivot_connector_id < m->connector_count) {
             free(l->frozen_local_offset);
-            l->frozen_local_offset = malloc((size_t)k * sizeof(Vec2));
+            l->frozen_local_offset = xmalloc((size_t)k * sizeof(Vec2));
             Vec2 pivot_pos = m->connectors[l->pivot_connector_id].pos;
             for (int i = 0; i < k; i++) {
                 l->frozen_local_offset[i] = vec2_sub(m->connectors[l->connector_ids[i]].pos, pivot_pos);
@@ -292,8 +293,8 @@ static bool link_fully_settled(const Mechanism *m, int link_id, const bool *sett
 static void pose_driven_links(Mechanism *m) {
     if (m->link_count <= 0) return;
 
-    bool *settled = malloc((size_t)(m->connector_count > 0 ? m->connector_count : 1) * sizeof(bool));
-    bool *posed = calloc((size_t)m->link_count, sizeof(bool));
+    bool *settled = xmalloc((size_t)(m->connector_count > 0 ? m->connector_count : 1) * sizeof(bool));
+    bool *posed = xcalloc((size_t)m->link_count, sizeof(bool));
     for (int i = 0; i < m->connector_count; i++) settled[i] = m->connectors[i].is_anchor;
 
     bool progress = true;
@@ -521,7 +522,7 @@ static void build_jacobian(const Mechanism *m, const int *free_index, const doub
  * (treated exactly like rigid ones) or left entirely unconstrained. */
 static bool solve_pass(Mechanism *m, SolverParams params, bool enforce_variable_links) {
     int nconn = m->connector_count;
-    int *free_index = malloc((size_t)nconn * sizeof(int));
+    int *free_index = xmalloc((size_t)nconn * sizeof(int));
     int num_free = 0;
     for (int c = 0; c < nconn; c++) {
         if (m->connectors[c].alive && !connector_is_fixed(m, c)) {
@@ -535,7 +536,7 @@ static bool solve_pass(Mechanism *m, SolverParams params, bool enforce_variable_
 
     if (num_free > 0) {
         int cap = 16, nres = 0;
-        Residual *res_list = malloc((size_t)cap * sizeof(Residual));
+        Residual *res_list = xmalloc((size_t)cap * sizeof(Residual));
         for (int li = 0; li < m->link_count; li++) {
             Link *l = &m->links[li];
             /* Driven links are exactly satisfied by construction. Variable
@@ -549,7 +550,7 @@ static bool solve_pass(Mechanism *m, SolverParams params, bool enforce_variable_
                     if (free_index[ci] < 0 && free_index[cj] < 0) continue; /* both fixed: nothing to solve */
                     if (nres >= cap) {
                         cap *= 2;
-                        res_list = realloc(res_list, (size_t)cap * sizeof(Residual));
+                        res_list = xrealloc(res_list, (size_t)cap * sizeof(Residual));
                     }
                     res_list[nres].kind = RES_PAIR;
                     res_list[nres].ci = ci;
@@ -573,7 +574,7 @@ static bool solve_pass(Mechanism *m, SolverParams params, bool enforce_variable_
                 free_index[sl->rail_a_id] < 0 && free_index[sl->rail_b_id] < 0) continue;
             if (nres >= cap) {
                 cap *= 2;
-                res_list = realloc(res_list, (size_t)cap * sizeof(Residual));
+                res_list = xrealloc(res_list, (size_t)cap * sizeof(Residual));
             }
             res_list[nres].kind = RES_RAIL;
             res_list[nres].ci = sl->pin_connector_id;
@@ -594,7 +595,7 @@ static bool solve_pass(Mechanism *m, SolverParams params, bool enforce_variable_
             if (free_index[fid] < 0) continue;
             if (nres >= cap) {
                 cap *= 2;
-                res_list = realloc(res_list, (size_t)cap * sizeof(Residual));
+                res_list = xrealloc(res_list, (size_t)cap * sizeof(Residual));
             }
             res_list[nres].kind = RES_AXIS;
             res_list[nres].ci = fid;
@@ -608,7 +609,7 @@ static bool solve_pass(Mechanism *m, SolverParams params, bool enforce_variable_
 
         if (nres > 0) {
             int n = 2 * num_free;
-            double *x = malloc((size_t)n * sizeof(double));
+            double *x = xmalloc((size_t)n * sizeof(double));
             for (int c = 0; c < nconn; c++) {
                 if (free_index[c] >= 0) {
                     x[2 * free_index[c]] = m->connectors[c].pos.x;
@@ -616,15 +617,15 @@ static bool solve_pass(Mechanism *m, SolverParams params, bool enforce_variable_
                 }
             }
 
-            double *r = malloc((size_t)nres * sizeof(double));
-            double *rnew = malloc((size_t)nres * sizeof(double));
-            double *J = malloc((size_t)nres * (size_t)n * sizeof(double));
-            double *Mm = malloc((size_t)n * (size_t)n * sizeof(double));
-            double *rhs = malloc((size_t)n * sizeof(double));
-            double *Mtmp = malloc((size_t)n * (size_t)n * sizeof(double));
-            double *rhs_tmp = malloc((size_t)n * sizeof(double));
-            double *delta = malloc((size_t)n * sizeof(double));
-            double *xnew = malloc((size_t)n * sizeof(double));
+            double *r = xmalloc((size_t)nres * sizeof(double));
+            double *rnew = xmalloc((size_t)nres * sizeof(double));
+            double *J = xmalloc((size_t)nres * (size_t)n * sizeof(double));
+            double *Mm = xmalloc((size_t)n * (size_t)n * sizeof(double));
+            double *rhs = xmalloc((size_t)n * sizeof(double));
+            double *Mtmp = xmalloc((size_t)n * (size_t)n * sizeof(double));
+            double *rhs_tmp = xmalloc((size_t)n * sizeof(double));
+            double *delta = xmalloc((size_t)n * sizeof(double));
+            double *xnew = xmalloc((size_t)n * sizeof(double));
 
             double cost = eval_residuals(m, free_index, x, res_list, nres, r);
             double lambda = params.lambda_init;
@@ -787,7 +788,7 @@ bool solver_solve_at_current_angle(Mechanism *m, SolverParams params) {
      * ones included: a variable link should only give way when the geometry
      * genuinely leaves it no choice, not merely because it is allowed to.
      * If that succeeds, nothing needed to stretch and we keep it. */
-    Vec2 *saved = malloc((size_t)m->connector_count * sizeof(Vec2));
+    Vec2 *saved = xmalloc((size_t)m->connector_count * sizeof(Vec2));
     for (int i = 0; i < m->connector_count; i++) saved[i] = m->connectors[i].pos;
 
     /* Judge success by the lengths themselves, not solve_pass's convergence
@@ -837,7 +838,7 @@ bool solver_advance(Mechanism *m, double dt, SolverParams params) {
          * return spring on its own follower. The spring is what makes
          * one-sided contact meaningful -- it is the only thing pressing the
          * follower back onto the profile once the cam stops pushing. */
-        Vec2 *accel = malloc((size_t)m->connector_count * sizeof(Vec2));
+        Vec2 *accel = xmalloc((size_t)m->connector_count * sizeof(Vec2));
         for (int i = 0; i < m->connector_count; i++) accel[i] = params.gravity;
 
         for (int ci = 0; ci < m->cam_count; ci++) {

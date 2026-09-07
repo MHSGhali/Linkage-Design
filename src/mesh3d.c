@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "xalloc.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -31,7 +32,7 @@ void mesh3d_free(Mesh3 *m) {
 void mesh3d_add_tri(Mesh3 *m, Vec3 a, Vec3 b, Vec3 c) {
     if (m->tri_count * 3 + 3 > m->capacity) {
         int want = (m->capacity > 0) ? m->capacity * 2 : 256;
-        Vec3 *grown = realloc(m->verts, (size_t)want * sizeof(Vec3));
+        Vec3 *grown = xrealloc(m->verts, (size_t)want * sizeof(Vec3));
         if (!grown) return;   /* out of memory: the closedness check will catch it */
         m->verts = grown;
         m->capacity = want;
@@ -95,9 +96,9 @@ static bool point_on_segment(Vec2 a, Vec2 b, Vec2 q) {
 static bool ear_clip(const Vec2 *v, int n, Mesh3 *out, double z, bool up) {
     if (n < 3) return false;
 
-    int *prev = malloc((size_t)n * sizeof(int));
-    int *next = malloc((size_t)n * sizeof(int));
-    bool *gone = calloc((size_t)n, sizeof(bool));
+    int *prev = xmalloc((size_t)n * sizeof(int));
+    int *next = xmalloc((size_t)n * sizeof(int));
+    bool *gone = xcalloc((size_t)n, sizeof(bool));
     if (!prev || !next || !gone) { free(prev); free(next); free(gone); return false; }
 
     for (int i = 0; i < n; i++) { prev[i] = (i + n - 1) % n; next[i] = (i + 1) % n; }
@@ -266,16 +267,16 @@ static Vec2 *bridge_holes(const Region2 *r, int *count_out) {
     int total = r->outer.count;
     for (int h = 0; h < r->hole_count; h++) total += r->holes[h].count + 4;
 
-    Vec2 *poly = malloc((size_t)total * sizeof(Vec2));
-    Vec2 *scratch = malloc((size_t)total * sizeof(Vec2));
+    Vec2 *poly = xmalloc((size_t)total * sizeof(Vec2));
+    Vec2 *scratch = xmalloc((size_t)total * sizeof(Vec2));
     /* outer_edge[i] marks the edge from poly[i] to poly[i+1] as part of the
      * ORIGINAL boundary, i.e. somewhere a seam may still land. */
-    bool *outer_edge = malloc((size_t)total * sizeof(bool));
+    bool *outer_edge = xmalloc((size_t)total * sizeof(bool));
     if (!poly || !scratch || !outer_edge) {
         free(poly); free(scratch); free(outer_edge);
         return NULL;
     }
-    bool *scratch_edge = malloc((size_t)total * sizeof(bool));
+    bool *scratch_edge = xmalloc((size_t)total * sizeof(bool));
     if (!scratch_edge) { free(poly); free(scratch); free(outer_edge); return NULL; }
 
     int n = r->outer.count;
@@ -283,7 +284,7 @@ static Vec2 *bridge_holes(const Region2 *r, int *count_out) {
     for (int i = 0; i < n; i++) outer_edge[i] = true;
 
     /* Rightmost hole first, so the seams fan out in a consistent order. */
-    int *order = malloc((size_t)(r->hole_count > 0 ? r->hole_count : 1) * sizeof(int));
+    int *order = xmalloc((size_t)(r->hole_count > 0 ? r->hole_count : 1) * sizeof(int));
     if (!order) { free(poly); free(scratch); free(outer_edge); free(scratch_edge); return NULL; }
     for (int h = 0; h < r->hole_count; h++) order[h] = h;
     for (int i = 1; i < r->hole_count; i++) {
@@ -312,7 +313,7 @@ static Vec2 *bridge_holes(const Region2 *r, int *count_out) {
 
         /* A hole runs the opposite way round to the boundary, so that walking
          * in through the seam and out again keeps the merged loop simple. */
-        Vec2 *hw = malloc((size_t)hole->count * sizeof(Vec2));
+        Vec2 *hw = xmalloc((size_t)hole->count * sizeof(Vec2));
         if (!hw) { ok = false; break; }
         copy_wound(hw, hole->p, hole->count, false);
 
@@ -414,7 +415,7 @@ bool mesh3d_extrude(Mesh3 *m, const Region2 *r, double z0, double z1) {
     if (!mesh3d_triangulate(m, r, z0, false)) { m->tri_count = before; return false; }
     if (!mesh3d_triangulate(m, r, z1, true)) { m->tri_count = before; return false; }
 
-    Vec2 *buf = malloc((size_t)r->outer.count * sizeof(Vec2));
+    Vec2 *buf = xmalloc((size_t)r->outer.count * sizeof(Vec2));
     if (!buf) { m->tri_count = before; return false; }
     copy_wound(buf, r->outer.p, r->outer.count, true);
     wall_from_loop(m, buf, r->outer.count, z0, z1);
@@ -423,7 +424,7 @@ bool mesh3d_extrude(Mesh3 *m, const Region2 *r, double z0, double z1) {
     for (int h = 0; h < r->hole_count; h++) {
         const Loop2 *hole = &r->holes[h];
         if (hole->count < 3) continue;
-        Vec2 *hb = malloc((size_t)hole->count * sizeof(Vec2));
+        Vec2 *hb = xmalloc((size_t)hole->count * sizeof(Vec2));
         if (!hb) { m->tri_count = before; return false; }
         copy_wound(hb, hole->p, hole->count, false);
         wall_from_loop(m, hb, hole->count, z0, z1);
@@ -472,8 +473,8 @@ static bool edges_all_matched(const Mesh3 *m, bool strict) {
 
     /* Weld coincident corners so that two triangles meeting along an edge
      * agree about which edge it is. */
-    const Vec3 **sorted = malloc((size_t)vn * sizeof(Vec3 *));
-    int *id = malloc((size_t)vn * sizeof(int));
+    const Vec3 **sorted = xmalloc((size_t)vn * sizeof(Vec3 *));
+    int *id = xmalloc((size_t)vn * sizeof(int));
     if (!sorted || !id) { free(sorted); free(id); return false; }
     for (int i = 0; i < vn; i++) sorted[i] = &m->verts[i];
     qsort(sorted, (size_t)vn, sizeof(Vec3 *), cmp_vec3);
@@ -484,7 +485,7 @@ static bool edges_all_matched(const Mesh3 *m, bool strict) {
         id[sorted[i] - m->verts] = groups;
     }
 
-    Edge *edges = malloc((size_t)(vn) * sizeof(Edge));
+    Edge *edges = xmalloc((size_t)(vn) * sizeof(Edge));
     if (!edges) { free(sorted); free(id); return false; }
     int en = 0;
     for (int t = 0; t < m->tri_count; t++) {
@@ -630,7 +631,7 @@ static int convex_hull(const Vec2 *pts, int n, Vec2 *hull) {
     if (n < 1) return 0;
     if (n == 1) { hull[0] = pts[0]; return 1; }
 
-    int *idx = malloc((size_t)n * sizeof(int));
+    int *idx = xmalloc((size_t)n * sizeof(int));
     if (!idx) return 0;
     for (int i = 0; i < n; i++) idx[i] = i;
     for (int i = 1; i < n; i++) {
@@ -671,7 +672,7 @@ int mesh3d_hull_offset(const Vec2 *pts, int point_count, double radius,
     if (corner_segments < 2) corner_segments = 2;
     if (cap < mesh3d_hull_offset_capacity(point_count, corner_segments)) return 0;
 
-    Vec2 *hull = malloc((size_t)(2 * point_count + 2) * sizeof(Vec2));
+    Vec2 *hull = xmalloc((size_t)(2 * point_count + 2) * sizeof(Vec2));
     if (!hull) return 0;
     int h = convex_hull(pts, point_count, hull);
 

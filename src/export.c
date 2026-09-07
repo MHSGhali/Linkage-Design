@@ -3,6 +3,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include "xalloc.h"
 
 /* Seconds of motion to sample when nothing is driving the mechanism and it
  * is just falling/swinging under gravity. */
@@ -42,7 +43,7 @@ bool export_blender_script(const Mechanism *m, SolverParams params, const char *
 
     /* Index the connectors we actually export, so the per-frame position
      * table lines up with the joint list regardless of deleted ids. */
-    int *joint_ids = malloc((size_t)(m->connector_count > 0 ? m->connector_count : 1) * sizeof(int));
+    int *joint_ids = xmalloc((size_t)(m->connector_count > 0 ? m->connector_count : 1) * sizeof(int));
     int joint_count = 0;
     for (int i = 0; i < m->connector_count; i++) {
         if (m->connectors[i].alive) joint_ids[joint_count++] = i;
@@ -93,7 +94,7 @@ bool export_blender_script(const Mechanism *m, SolverParams params, const char *
     double substep_dt = frame_dt / (double)substeps;
 
     /* Cams that are exportable: alive, with a live centre we can hang them on. */
-    int *cam_ids = malloc((size_t)(m->cam_count > 0 ? m->cam_count : 1) * sizeof(int));
+    int *cam_ids = xmalloc((size_t)(m->cam_count > 0 ? m->cam_count : 1) * sizeof(int));
     int cam_count = 0;
     for (int i = 0; i < m->cam_count; i++) {
         const Cam *c = &m->cams[i];
@@ -102,8 +103,8 @@ bool export_blender_script(const Mechanism *m, SolverParams params, const char *
         cam_ids[cam_count++] = i;
     }
 
-    Vec2 *samples = malloc((size_t)EXPORT_FRAMES * (size_t)(joint_count > 0 ? joint_count : 1) * sizeof(Vec2));
-    double *cam_angles = malloc((size_t)EXPORT_FRAMES * (size_t)(cam_count > 0 ? cam_count : 1) * sizeof(double));
+    Vec2 *samples = xmalloc((size_t)EXPORT_FRAMES * (size_t)(joint_count > 0 ? joint_count : 1) * sizeof(Vec2));
+    double *cam_angles = xmalloc((size_t)EXPORT_FRAMES * (size_t)(cam_count > 0 ? cam_count : 1) * sizeof(double));
     int recorded = 0;
     bool jammed = false;
 
@@ -228,7 +229,7 @@ bool export_blender_script(const Mechanism *m, SolverParams params, const char *
      * that actually gets cut), plus the joint it spins about and the roller
      * that rides it. */
     fprintf(f, "CAMS = [\n");
-    Vec2 *profile = malloc((size_t)CAM_EXPORT_SAMPLES * sizeof(Vec2));
+    Vec2 *profile = xmalloc((size_t)CAM_EXPORT_SAMPLES * sizeof(Vec2));
     for (int j = 0; j < cam_count; j++) {
         const Cam *c = &m->cams[cam_ids[j]];
         int center_slot = -1, follower_slot = -1;

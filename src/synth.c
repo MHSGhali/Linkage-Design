@@ -3,6 +3,7 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include "xalloc.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -398,7 +399,7 @@ bool synth_fit_four_bar(const Vec2 *target, int count, bool closed,
 
     int keep = params.refine_candidates;
     if (keep < 1) keep = 1;
-    Candidate *best = malloc((size_t)keep * sizeof(Candidate));
+    Candidate *best = xmalloc((size_t)keep * sizeof(Candidate));
     for (int i = 0; i < keep; i++) best[i].error = 1e300;
 
     unsigned rng = params.seed ? params.seed : 1u;

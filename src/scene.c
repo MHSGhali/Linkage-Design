@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+#include "xalloc.h"
 
 /* Doubles round-trip exactly at 17 significant digits, so reopening a file
  * gives back the mechanism that was saved rather than one very close to it. */
@@ -29,7 +30,7 @@ typedef struct {
 } IdMap;
 
 static bool idmap_build(IdMap *map, int n) {
-    map->slot = (n > 0) ? malloc((size_t)n * sizeof(int)) : NULL;
+    map->slot = (n > 0) ? xmalloc((size_t)n * sizeof(int)) : NULL;
     if (n > 0 && !map->slot) return false;
     for (int i = 0; i < n; i++) map->slot[i] = -1;
     map->count = 0;
@@ -229,7 +230,7 @@ bool scene_load(Mechanism *m, SolverParams *params, const char *path,
             if (sscanf(line, " L %d%n", &n, &consumed) != 1 || n < 2 || n > 4096) {
                 problem = "a body"; break;
             }
-            int *ids = malloc((size_t)n * sizeof(int));
+            int *ids = xmalloc((size_t)n * sizeof(int));
             if (!ids) { problem = "a body (out of memory)"; break; }
             const char *p = line + consumed;
             bool bad = false;

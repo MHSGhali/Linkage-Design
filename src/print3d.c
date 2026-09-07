@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include "xalloc.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -200,8 +201,8 @@ static void layout_build(Layout *L, const Mechanism *m) {
     L->m = m;
     L->link_count = m->link_count;
     L->node_count = m->link_count + m->cam_count;
-    L->parent = malloc((size_t)(L->node_count > 0 ? L->node_count : 1) * sizeof(int));
-    L->layer = malloc((size_t)(L->node_count > 0 ? L->node_count : 1) * sizeof(int));
+    L->parent = xmalloc((size_t)(L->node_count > 0 ? L->node_count : 1) * sizeof(int));
+    L->layer = xmalloc((size_t)(L->node_count > 0 ? L->node_count : 1) * sizeof(int));
     L->max_layer = 0;
     if (!L->parent || !L->layer) { free(L->parent); free(L->layer); L->parent = NULL; L->layer = NULL; return; }
     for (int i = 0; i < L->node_count; i++) { L->parent[i] = i; L->layer[i] = -1; }
@@ -226,8 +227,8 @@ static void layout_build(Layout *L, const Mechanism *m) {
     /* Greedy colouring, busiest group first: the node that conflicts with the
      * most others is hardest to place, so place it while every layer is free. */
     int groups = 0;
-    int *reps = malloc((size_t)(L->node_count > 0 ? L->node_count : 1) * sizeof(int));
-    int *degree = malloc((size_t)(L->node_count > 0 ? L->node_count : 1) * sizeof(int));
+    int *reps = xmalloc((size_t)(L->node_count > 0 ? L->node_count : 1) * sizeof(int));
+    int *degree = xmalloc((size_t)(L->node_count > 0 ? L->node_count : 1) * sizeof(int));
     if (!reps || !degree) { free(reps); free(degree); return; }
     for (int i = 0; i < L->node_count; i++) {
         if (!node_alive(L, i) || uf_find(L->parent, i) != i) continue;
@@ -255,7 +256,7 @@ static void layout_build(Layout *L, const Mechanism *m) {
         reps[j + 1] = kr; degree[j + 1] = kd;
     }
 
-    int *colour = malloc((size_t)(groups > 0 ? groups : 1) * sizeof(int));
+    int *colour = xmalloc((size_t)(groups > 0 ? groups : 1) * sizeof(int));
     if (!colour) { free(reps); free(degree); return; }
     for (int i = 0; i < groups; i++) colour[i] = -1;
 
@@ -477,9 +478,9 @@ static bool scratch_init(Scratch *s, int outer_cap, int hole_cap) {
     s->outer_cap = outer_cap;
     s->hole_cap = hole_cap;
     s->hole_n = 0;
-    s->outer = malloc((size_t)outer_cap * sizeof(Vec2));
-    s->holepts = malloc((size_t)hole_cap * HOLE_SEG * sizeof(Vec2));
-    s->holes = malloc((size_t)hole_cap * sizeof(Loop2));
+    s->outer = xmalloc((size_t)outer_cap * sizeof(Vec2));
+    s->holepts = xmalloc((size_t)hole_cap * HOLE_SEG * sizeof(Vec2));
+    s->holes = xmalloc((size_t)hole_cap * sizeof(Loop2));
     if (!s->outer || !s->holepts || !s->holes) {
         free(s->outer); free(s->holepts); free(s->holes);
         s->outer = NULL; s->holepts = NULL; s->holes = NULL;
@@ -553,7 +554,7 @@ static Place on_layer(const Ctx *c, int l, double angle, Vec2 offset) {
  * ternary link as a rounded triangle. */
 static void emit_link_plate(Ctx *c, const Layout *L, int li) {
     const Link *l = &c->m->links[li];
-    Vec2 *pins = malloc((size_t)l->connector_count * sizeof(Vec2));
+    Vec2 *pins = xmalloc((size_t)l->connector_count * sizeof(Vec2));
     if (!pins) return;
     int np = 0;
     for (int i = 0; i < l->connector_count; i++) {
@@ -1021,7 +1022,7 @@ bool print3d_export(const Mechanism *m, PrintParams p, const char *dir,
     /* Wheels have to be turned so their teeth interleave; each wheel's own rim
      * mark points wherever it happens to point. */
     double *phase = (m->link_count > 0)
-                     ? malloc((size_t)m->link_count * sizeof(double)) : NULL;
+                     ? xmalloc((size_t)m->link_count * sizeof(double)) : NULL;
     if (phase) mechanism_gear_phases(m, phase);
 
     fprintf(man, "Linkage Design -- printable parts\n");
@@ -1094,9 +1095,9 @@ bool print3d_export(const Mechanism *m, PrintParams p, const char *dir,
 
     /* Which layers each joint actually carries, so pins can be cut to length
      * and the holes in the stack filled. */
-    int *lowest = malloc((size_t)(m->connector_count > 0 ? m->connector_count : 1) * sizeof(int));
-    int *highest = malloc((size_t)(m->connector_count > 0 ? m->connector_count : 1) * sizeof(int));
-    unsigned long long *used = calloc((size_t)(m->connector_count > 0 ? m->connector_count : 1),
+    int *lowest = xmalloc((size_t)(m->connector_count > 0 ? m->connector_count : 1) * sizeof(int));
+    int *highest = xmalloc((size_t)(m->connector_count > 0 ? m->connector_count : 1) * sizeof(int));
+    unsigned long long *used = xcalloc((size_t)(m->connector_count > 0 ? m->connector_count : 1),
                                        sizeof(unsigned long long));
     if (!lowest || !highest || !used) {
         free(lowest); free(highest); free(used);
@@ -1137,9 +1138,9 @@ bool print3d_export(const Mechanism *m, PrintParams p, const char *dir,
     double base_thickness = p.thickness * BASE_THICKNESS_FACTOR;
 
     int max_places = m->connector_count > 0 ? m->connector_count : 1;
-    Place *pin_places = calloc((size_t)(64 * max_places), sizeof(Place));
-    Place *cap_places = calloc((size_t)(64 * max_places), sizeof(Place));
-    Place *spacer_places = calloc((size_t)(64 * max_places), sizeof(Place));
+    Place *pin_places = xcalloc((size_t)(64 * max_places), sizeof(Place));
+    Place *cap_places = xcalloc((size_t)(64 * max_places), sizeof(Place));
+    Place *spacer_places = xcalloc((size_t)(64 * max_places), sizeof(Place));
     if (!pin_places || !cap_places || !spacer_places) {
         free(pin_places); free(cap_places); free(spacer_places);
         free(lowest); free(highest); free(used);
@@ -1220,7 +1221,7 @@ bool print3d_export(const Mechanism *m, PrintParams p, const char *dir,
         }
         int total = anchor_count + extra_mount_count;
         if (total >= 1) {
-            Vec2 *pts = malloc((size_t)total * sizeof(Vec2));
+            Vec2 *pts = xmalloc((size_t)total * sizeof(Vec2));
             if (pts) {
                 int n = 0;
                 for (int i = 0; i < m->connector_count; i++) {

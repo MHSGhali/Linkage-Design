@@ -5,6 +5,7 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include "xalloc.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -25,7 +26,7 @@ static void *grow(void *arr, int *capacity, int count, size_t elem_size) {
     int new_cap = (*capacity == 0) ? 4 : (*capacity) * 2;
     while (new_cap <= count) new_cap *= 2;
     *capacity = new_cap;
-    return realloc(arr, (size_t)new_cap * elem_size);
+    return xrealloc(arr, (size_t)new_cap * elem_size);
 }
 
 void mechanism_init(Mechanism *m) {
@@ -73,15 +74,15 @@ void mechanism_clone(const Mechanism *src, Mechanism *dst) {
     dst->gear_module = src->gear_module;
     dst->connector_count = src->connector_count;
     dst->connector_capacity = src->connector_count;
-    dst->connectors = (src->connector_count > 0) ? malloc((size_t)src->connector_count * sizeof(Connector)) : NULL;
+    dst->connectors = (src->connector_count > 0) ? xmalloc((size_t)src->connector_count * sizeof(Connector)) : NULL;
     for (int i = 0; i < src->connector_count; i++) {
         Connector *d = &dst->connectors[i];
         *d = src->connectors[i];
         if (src->connectors[i].path_count > 0) {
             size_t n = (size_t)src->connectors[i].path_count;
-            d->path = malloc(n * sizeof(Vec2));
+            d->path = xmalloc(n * sizeof(Vec2));
             memcpy(d->path, src->connectors[i].path, n * sizeof(Vec2));
-            d->path_time = malloc(n * sizeof(double));
+            d->path_time = xmalloc(n * sizeof(double));
             memcpy(d->path_time, src->connectors[i].path_time, n * sizeof(double));
             d->path_capacity = src->connectors[i].path_count;
         } else {
@@ -93,19 +94,19 @@ void mechanism_clone(const Mechanism *src, Mechanism *dst) {
 
     dst->link_count = src->link_count;
     dst->link_capacity = src->link_count;
-    dst->links = (src->link_count > 0) ? malloc((size_t)src->link_count * sizeof(Link)) : NULL;
+    dst->links = (src->link_count > 0) ? xmalloc((size_t)src->link_count * sizeof(Link)) : NULL;
     for (int i = 0; i < src->link_count; i++) {
         Link *d = &dst->links[i];
         *d = src->links[i];
         int k = src->links[i].connector_count;
         if (k > 0) {
-            d->connector_ids = malloc((size_t)k * sizeof(int));
+            d->connector_ids = xmalloc((size_t)k * sizeof(int));
             memcpy(d->connector_ids, src->links[i].connector_ids, (size_t)k * sizeof(int));
             int npairs = k * (k - 1) / 2;
-            d->rest_dist = malloc((size_t)npairs * sizeof(double));
+            d->rest_dist = xmalloc((size_t)npairs * sizeof(double));
             memcpy(d->rest_dist, src->links[i].rest_dist, (size_t)npairs * sizeof(double));
             if (src->links[i].frozen_local_offset) {
-                d->frozen_local_offset = malloc((size_t)k * sizeof(Vec2));
+                d->frozen_local_offset = xmalloc((size_t)k * sizeof(Vec2));
                 memcpy(d->frozen_local_offset, src->links[i].frozen_local_offset, (size_t)k * sizeof(Vec2));
             } else {
                 d->frozen_local_offset = NULL;
@@ -120,19 +121,19 @@ void mechanism_clone(const Mechanism *src, Mechanism *dst) {
     /* Cams, sliders, gears and Geneva wheels own no heap memory, so a flat
      * copy of each array is a full deep copy. */
     dst->cam_count = dst->cam_capacity = src->cam_count;
-    dst->cams = (src->cam_count > 0) ? malloc((size_t)src->cam_count * sizeof(Cam)) : NULL;
+    dst->cams = (src->cam_count > 0) ? xmalloc((size_t)src->cam_count * sizeof(Cam)) : NULL;
     if (src->cam_count > 0) memcpy(dst->cams, src->cams, (size_t)src->cam_count * sizeof(Cam));
 
     dst->slider_count = dst->slider_capacity = src->slider_count;
-    dst->sliders = (src->slider_count > 0) ? malloc((size_t)src->slider_count * sizeof(Slider)) : NULL;
+    dst->sliders = (src->slider_count > 0) ? xmalloc((size_t)src->slider_count * sizeof(Slider)) : NULL;
     if (src->slider_count > 0) memcpy(dst->sliders, src->sliders, (size_t)src->slider_count * sizeof(Slider));
 
     dst->gear_count = dst->gear_capacity = src->gear_count;
-    dst->gears = (src->gear_count > 0) ? malloc((size_t)src->gear_count * sizeof(Gear)) : NULL;
+    dst->gears = (src->gear_count > 0) ? xmalloc((size_t)src->gear_count * sizeof(Gear)) : NULL;
     if (src->gear_count > 0) memcpy(dst->gears, src->gears, (size_t)src->gear_count * sizeof(Gear));
 
     dst->geneva_count = dst->geneva_capacity = src->geneva_count;
-    dst->genevas = (src->geneva_count > 0) ? malloc((size_t)src->geneva_count * sizeof(Geneva)) : NULL;
+    dst->genevas = (src->geneva_count > 0) ? xmalloc((size_t)src->geneva_count * sizeof(Geneva)) : NULL;
     if (src->geneva_count > 0) memcpy(dst->genevas, src->genevas, (size_t)src->geneva_count * sizeof(Geneva));
 }
 
@@ -307,11 +308,11 @@ int mechanism_add_link(Mechanism *m, const int *connector_ids, int count) {
     Link *l = &m->links[m->link_count];
 
     l->connector_count = count;
-    l->connector_ids = malloc((size_t)count * sizeof(int));
+    l->connector_ids = xmalloc((size_t)count * sizeof(int));
     memcpy(l->connector_ids, connector_ids, (size_t)count * sizeof(int));
 
     int npairs = count * (count - 1) / 2;
-    l->rest_dist = malloc((size_t)npairs * sizeof(double));
+    l->rest_dist = xmalloc((size_t)npairs * sizeof(double));
     for (int i = 0; i < count; i++) {
         for (int j = i + 1; j < count; j++) {
             l->rest_dist[mechanism_pair_index(i, j, count)] =
@@ -472,8 +473,8 @@ void mechanism_trace_step(Mechanism *m, double sim_time) {
         if (c->path_count >= c->path_capacity) {
             int new_cap = (c->path_capacity == 0) ? 4 : c->path_capacity * 2;
             while (new_cap <= c->path_count) new_cap *= 2;
-            c->path = realloc(c->path, (size_t)new_cap * sizeof(Vec2));
-            c->path_time = realloc(c->path_time, (size_t)new_cap * sizeof(double));
+            c->path = xrealloc(c->path, (size_t)new_cap * sizeof(Vec2));
+            c->path_time = xrealloc(c->path_time, (size_t)new_cap * sizeof(double));
             c->path_capacity = new_cap;
         }
         c->path_time[c->path_count] = sim_time;
@@ -950,8 +951,8 @@ bool mechanism_orient_train_from(Mechanism *m, int root_link) {
      * it and turn round any that were pointing the other way. Without this,
      * naming a wheel as the driver would only work if you happened to have
      * meshed the train in the right order to begin with. */
-    bool *seen = calloc((size_t)m->link_count, sizeof(bool));
-    int *queue = malloc((size_t)m->link_count * sizeof(int));
+    bool *seen = xcalloc((size_t)m->link_count, sizeof(bool));
+    int *queue = xmalloc((size_t)m->link_count * sizeof(int));
     if (!seen || !queue) { free(seen); free(queue); return false; }
 
     int head = 0, tail = 0;
@@ -1161,8 +1162,8 @@ void mechanism_gear_phases(const Mechanism *m, double *angles_out) {
 
     /* Walk each train outwards from whichever wheel is reached first, keeping
      * that one's own orientation and turning every wheel it drives to suit. */
-    bool *placed = calloc((size_t)m->link_count, sizeof(bool));
-    int *queue = malloc((size_t)m->link_count * sizeof(int));
+    bool *placed = xcalloc((size_t)m->link_count, sizeof(bool));
+    int *queue = xmalloc((size_t)m->link_count * sizeof(int));
     if (!placed || !queue) { free(placed); free(queue); return; }
 
     for (int root = 0; root < m->link_count; root++) {

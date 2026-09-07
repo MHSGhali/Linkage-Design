@@ -4,6 +4,7 @@
 #include <math.h>
 #include <stdbool.h>
 #include <dirent.h>
+#include <sys/stat.h>
 
 #include "../src/mechanism.h"
 #include "../src/solver.h"
@@ -24,6 +25,38 @@
 #endif
 
 static int failures = 0;
+
+/* Every file these tests write goes under one scratch directory, resolved
+ * once at start-up, so the suite runs the same from any working directory.
+ * The paths used to be literal ("tests/tmp_round_trip.linkage"), which meant
+ * `make test` from the repo root worked and running the binary directly from
+ * anywhere else silently failed the save, then read back a mechanism that had
+ * never been loaded -- and crashed on it. */
+static char scratch_root[512];
+
+static void scratch_init(void) {
+    const char *tmp = getenv("TMPDIR");
+    if (!tmp || !*tmp) tmp = "/tmp";
+    size_t n = strlen(tmp);
+    snprintf(scratch_root, sizeof scratch_root, "%s%slinkage_design_tests",
+              tmp, (n > 0 && tmp[n - 1] == '/') ? "" : "/");
+    mkdir(scratch_root, 0777);   /* EEXIST is the normal case on a second run */
+}
+
+/* A path inside that directory. The returned buffer is one of a rotating
+ * set, so several calls can be live at once within a test (a directory held
+ * in a local plus the files read back out of it) without one overwriting
+ * another; nothing here comes close to holding SCRATCH_BUFS of them. */
+#define SCRATCH_BUFS 16
+
+static const char *scratch(const char *name) {
+    static char bufs[SCRATCH_BUFS][1024];
+    static int next = 0;
+    char *out = bufs[next];
+    next = (next + 1) % SCRATCH_BUFS;
+    snprintf(out, sizeof bufs[0], "%s/%s", scratch_root, name);
+    return out;
+}
 
 static void check_close(const char *name, double actual, double expected, double tol) {
     if (fabs(actual - expected) > tol) {
@@ -375,7 +408,7 @@ static void test_export_blender_script(void) {
     mechanism_add_link(&m, rocker, 2);
     mechanism_toggle_driven(&m, 0, 90.0);
 
-    const char *path = "test_export_output.py";
+    const char *path = scratch("test_export_output.py");
     SolverParams params = solver_default_params();
     check_true("export_blender_script succeeds", export_blender_script(&m, params, path));
 
@@ -442,7 +475,7 @@ static void test_export_animation_actually_moves(void) {
     mechanism_add_link(&m, crank, 2);
     mechanism_toggle_driven(&m, 0, 90.0);
 
-    const char *path = "test_export_anim.py";
+    const char *path = scratch("test_export_anim.py");
     SolverParams params = solver_default_params();
     check_true("animated export succeeds", export_blender_script(&m, params, path));
 
@@ -2535,14 +2568,26 @@ static void test_scene_round_trip_preserves_the_mechanism(void) {
     SolverParams params = solver_default_params();
     params.gravity = (Vec2){ 0.0, 250.0 };
 
-    const char *path = "tests/tmp_round_trip.linkage";
+    const char *path = scratch("tmp_round_trip.linkage");
     char err[256] = { 0 };
-    check_true("the mechanism saves", scene_save(&original, &params, path, err, sizeof err));
+    bool saved = scene_save(&original, &params, path, err, sizeof err);
+    check_true("the mechanism saves", saved);
 
     Mechanism reopened;
     mechanism_init(&reopened);
     SolverParams reopened_params = solver_default_params();
-    check_true("and reopens", scene_load(&reopened, &reopened_params, path, err, sizeof err));
+    bool opened = saved && scene_load(&reopened, &reopened_params, path, err, sizeof err);
+    check_true("and reopens", opened);
+
+    /* Nothing below this point means anything about a mechanism that was
+     * never loaded, and reading one (cams[0] of an empty array) is a crash
+     * rather than a failure -- so report what went wrong and stop here. */
+    if (!opened) {
+        printf("     (%s)\n", err[0] ? err : "no reason given");
+        mechanism_free(&original);
+        mechanism_free(&reopened);
+        return;
+    }
 
     /* Tombstones are not written, so the file is dense: what must match is
      * every LIVE part, in order. */
@@ -2616,7 +2661,7 @@ static void test_scene_round_trip_preserves_the_mechanism(void) {
 }
 
 static void test_a_damaged_file_costs_nothing(void) {
-    const char *path = "tests/tmp_damaged.linkage";
+    const char *path = scratch("tmp_damaged.linkage");
     FILE *f = fopen(path, "w");
     /* The body names pin 9, which does not exist. */
     fprintf(f, "LINKAGE 1\n" "C 10 20 0 0\n" "C 30 40 0 0\n" "L 2 0 9 1 0 -1 0 0\n");
@@ -2916,7 +2961,7 @@ static void build_everything(Mechanism *m) {
 }
 
 static void test_every_exported_part_is_a_printable_solid(void) {
-    const char *dir = "tests/tmp_parts";
+    const char *dir = scratch("tmp_parts");
     wipe_dir(dir);
 
     Mechanism m;
@@ -2975,7 +3020,7 @@ static void test_every_exported_part_is_a_printable_solid(void) {
 }
 
 static void test_a_link_plate_has_a_hole_at_every_pin(void) {
-    const char *dir = "tests/tmp_holes";
+    const char *dir = scratch("tmp_holes");
     wipe_dir(dir);
 
     Mechanism m;
@@ -2991,7 +3036,7 @@ static void test_a_link_plate_has_a_hole_at_every_pin(void) {
     check_true("a ternary link exports", print3d_export(&m, p, dir, report, sizeof report));
 
     Mesh3 mesh;
-    check_true("its plate can be read back", read_stl("tests/tmp_holes/link_0.stl", &mesh));
+    check_true("its plate can be read back", read_stl(scratch("tmp_holes/link_0.stl"), &mesh));
 
     /* Every pin should have a ring of vertices around it at the running-fit
      * radius: that ring IS the hole. Without it the plate is a solid slab and
@@ -3046,7 +3091,7 @@ static int manifest_layer(const char *dir, const char *part) {
 }
 
 static void test_parts_that_share_a_pin_are_stacked_apart(void) {
-    const char *dir = "tests/tmp_layers";
+    const char *dir = scratch("tmp_layers");
     wipe_dir(dir);
 
     Mechanism m;
@@ -3112,7 +3157,7 @@ static void test_print_options_are_read_and_clamped(void) {
 static void test_a_scene_from_before_gears_had_teeth_still_opens(void) {
     /* Format 1: the L record stopped at the wheel radius, and 37.3 was a
      * radius nothing could be cut to. */
-    const char *path = "tests/tmp_v1.linkage";
+    const char *path = scratch("tmp_v1.linkage");
     FILE *f = fopen(path, "w");
     fprintf(f, "LINKAGE 1\n" "P 0 0\n" "C 0 0 1 0\n" "C 0 -37.3 0 0\n"
                 "L 2 0 1 1 0 -1 0 37.3\n");
@@ -3130,7 +3175,7 @@ static void test_a_scene_from_before_gears_had_teeth_still_opens(void) {
                  mechanism_gear_wheel_radius(&m, 0, NULL), 37.0, 1e-9);
 
     /* Round-tripping through format 2 keeps both. */
-    const char *out = "tests/tmp_v2.linkage";
+    const char *out = scratch("tmp_v2.linkage");
     check_true("it saves again", scene_save(&m, &params, out, err, sizeof err));
     Mechanism back;
     mechanism_init(&back);
@@ -3149,7 +3194,7 @@ static void test_a_scene_from_before_gears_had_teeth_still_opens(void) {
  * shows up in a watertightness check: a slot rounded off the wrong way is a
  * perfectly good solid, just one that jams. So measure it. */
 static void test_a_geneva_slot_reaches_the_pin(void) {
-    const char *dir = "tests/tmp_geneva";
+    const char *dir = scratch("tmp_geneva");
     wipe_dir(dir);
 
     Mechanism m;
@@ -3166,7 +3211,7 @@ static void test_a_geneva_slot_reaches_the_pin(void) {
     check_true("it exports", print3d_export(&m, p, dir, report, sizeof report));
 
     Mesh3 mesh;
-    check_true("its wheel can be read back", read_stl("tests/tmp_geneva/geneva_wheel_0.stl", &mesh));
+    check_true("its wheel can be read back", read_stl(scratch("tmp_geneva/geneva_wheel_0.stl"), &mesh));
 
     const Geneva *gv = &m.genevas[gid];
     double rim = mechanism_geneva_wheel_radius(gv);
@@ -3291,7 +3336,7 @@ static void test_meshed_gears_are_phased_to_interleave(void) {
 }
 
 static void test_the_export_shows_how_it_goes_together(void) {
-    const char *dir = "tests/tmp_asm";
+    const char *dir = scratch("tmp_asm");
     wipe_dir(dir);
 
     Mechanism m;
@@ -3301,8 +3346,8 @@ static void test_the_export_shows_how_it_goes_together(void) {
     check_true("the mechanism exports", print3d_export(&m, p, dir, report, sizeof report));
 
     Mesh3 assembled, exploded;
-    check_true("an assembled view is written", read_stl("tests/tmp_asm/assembly.stl", &assembled));
-    check_true("and an exploded one", read_stl("tests/tmp_asm/assembly_exploded.stl", &exploded));
+    check_true("an assembled view is written", read_stl(scratch("tmp_asm/assembly.stl"), &assembled));
+    check_true("and an exploded one", read_stl(scratch("tmp_asm/assembly_exploded.stl"), &exploded));
     /* Parts touch in an assembly, so coincident faces make an edge appear four
      * times rather than two. That is not a hole; what would be a hole is an
      * edge with no partner at all. */
@@ -3389,13 +3434,13 @@ static void test_the_export_shows_how_it_goes_together(void) {
                 "one reaches down through it", true);
 
     /* Turning it off leaves the parts but not the two views. */
-    const char *plain = "tests/tmp_asm_off";
+    const char *plain = scratch("tmp_asm_off");
     wipe_dir(plain);
     p.assembly = false;
     check_true("asm=off still exports", print3d_export(&m, p, plain, report, sizeof report));
     Mesh3 none;
     check_true("but writes no assembled view",
-                !read_stl("tests/tmp_asm_off/assembly.stl", &none));
+                !read_stl(scratch("tmp_asm_off/assembly.stl"), &none));
 
     mesh3d_free(&assembled);
     mesh3d_free(&exploded);
@@ -3405,6 +3450,7 @@ static void test_the_export_shows_how_it_goes_together(void) {
 }
 
 int main(void) {
+    scratch_init();
     test_scene_round_trip_preserves_the_mechanism();
     test_a_damaged_file_costs_nothing();
     test_status_log_keeps_the_newest_messages();

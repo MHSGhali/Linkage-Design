@@ -6,6 +6,7 @@
 #include <stdarg.h>
 #include <string.h>
 #include <unistd.h>
+#include <ctype.h>
 
 #include "mechanism.h"
 #include "solver.h"
@@ -18,6 +19,7 @@
 #include "templates.h"
 #include "status.h"
 #include "scene.h"
+#include "xalloc.h"
 
 /* The window opens at this size and can be resized freely from there. It used
  * to be fixed, which meant a laptop screen shorter than WIN_H simply lost the
@@ -265,8 +267,19 @@ typedef struct {
     bool dirty;
     Prompt prompt;
     SDL_Window *window;   /* only so the title bar can show the file name */
+    SDL_Renderer *renderer;
 
     Toolbar toolbar;
+
+    /* Where the cursor is, and when it settled on the button it is over --
+     * the gallery highlights the tile under it, and a tooltip waits for the
+     * cursor to stop moving. Both used to be locals in main(). */
+    int mouse_x, mouse_y;
+    Uint32 hover_since;
+
+    /* Cleared by a quit that the user has confirmed (or that needed no
+     * confirming); the frame loop reads it. */
+    bool running;
 } App;
 
 static void clear_selection(Mechanism *m) {
@@ -740,7 +753,7 @@ static void stroke_push(Vec2 **pts, int *count, int *capacity, Vec2 p) {
     if (*count > 0 && vec2_dist((*pts)[*count - 1], p) < CAM_STROKE_MIN_SPACING) return;
     if (*count >= *capacity) {
         int cap = (*capacity == 0) ? 64 : *capacity * 2;
-        *pts = realloc(*pts, (size_t)cap * sizeof(Vec2));
+        *pts = xrealloc(*pts, (size_t)cap * sizeof(Vec2));
         *capacity = cap;
     }
     (*pts)[(*count)++] = p;
@@ -810,7 +823,7 @@ static void app_create_cam(App *a, const Vec2 *outline, int n, Vec2 fallback_cen
     Cam *cam = &a->mech.cams[cam_id];
 
     if (drawn) {
-        Vec2 *local = malloc((size_t)n * sizeof(Vec2));
+        Vec2 *local = xmalloc((size_t)n * sizeof(Vec2));
         for (int i = 0; i < n; i++) local[i] = vec2_sub(outline[i], centre);
         if (!cam_set_from_drawn_outline(cam, local, n)) {
             app_message(a, STATUS_WARN, "Couldn't read a profile from that outline -- using a default cam. "
@@ -1749,14 +1762,14 @@ static void app_open(App *a) {
 static void app_start_run(App *a) {
     free(a->pre_run_positions);
     a->pre_run_count = a->mech.connector_count;
-    a->pre_run_positions = malloc((size_t)a->pre_run_count * sizeof(Vec2));
+    a->pre_run_positions = xmalloc((size_t)a->pre_run_count * sizeof(Vec2));
     for (int i = 0; i < a->pre_run_count; i++) a->pre_run_positions[i] = a->mech.connectors[i].pos;
 
     free(a->frame_positions);
-    a->frame_positions = malloc((size_t)a->pre_run_count * sizeof(Vec2));
+    a->frame_positions = xmalloc((size_t)a->pre_run_count * sizeof(Vec2));
     free(a->frame_angles);
     a->frame_link_count = a->mech.link_count;
-    a->frame_angles = (a->frame_link_count > 0) ? malloc((size_t)a->frame_link_count * sizeof(double)) : NULL;
+    a->frame_angles = (a->frame_link_count > 0) ? xmalloc((size_t)a->frame_link_count * sizeof(double)) : NULL;
     a->jammed = false;
 
     if (!a->gravity_set_by_user && !mechanism_has_driven_link(&a->mech)) {
@@ -2084,7 +2097,7 @@ static void draw_mechanism(SDL_Renderer *ren, const Mechanism *m, DragMode drag_
     static double *tooth_phase = NULL;
     static int tooth_phase_cap = 0;
     if (m->link_count > tooth_phase_cap) {
-        double *grown = realloc(tooth_phase, (size_t)m->link_count * sizeof(double));
+        double *grown = xrealloc(tooth_phase, (size_t)m->link_count * sizeof(double));
         if (grown) { tooth_phase = grown; tooth_phase_cap = m->link_count; }
     }
     if (tooth_phase && tooth_phase_cap >= m->link_count) mechanism_gear_phases(m, tooth_phase);
@@ -2441,10 +2454,743 @@ static void app_handle_key(App *a, const SDL_KeyboardEvent *key) {
     }
 }
 
-int main(void) {
+/* ---------------------------------------------------------------------
+ * The application: set up, one event, one simulation step, one frame.
+ *
+ * These four were the body of main(), which had grown to the point where
+ * the shape of a frame -- events, then physics, then drawing -- was no
+ * longer visible from anywhere. Splitting them out also makes a frame
+ * something that can be driven by something other than the event loop:
+ * --capture below runs app_step and app_draw with no window on screen.
+ * ------------------------------------------------------------------- */
+
+static void app_init(App *a, SDL_Window *win, SDL_Renderer *ren, int win_w, int win_h) {
+    mechanism_init(&a->mech);
+    a->params = solver_default_params();
+    a->gravity_set_by_user = false;
+    a->undo_count = 0;
+    a->redo_count = 0;
+    a->state = APP_EDIT;
+    a->drag_mode = DRAG_NONE;
+    a->drag_start = a->drag_last = a->drag_current = (Vec2){ 0, 0 };
+    a->pan_last_screen = (Vec2){ 0, 0 };
+    a->drag_pushed_undo = false;
+    a->pre_run_positions = NULL;
+    a->pre_run_count = 0;
+    a->frame_positions = NULL;
+    a->frame_angles = NULL;
+    a->frame_link_count = 0;
+    a->jammed = false;
+    a->view_pan = (Vec2){ UI_TOOLBAR_W, 0 };
+    a->view_zoom = 1.0;
+    a->sim_time = 0.0;
+    a->paused = false;
+    a->step_once = false;
+    a->sim_rate = 1.0;
+    a->cam_draw_armed = false;
+    a->cam_stroke = NULL;
+    a->cam_stroke_count = 0;
+    a->cam_stroke_capacity = 0;
+    a->path_tool = PATH_TOOL_NONE;
+    a->gallery_open = false;
+    a->gallery_page = 0;
+    a->help_open = false;
+    a->path_stroke = NULL;
+    a->path_stroke_count = 0;
+    a->path_stroke_capacity = 0;
+    a->path_ghost_count = 0;
+    a->path_ghost_closed = false;
+    a->current_path[0] = '\0';
+    a->dirty = false;
+    a->prompt.kind = PROMPT_NONE;
+    a->prompt.text[0] = '\0';
+    a->prompt.pending[0] = '\0';
+    a->window = win;
+    a->renderer = ren;
+    a->mouse_x = 0;
+    a->mouse_y = 0;
+    a->hover_since = 0;
+    a->running = true;
+    status_init(&a->status);
+    /* Everything -- app maths, SDL mouse coordinates, drawing -- stays in
+     * window POINTS, and the renderer scales that to whatever pixels the
+     * display actually has. That is what makes the window sharp on a Retina
+     * screen without a single coordinate conversion anywhere else. */
+    SDL_RenderSetLogicalSize(ren, win_w, win_h);
+    a->layout = layout_for(win_w, win_h);
+    ui_init(&a->toolbar, a->layout.win_h);
+    app_update_title(a);
+}
+
+static void app_shutdown(App *a) {
+    free(a->cam_stroke);
+    free(a->path_stroke);
+    free(a->pre_run_positions);
+    free(a->frame_positions);
+    free(a->frame_angles);
+    mechanism_free(&a->mech);
+    clear_stack(a->undo_stack, &a->undo_count);
+    clear_stack(a->redo_stack, &a->redo_count);
+}
+
+static void app_handle_event(App *a, const SDL_Event *ev) {
+    if (ev->type == SDL_TEXTINPUT) {
+        if (prompt_takes_typing(a->prompt.kind)) {
+            size_t len = strlen(a->prompt.text);
+            snprintf(a->prompt.text + len, sizeof a->prompt.text - len, "%s", ev->text.text);
+        }
+    } else if (a->prompt.kind != PROMPT_NONE &&
+                (ev->type == SDL_MOUSEBUTTONDOWN || ev->type == SDL_MOUSEBUTTONUP ||
+                 ev->type == SDL_MOUSEWHEEL)) {
+        /* The canvas is behind a question; clicking it would edit a
+         * mechanism the user cannot currently see the whole of. */
+    } else if (ev->type == SDL_QUIT) {
+        /* Unsaved work is not thrown away without being asked. */
+        if (a->dirty && a->prompt.kind != PROMPT_QUIT) {
+            prompt_open(a, PROMPT_QUIT, "THIS MECHANISM HAS UNSAVED CHANGES",
+                         "PRESS Y TO QUIT ANYWAY, ESC TO GO BACK AND SAVE IT", NULL);
+        } else {
+            a->running = false;
+        }
+    } else if (ev->type == SDL_WINDOWEVENT && ev->window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
+        int w = ev->window.data1, h = ev->window.data2;
+        SDL_RenderSetLogicalSize(a->renderer, w, h);
+        a->layout = layout_for(w, h);
+        ui_init(&a->toolbar, a->layout.win_h);
+    } else if (ev->type == SDL_MOUSEBUTTONDOWN && ev->button.button == SDL_BUTTON_MIDDLE) {
+        /* Panning works in every mode, including mid-run: it is the
+         * window moving, not the mechanism. */
+        a->drag_mode = DRAG_PAN;
+        a->pan_last_screen = (Vec2){ (double)ev->button.x, (double)ev->button.y };
+    } else if (ev->type == SDL_MOUSEBUTTONUP && ev->button.button == SDL_BUTTON_MIDDLE) {
+        if (a->drag_mode == DRAG_PAN) a->drag_mode = DRAG_NONE;
+    } else if (ev->type == SDL_MOUSEMOTION) {
+        a->mouse_x = ev->motion.x;
+        a->mouse_y = ev->motion.y;
+        if (a->drag_mode == DRAG_PAN) {
+            app_pan_by(a, ev->motion.x - a->pan_last_screen.x,
+                          ev->motion.y - a->pan_last_screen.y);
+            a->pan_last_screen = (Vec2){ (double)ev->motion.x, (double)ev->motion.y };
+        }
+        {
+            /* A tooltip waits for the cursor to settle, so sweeping
+             * down the strip doesn't flash a panel per button. */
+            int was = a->toolbar.hover;
+            a->toolbar.hover = ui_hit_test(&a->toolbar, ev->motion.x, ev->motion.y);
+            if (a->toolbar.hover != was) a->hover_since = SDL_GetTicks();
+        }
+        /* A drag can only have started on the canvas (the toolbar
+         * consumes its own press), so let it continue even if the
+         * cursor strays over the strip. */
+        if (a->state == APP_EDIT) {
+            Vec2 p = screen_to_world((Vec2){ (double)ev->motion.x, (double)ev->motion.y }, a->view_pan, a->view_zoom);
+            if (a->drag_mode == DRAG_MOVE_CONNECTORS) {
+                Vec2 delta = vec2_sub(p, a->drag_last);
+                /* Snapshot on the first real movement, not on the press:
+                 * a click that moves nothing leaves no history behind. */
+                if (!a->drag_pushed_undo && vec2_len(delta) > 0.0) {
+                    push_undo(a);
+                    a->drag_pushed_undo = true;
+                }
+                for (int i = 0; i < a->mech.connector_count; i++) {
+                    if (a->mech.connectors[i].alive && a->mech.connectors[i].selected) {
+                        a->mech.connectors[i].pos = vec2_add(a->mech.connectors[i].pos, delta);
+                    }
+                }
+                a->drag_last = p;
+            } else if (a->drag_mode == DRAG_PENDING_EMPTY) {
+                if (vec2_dist(p, a->drag_start) > DRAG_THRESHOLD / a->view_zoom) a->drag_mode = DRAG_BOX_SELECT;
+                a->drag_current = p;
+            } else if (a->drag_mode == DRAG_BOX_SELECT) {
+                a->drag_current = p;
+            } else if (a->drag_mode == DRAG_DRAW_CAM) {
+                stroke_push(&a->cam_stroke, &a->cam_stroke_count, &a->cam_stroke_capacity, p);
+            } else if (a->drag_mode == DRAG_DRAW_PATH) {
+                stroke_push(&a->path_stroke, &a->path_stroke_count, &a->path_stroke_capacity, p);
+            }
+        }
+    } else if (ev->type == SDL_MOUSEBUTTONDOWN && ev->button.button == SDL_BUTTON_LEFT &&
+                ui_contains(&a->toolbar, ev->button.x, ev->button.y)) {
+        /* Toolbar presses are handled in both edit and running mode. */
+        a->toolbar.pressed = ui_hit_test(&a->toolbar, ev->button.x, ev->button.y);
+    } else if (ev->type == SDL_MOUSEBUTTONUP && ev->button.button == SDL_BUTTON_LEFT &&
+                a->toolbar.pressed >= 0) {
+        int released_on = ui_hit_test(&a->toolbar, ev->button.x, ev->button.y);
+        const UiButton *b = &a->toolbar.buttons[a->toolbar.pressed];
+        /* Through app_try_action, so pressing a greyed-out button says
+         * what it wants rather than doing nothing at all. */
+        if (released_on == a->toolbar.pressed) app_try_action(a, b->action);
+        a->toolbar.pressed = -1;
+    } else if (ev->type == SDL_KEYDOWN) {
+        bool quitting = (a->prompt.kind == PROMPT_QUIT) &&
+                         (ev->key.keysym.sym == SDLK_y || ev->key.keysym.sym == SDLK_RETURN);
+        app_handle_key(a, &ev->key);
+        if (quitting) a->running = false;
+    } else if (ev->type == SDL_MOUSEWHEEL) {
+        int mx, my;
+        SDL_GetMouseState(&mx, &my);
+        if (!ui_contains(&a->toolbar, mx, my)) {
+            Vec2 screen_mouse = { (double)mx, (double)my };
+            Vec2 world_before = screen_to_world(screen_mouse, a->view_pan, a->view_zoom);
+
+            double factor = (ev->wheel.y > 0) ? ZOOM_STEP : 1.0 / ZOOM_STEP;
+            double new_zoom = a->view_zoom * factor;
+            if (new_zoom < ZOOM_MIN) new_zoom = ZOOM_MIN;
+            if (new_zoom > ZOOM_MAX) new_zoom = ZOOM_MAX;
+
+            a->view_pan.x = screen_mouse.x - world_before.x * new_zoom;
+            a->view_pan.y = screen_mouse.y - world_before.y * new_zoom;
+            a->view_zoom = new_zoom;
+        }
+    } else if (a->help_open && ev->type == SDL_MOUSEBUTTONDOWN &&
+                ev->button.button == SDL_BUTTON_LEFT) {
+        /* A click anywhere puts the key list away, rather than landing
+         * on the mechanism hidden behind it. */
+        a->help_open = false;
+    } else if (a->state == APP_EDIT && ev->type == SDL_MOUSEBUTTONDOWN && ev->button.button == SDL_BUTTON_LEFT &&
+                a->gallery_open) {
+        int tile = gallery_hit(a, ev->button.x, ev->button.y);
+        if (tile >= 0) app_insert_template(a, tile);
+        else a->gallery_open = false;   /* a click outside dismisses it */
+    } else if (a->state == APP_EDIT && ev->type == SDL_MOUSEBUTTONDOWN && ev->button.button == SDL_BUTTON_LEFT &&
+                a->path_tool != PATH_TOOL_NONE) {
+        Vec2 p = screen_to_world((Vec2){ (double)ev->button.x, (double)ev->button.y }, a->view_pan, a->view_zoom);
+        a->drag_mode = DRAG_DRAW_PATH;
+        a->drag_start = p;
+        a->path_stroke_count = 0;
+        a->path_ghost_count = 0;   /* the previous target, superseded */
+        stroke_push(&a->path_stroke, &a->path_stroke_count, &a->path_stroke_capacity, p);
+    } else if (a->state == APP_EDIT && ev->type == SDL_MOUSEBUTTONDOWN && ev->button.button == SDL_BUTTON_LEFT &&
+                a->cam_draw_armed) {
+        Vec2 p = screen_to_world((Vec2){ (double)ev->button.x, (double)ev->button.y }, a->view_pan, a->view_zoom);
+        a->drag_mode = DRAG_DRAW_CAM;
+        a->drag_start = p;
+        a->cam_stroke_count = 0;
+        stroke_push(&a->cam_stroke, &a->cam_stroke_count, &a->cam_stroke_capacity, p);
+    } else if (ev->type == SDL_MOUSEBUTTONDOWN && ev->button.button == SDL_BUTTON_LEFT) {
+        /* Selecting works while running too: you have to be able to
+         * point at the motor you want to speed up. Nothing that MOVES
+         * a part is allowed -- see `editing` below. */
+        bool editing = (a->state == APP_EDIT);
+        Vec2 p = screen_to_world((Vec2){ (double)ev->button.x, (double)ev->button.y }, a->view_pan, a->view_zoom);
+        bool shift = (SDL_GetModState() & KMOD_SHIFT) != 0;
+        /* Aim at what is drawn: at high zoom the dot is bigger than a
+         * flat ten-pixel target, and clicking it used to miss. */
+        double hit_px = fmax(CONNECTOR_HIT_RADIUS, handle_radius(a->view_zoom) + 2.0);
+        int hit_conn = mechanism_pick_connector(&a->mech, p, hit_px / a->view_zoom);
+        if (hit_conn >= 0) {
+            if (shift) {
+                a->mech.connectors[hit_conn].selected = !a->mech.connectors[hit_conn].selected;
+                a->drag_mode = DRAG_NONE;
+            } else {
+                if (!a->mech.connectors[hit_conn].selected) {
+                    clear_selection(&a->mech);
+                    a->mech.connectors[hit_conn].selected = true;
+                }
+                if (editing) {
+                    a->drag_mode = DRAG_MOVE_CONNECTORS;
+                    a->drag_pushed_undo = false;
+                    a->drag_last = p;
+                }
+            }
+        } else {
+            /* Bars first, then the joints drawn behind them: a cam
+             * outline, a pitch circle, a Geneva wheel, a slider rail.
+             * Picking one is how its proportions get edited. */
+            double jt = JOINT_HIT_DIST / a->view_zoom;
+            int hit_link = mechanism_pick_link_edge(&a->mech, p, LINK_EDGE_HIT_DIST / a->view_zoom);
+            int hit_cam = (hit_link >= 0) ? -1
+                            : mechanism_pick_cam(&a->mech, p, CAM_HIT_DIST / a->view_zoom);
+            /* A wheel is picked before a bar, since a bar crossing a
+             * wheel's face is the rarer thing to want. */
+            int hit_wheel = (hit_cam >= 0) ? -1 : mechanism_pick_wheel(&a->mech, p, jt);
+            if (hit_wheel >= 0) hit_link = -1;
+            int hit_gear = (hit_link >= 0 || hit_cam >= 0 || hit_wheel >= 0)
+                            ? -1 : mechanism_pick_gear(&a->mech, p, jt);
+            int hit_gen = (hit_link >= 0 || hit_cam >= 0 || hit_gear >= 0)
+                            ? -1 : mechanism_pick_geneva(&a->mech, p, jt);
+            int hit_slid = (hit_link >= 0 || hit_cam >= 0 || hit_gear >= 0 || hit_gen >= 0)
+                            ? -1 : mechanism_pick_slider(&a->mech, p, jt);
+            /* Shift extends the selection whatever was clicked. It
+             * used to do so only for pins and wheels, so the rule you
+             * learn meshing two wheels quietly failed on a bar. */
+            bool *flag = NULL;
+            if (hit_link >= 0)       flag = &a->mech.links[hit_link].selected;
+            else if (hit_cam >= 0)   flag = &a->mech.cams[hit_cam].selected;
+            else if (hit_wheel >= 0) flag = &a->mech.links[hit_wheel].selected;
+            else if (hit_gear >= 0)  flag = &a->mech.gears[hit_gear].selected;
+            else if (hit_gen >= 0)   flag = &a->mech.genevas[hit_gen].selected;
+            else if (hit_slid >= 0)  flag = &a->mech.sliders[hit_slid].selected;
+
+            if (flag) {
+                if (shift) {
+                    *flag = !*flag;
+                } else {
+                    clear_selection(&a->mech);
+                    *flag = true;
+                }
+                a->drag_mode = DRAG_NONE;
+            } else if (editing) {
+                a->drag_mode = DRAG_PENDING_EMPTY;
+                a->drag_start = p;
+                a->drag_current = p;
+            } else {
+                clear_selection(&a->mech);
+            }
+        }
+    } else if (a->state == APP_EDIT && ev->type == SDL_MOUSEBUTTONUP && ev->button.button == SDL_BUTTON_LEFT &&
+                a->drag_mode == DRAG_DRAW_PATH) {
+        if (a->path_tool == PATH_TOOL_LINKAGE) app_synthesize_linkage(a);
+        else app_synthesize_arms(a);
+        a->path_stroke_count = 0;
+        a->path_tool = PATH_TOOL_NONE;
+        a->drag_mode = DRAG_NONE;
+    } else if (a->state == APP_EDIT && ev->type == SDL_MOUSEBUTTONUP && ev->button.button == SDL_BUTTON_LEFT &&
+                a->drag_mode == DRAG_DRAW_CAM) {
+        if (a->cam_stroke_count >= 3) {
+            app_create_cam(a, a->cam_stroke, a->cam_stroke_count, a->drag_start);
+        } else {
+            /* A click rather than a drag: give them a working default
+             * cam right there instead of nothing. */
+            app_create_cam(a, NULL, 0, a->drag_start);
+        }
+        a->cam_stroke_count = 0;
+        a->cam_draw_armed = false;
+        a->drag_mode = DRAG_NONE;
+    } else if (a->state == APP_EDIT && ev->type == SDL_MOUSEBUTTONUP && ev->button.button == SDL_BUTTON_LEFT) {
+        if (a->drag_mode == DRAG_PENDING_EMPTY) {
+            push_undo(a);
+            clear_selection(&a->mech);
+            int id = mechanism_add_connector(&a->mech, a->drag_start, false);
+            a->mech.connectors[id].selected = true;
+        } else if (a->drag_mode == DRAG_BOX_SELECT) {
+            double x0 = fmin(a->drag_start.x, a->drag_current.x), x1 = fmax(a->drag_start.x, a->drag_current.x);
+            double y0 = fmin(a->drag_start.y, a->drag_current.y), y1 = fmax(a->drag_start.y, a->drag_current.y);
+            clear_selection(&a->mech);
+            for (int i = 0; i < a->mech.connector_count; i++) {
+                Connector *c = &a->mech.connectors[i];
+                if (c->alive && c->pos.x >= x0 && c->pos.x <= x1 && c->pos.y >= y0 && c->pos.y <= y1) {
+                    c->selected = true;
+                }
+            }
+            /* A body entirely inside the box is inside the box: drawing
+             * round a mechanism and pressing DELETE should take the
+             * bars with the pins. */
+            for (int li = 0; li < a->mech.link_count; li++) {
+                Link *l = &a->mech.links[li];
+                if (!l->alive) continue;
+                bool all_in = true;
+                for (int k = 0; k < l->connector_count && all_in; k++) {
+                    if (!a->mech.connectors[l->connector_ids[k]].selected) all_in = false;
+                }
+                if (all_in) l->selected = true;
+            }
+        }
+        a->drag_mode = DRAG_NONE;
+    }
+}
+
+/* One simulation step of `dt` real seconds. Does nothing to the mechanism
+ * unless it is running, un-jammed and not paused -- but still refreshes the
+ * joint sizes while editing, so what is drawn is what the solver would use. */
+static void app_step(App *a, double dt) {
+    if (a->state == APP_RUNNING && !a->jammed && (!a->paused || a->step_once)) {
+        if (dt > 0.05) dt = 0.05; /* clamp huge stalls (e.g. window drag) */
+        /* Paused-and-stepping advances one fixed frame; otherwise real
+         * time, scaled by whatever speed is set. */
+        dt = a->step_once ? SIM_STEP_DT : dt * a->sim_rate;
+        a->step_once = false;
+
+        for (int i = 0; i < a->pre_run_count; i++) a->frame_positions[i] = a->mech.connectors[i].pos;
+        for (int i = 0; i < a->frame_link_count; i++) a->frame_angles[i] = a->mech.links[i].accumulated_angle_rad;
+
+        SolverParams frame_params = a->params;
+        frame_params.gravity = effective_gravity(a);
+        solver_advance(&a->mech, dt, frame_params);
+
+        if (solver_has_length_violation(&a->mech, a->params.length_tol_abs, a->params.length_tol_rel)) {
+            /* This step would only be reachable by stretching a
+             * fixed-length link, so roll it back entirely and stop:
+             * a rigid link is rigid, so the mechanism binds instead. */
+            for (int i = 0; i < a->pre_run_count; i++) a->mech.connectors[i].pos = a->frame_positions[i];
+            for (int i = 0; i < a->frame_link_count; i++) a->mech.links[i].accumulated_angle_rad = a->frame_angles[i];
+            a->jammed = true;
+            /* A condition that is still true, not a moment that has
+             * passed: it stays up until the run is stopped or restarted. */
+            status_set_sticky(&a->status, STATUS_ERROR,
+                               "JAMMED: A FIXED-LENGTH LINK WOULD HAVE TO CHANGE LENGTH HERE");
+            app_message(a, STATUS_ERROR,
+                         "Mechanism jammed: a fixed-length link would have to change length here. "
+                         "Press STOP (or R), then adjust the geometry (or press VARY to let a "
+                         "link's length vary).");
+        } else {
+            a->sim_time += dt;
+            mechanism_trace_step(&a->mech, a->sim_time);
+        }
+    }
+
+    if (a->state == APP_EDIT) {
+        /* A joint's proportions are read off the geometry, so dragging a
+         * part while editing resizes it live -- the pitch circles you see
+         * are always the ones the solver will use. */
+        mechanism_refresh_joint_sizes(&a->mech);
+    }
+}
+
+/* Draws one whole frame into the renderer's back buffer. Does not present
+ * it: the caller decides whether the frame goes to a window or is read back
+ * as pixels. */
+static void app_draw(App *a) {
+    SDL_Renderer *ren = a->renderer;
+
+    ui_apply_state(&a->toolbar, app_ui_state(a));
+
+    SDL_SetRenderDrawColor(ren, 20, 20, 20, 255);
+    SDL_RenderClear(ren);
+
+    /* Keep the mechanism inside the canvas so long links can't draw over
+     * the toolbar. */
+    SDL_Rect canvas_clip = { a->layout.canvas.x, a->layout.canvas.y,
+                              a->layout.canvas.w, a->layout.canvas.h };
+    SDL_RenderSetClipRect(ren, &canvas_clip);
+    draw_mechanism(ren, &a->mech, a->drag_mode, a->drag_start, a->drag_current, a->view_pan, a->view_zoom);
+
+    /* The cam outline being drawn, closed back to its start so what you
+     * see is the shape that will actually be read. */
+    if (a->cam_stroke_count >= 2) {
+        for (int i = 1; i <= a->cam_stroke_count; i++) {
+            Vec2 a0 = world_to_screen(a->cam_stroke[i - 1], a->view_pan, a->view_zoom);
+            Vec2 a1 = world_to_screen(a->cam_stroke[i % a->cam_stroke_count], a->view_pan, a->view_zoom);
+            bool closing = (i == a->cam_stroke_count);
+            if (closing) render_line(ren, a0, a1, 120, 100, 150, 255);
+            else render_line(ren, a0, a1, 200, 175, 235, 255);
+        }
+    }
+    /* The path that was asked for, kept behind the result so the fit can
+     * be judged by eye. */
+    for (int i = 1; i < a->path_ghost_count; i++) {
+        render_line(ren, world_to_screen(a->path_ghost[i - 1], a->view_pan, a->view_zoom),
+                    world_to_screen(a->path_ghost[i], a->view_pan, a->view_zoom),
+                    95, 90, 120, 255);
+    }
+    if (a->path_ghost_closed && a->path_ghost_count > 2) {
+        render_line(ren, world_to_screen(a->path_ghost[a->path_ghost_count - 1], a->view_pan, a->view_zoom),
+                    world_to_screen(a->path_ghost[0], a->view_pan, a->view_zoom), 95, 90, 120, 255);
+    }
+
+    for (int i = 1; i < a->path_stroke_count; i++) {
+        render_line(ren, world_to_screen(a->path_stroke[i - 1], a->view_pan, a->view_zoom),
+                    world_to_screen(a->path_stroke[i], a->view_pan, a->view_zoom),
+                    150, 200, 255, 255);
+    }
+
+    /* What the simulation is doing right now. Paused used to look exactly
+     * like jammed, which looked exactly like a motor set to zero. */
+    if (a->state == APP_RUNNING && !a->jammed) {
+        char banner[96];
+        if (a->paused) snprintf(banner, sizeof banner, "PAUSED - SPACE RUNS ON, . STEPS");
+        else snprintf(banner, sizeof banner, "RUNNING AT %.2fX - < AND > CHANGE IT", a->sim_rate);
+        double bw = render_text_width(8.5, banner);
+        render_text(ren, (Vec2){ a->layout.canvas.x + a->layout.canvas.w - bw - 12.0, 12.0 },
+                    8.5, banner, a->paused ? 245 : 130, a->paused ? 195 : 200,
+                    a->paused ? 90 : 150, 255);
+    }
+
+    if (a->path_tool != PATH_TOOL_NONE) {
+        const char *hint = (a->path_tool == PATH_TOOL_LINKAGE)
+            ? "DRAW A PATH FOR A FOUR-BAR LINKAGE TO TRACE   ESC TO CANCEL"
+            : "DRAW ANY PATH FOR A CHAIN OF ARMS TO REDRAW   ESC TO CANCEL";
+        double w = render_text_width(9.0, hint);
+        render_text(ren, (Vec2){ a->layout.canvas.x + (a->layout.canvas.w - w) / 2.0, 16.0 },
+                    9.0, hint, 150, 200, 255, 255);
+    }
+    if (a->cam_draw_armed) {
+        const char *hint = "DRAG TO DRAW THE CAM OUTLINE   CLICK FOR A DEFAULT CAM   ESC TO CANCEL";
+        double w = render_text_width(9.0, hint);
+        render_text(ren, (Vec2){ a->layout.canvas.x + (a->layout.canvas.w - w) / 2.0, 16.0 },
+                    9.0, hint, 200, 175, 235, 255);
+    }
+    /* An empty canvas used to say nothing at all, with every instruction
+     * in a terminal the user may never have seen. */
+    if (!a->gallery_open && !a->help_open && a->prompt.kind == PROMPT_NONE &&
+        !mechanism_has_any_part(&a->mech)) {
+        const char *l1 = "CLICK TO PLACE A PIN, OR PRESS N FOR A GALLERY OF MECHANISMS";
+        const char *l2 = "PRESS H FOR EVERY KEY";
+        double w1 = render_text_width(10.0, l1), w2 = render_text_width(9.0, l2);
+        Vec2 mid = { a->layout.canvas.x + a->layout.canvas.w / 2.0,
+                      a->layout.canvas.y + a->layout.canvas.h / 2.0 };
+        render_text(ren, (Vec2){ mid.x - w1 / 2.0, mid.y - 14.0 }, 10.0, l1, 120, 126, 140, 255);
+        render_text(ren, (Vec2){ mid.x - w2 / 2.0, mid.y + 10.0 }, 9.0, l2, 100, 106, 120, 255);
+    }
+
+    if (a->gallery_open) {
+        UiRect panel = gallery_panel(a);
+        render_rect_filled(ren, panel, 24, 25, 30, 255);
+        render_rect_outline(ren, panel, 90, 95, 110, 255);
+        const char *title = "PICK A MECHANISM";
+        double tw = render_text_width(10.0, title);
+        render_text(ren, (Vec2){ panel.x + (panel.w - tw) / 2.0, panel.y + 8.0 }, 10.0, title,
+                    205, 210, 220, 255);
+        int first = gallery_page_first(a);
+        for (int i = first; i < first + gallery_page_size(a); i++) {
+            UiRect tile = gallery_tile(a, i);
+            bool hot = (gallery_hit(a, a->mouse_x, a->mouse_y) == i);
+            render_rect_filled(ren, tile, hot ? 44 : 34, hot ? 46 : 36, hot ? 54 : 42, 255);
+            render_rect_outline(ren, tile, hot ? 255 : 66, hot ? 225 : 70, hot ? 70 : 80, 255);
+            draw_template_preview(ren, i, tile, hot);
+        }
+        int pages = gallery_page_count(a);
+        if (pages > 1) {
+            char footer[64];
+            snprintf(footer, sizeof footer, "PAGE %d OF %d - ARROW KEYS TO TURN",
+                      a->gallery_page + 1, pages);
+            double fw = render_text_width(8.0, footer);
+            render_text(ren, (Vec2){ panel.x + (panel.w - fw) / 2.0,
+                                      panel.y + panel.h - GALLERY_FOOTER_H + 4.0 },
+                        8.0, footer, 150, 155, 168, 255);
+        }
+    }
+
+    if (a->help_open) draw_help(ren, a);
+
+    /* The prompt sits over the canvas: it is a question about the whole
+     * mechanism, not about any part of it. */
+    if (a->prompt.kind != PROMPT_NONE) {
+        UiRect canvas = a->layout.canvas;
+        int w = canvas.w - 120; if (w > 640) w = 640; if (w < 240) w = 240;
+        UiRect panel = { canvas.x + (canvas.w - w) / 2, canvas.y + canvas.h / 3, w, 104 };
+        render_rect_filled(ren, panel, 26, 27, 33, 245);
+        render_rect_outline(ren, panel, 120, 130, 155, 255);
+
+        double tw = render_text_width(10.0, a->prompt.title);
+        render_text(ren, (Vec2){ panel.x + (panel.w - tw) / 2.0, panel.y + 14.0 },
+                    10.0, a->prompt.title, 215, 220, 232, 255);
+
+        if (prompt_takes_typing(a->prompt.kind)) {
+            /* The typed name, with a caret blinking on the end of it. */
+            UiRect field = { panel.x + 16, panel.y + 40, panel.w - 32, 26 };
+            render_rect_filled(ren, field, 16, 17, 21, 255);
+            render_rect_outline(ren, field, 80, 86, 100, 255);
+            double text_w = render_text_width(10.0, a->prompt.text);
+            double x = field.x + 8.0;
+            if (text_w > field.w - 16.0) x -= (text_w - (field.w - 16.0));  /* scroll left */
+            render_text(ren, (Vec2){ x, field.y + 8.0 }, 10.0, a->prompt.text,
+                        235, 238, 245, 255);
+            if ((SDL_GetTicks() / 500) % 2 == 0) {
+                double cx = x + text_w + 2.0;
+                render_line(ren, (Vec2){ cx, field.y + 6.0 }, (Vec2){ cx, field.y + 20.0 },
+                            235, 238, 245, 255);
+            }
+        }
+
+        double hw = render_text_width(8.0, a->prompt.hint);
+        render_text(ren, (Vec2){ panel.x + (panel.w - hw) / 2.0, panel.y + panel.h - 22.0 },
+                    8.0, a->prompt.hint, 150, 156, 170, 255);
+    }
+
+    SDL_RenderSetClipRect(ren, NULL);
+
+    render_status(ren, &a->status, a->layout.canvas, SDL_GetTicks());
+    render_plot(ren, &a->mech, a->layout.plot);
+    render_toolbar(ren, &a->toolbar, a->layout.win_h);
+    /* Last of all, so it sits over the canvas and the panels. */
+    if (a->toolbar.hover >= 0 && a->toolbar.hover < a->toolbar.count &&
+        SDL_GetTicks() - a->hover_since > TOOLTIP_DELAY_MS) {
+        const UiButton *hb = &a->toolbar.buttons[a->toolbar.hover];
+        render_tooltip(ren, hb->rect, hb->tip, a->layout.win_w, a->layout.win_h);
+    }
+}
+
+/* ---------------------------------------------------------------------
+ * Offscreen capture: --capture <template> <frames> <dir>
+ *
+ * Renders a template mechanism running, through exactly the drawing code
+ * above, into <dir>/frame_000.bmp... with no window on screen. It exists so
+ * the screenshots and the animation in the README are generated from the
+ * program rather than kept by hand, and can be regenerated whenever the
+ * drawing changes. `make docs-images` wraps it up with ffmpeg.
+ * ------------------------------------------------------------------- */
+
+#define CAPTURE_W 1180
+#define CAPTURE_H 820
+#define CAPTURE_DT (1.0 / 60.0)
+#define CAPTURE_SETTLE_FRAMES 2   /* let the first solve land before recording */
+
+static int capture_template_index(const char *name) {
+    for (int i = 0; i < templates_count(); i++) {
+        const char *n = templates_get(i)->name;
+        /* Case-insensitively, and ignoring spaces, so "watt" finds "Watt's
+         * Linkage" and the caller need not quote anything. */
+        int a = 0, b = 0;
+        while (n[a] && name[b]) {
+            if (n[a] == ' ') { a++; continue; }
+            if (name[b] == ' ') { b++; continue; }
+            if (tolower((unsigned char)n[a]) != tolower((unsigned char)name[b])) break;
+            a++; b++;
+        }
+        while (name[b] == ' ') b++;
+        if (name[b] == '\0') return i;
+    }
+    return -1;
+}
+
+/* Frames the whole motion, not the starting pose.
+ *
+ * app_fit_view fits where the parts are NOW, which for a running mechanism
+ * means the coupler swings out of shot a few frames in. So rehearse the
+ * sequence, note the envelope every part sweeps through, rewind, and set the
+ * view from that. Rewinding is exactly what STOP then RUN does, so the
+ * captured run starts from the same pose as an un-rehearsed one. */
+static void capture_frame_the_motion(App *a, int frames) {
+    double x0 = 1e30, y0 = 1e30, x1 = -1e30, y1 = -1e30;
+    bool any = false;
+
+    for (int f = 0; f < frames; f++) {
+        app_step(a, CAPTURE_DT);
+        for (int i = 0; i < a->mech.connector_count; i++) {
+            if (!a->mech.connectors[i].alive) continue;
+            Vec2 p = a->mech.connectors[i].pos;
+            /* A wheel reaches a radius beyond its centre; a pin reaches
+             * nothing, and its radius is zero. */
+            double r = 0.0;
+            for (int li = 0; li < a->mech.link_count; li++) {
+                const Link *l = &a->mech.links[li];
+                if (l->alive && l->wheel_radius > r && l->pivot_connector_id == i) r = l->wheel_radius;
+            }
+            if (p.x - r < x0) x0 = p.x - r;
+            if (p.y - r < y0) y0 = p.y - r;
+            if (p.x + r > x1) x1 = p.x + r;
+            if (p.y + r > y1) y1 = p.y + r;
+            any = true;
+        }
+    }
+
+    app_stop_run(a);
+    app_start_run(a);
+    /* The insertion message and anything the rehearsal said would otherwise
+     * sit in the corner of every frame: the capture starts on a clean canvas. */
+    status_init(&a->status);
+
+    if (!any) return;
+
+    const double margin = 50.0;
+    double w = (x1 - x0) + 2 * margin, h = (y1 - y0) + 2 * margin;
+    if (w < 1.0) w = 1.0;
+    if (h < 1.0) h = 1.0;
+    double zoom = fmin((double)a->layout.canvas.w / w, (double)a->layout.canvas.h / h);
+    if (zoom > ZOOM_MAX) zoom = ZOOM_MAX;
+    if (zoom < ZOOM_MIN) zoom = ZOOM_MIN;
+    a->view_zoom = zoom;
+    Vec2 mid = { (x0 + x1) / 2.0, (y0 + y1) / 2.0 };
+    Vec2 centre = rect_centre(a->layout.canvas);
+    a->view_pan.x = centre.x - mid.x * zoom;
+    a->view_pan.y = centre.y - mid.y * zoom;
+}
+
+static void capture_list_templates(void) {
+    fprintf(stderr, "Templates:\n");
+    for (int i = 0; i < templates_count(); i++) {
+        fprintf(stderr, "  %s\n", templates_get(i)->name);
+    }
+}
+
+static int run_capture(const char *template_name, int frames, const char *dir) {
+    int index = capture_template_index(template_name);
+    if (index < 0) {
+        fprintf(stderr, "--capture: no template called \"%s\".\n", template_name);
+        capture_list_templates();
+        return 1;
+    }
+    if (frames < 1) frames = 1;
+
+    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+        fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
+        return 1;
+    }
+    /* Hidden, so this can run over ssh or in CI without stealing focus, and
+     * software-rendered, so the pixels are the same on every machine. */
+    SDL_Window *win = SDL_CreateWindow("Linkage Design", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                                        CAPTURE_W, CAPTURE_H, SDL_WINDOW_HIDDEN);
+    if (!win) {
+        fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
+        SDL_Quit();
+        return 1;
+    }
+    SDL_Renderer *ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_SOFTWARE);
+    if (!ren) {
+        fprintf(stderr, "SDL_CreateRenderer failed: %s\n", SDL_GetError());
+        SDL_DestroyWindow(win);
+        SDL_Quit();
+        return 1;
+    }
+
+    App app;
+    app_init(&app, win, ren, CAPTURE_W, CAPTURE_H);
+    app_insert_template(&app, index);
+    app_fit_view(&app, true);
+    app_start_run(&app);
+    capture_frame_the_motion(&app, frames + CAPTURE_SETTLE_FRAMES);
+
+    SDL_Surface *shot = SDL_CreateRGBSurfaceWithFormat(0, CAPTURE_W, CAPTURE_H, 32, SDL_PIXELFORMAT_ARGB8888);
+    int written = 0;
+    if (!shot) {
+        fprintf(stderr, "SDL_CreateRGBSurface failed: %s\n", SDL_GetError());
+    } else {
+        for (int f = 0; f < frames + CAPTURE_SETTLE_FRAMES; f++) {
+            app_step(&app, CAPTURE_DT);
+            app_draw(&app);
+            if (f < CAPTURE_SETTLE_FRAMES) continue;
+
+            if (SDL_RenderReadPixels(ren, NULL, SDL_PIXELFORMAT_ARGB8888,
+                                      shot->pixels, shot->pitch) != 0) {
+                fprintf(stderr, "SDL_RenderReadPixels failed: %s\n", SDL_GetError());
+                break;
+            }
+            char path[APP_PATH_MAX];
+            snprintf(path, sizeof path, "%s/frame_%03d.bmp", dir, f - CAPTURE_SETTLE_FRAMES);
+            if (SDL_SaveBMP(shot, path) != 0) {
+                fprintf(stderr, "could not write %s: %s\n", path, SDL_GetError());
+                break;
+            }
+            written++;
+        }
+        SDL_FreeSurface(shot);
+    }
+
+    printf("captured %d frame(s) of \"%s\" into %s\n", written, templates_get(index)->name, dir);
+
+    app_shutdown(&app);
+    SDL_DestroyRenderer(ren);
+    SDL_DestroyWindow(win);
+    SDL_Quit();
+    return (written == frames) ? 0 : 1;
+}
+
+static void print_usage(const char *argv0) {
+    fprintf(stderr,
+        "usage: %s                                    run the editor\n"
+        "       %s --capture <template> <n> <dir>     render n frames of a template to <dir>\n"
+        "       %s --list-templates                   name every template\n",
+        argv0, argv0, argv0);
+}
+
+int main(int argc, char **argv) {
     /* Line-buffer stdout so the running commentary still appears in order
      * when it is redirected to a file, not just when it goes to a terminal. */
     setvbuf(stdout, NULL, _IOLBF, 0);
+
+    if (argc > 1) {
+        if (strcmp(argv[1], "--list-templates") == 0) {
+            capture_list_templates();
+            return 0;
+        }
+        if (strcmp(argv[1], "--capture") == 0) {
+            if (argc != 5) { print_usage(argv[0]); return 2; }
+            return run_capture(argv[2], atoi(argv[3]), argv[4]);
+        }
+        print_usage(argv[0]);
+        return 2;
+    }
 
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
@@ -2494,537 +3240,25 @@ int main(void) {
     printf("  Anything the program has to say now appears on the canvas as well as here.\n");
 
     App app;
-    mechanism_init(&app.mech);
-    app.params = solver_default_params();
-    app.gravity_set_by_user = false;
-    app.undo_count = 0;
-    app.redo_count = 0;
-    app.state = APP_EDIT;
-    app.drag_mode = DRAG_NONE;
-    app.drag_start = app.drag_last = app.drag_current = (Vec2){ 0, 0 };
-    app.pan_last_screen = (Vec2){ 0, 0 };
-    app.drag_pushed_undo = false;
-    app.pre_run_positions = NULL;
-    app.pre_run_count = 0;
-    app.frame_positions = NULL;
-    app.frame_angles = NULL;
-    app.frame_link_count = 0;
-    app.jammed = false;
-    app.view_pan = (Vec2){ UI_TOOLBAR_W, 0 };
-    app.view_zoom = 1.0;
-    app.sim_time = 0.0;
-    app.paused = false;
-    app.step_once = false;
-    app.sim_rate = 1.0;
-    app.cam_draw_armed = false;
-    app.cam_stroke = NULL;
-    app.cam_stroke_count = 0;
-    app.cam_stroke_capacity = 0;
-    app.path_tool = PATH_TOOL_NONE;
-    app.gallery_open = false;
-    app.gallery_page = 0;
-    app.help_open = false;
-    app.path_stroke = NULL;
-    app.path_stroke_count = 0;
-    app.path_stroke_capacity = 0;
-    app.path_ghost_count = 0;
-    app.path_ghost_closed = false;
-    app.current_path[0] = '\0';
-    app.dirty = false;
-    app.prompt.kind = PROMPT_NONE;
-    app.prompt.text[0] = '\0';
-    app.prompt.pending[0] = '\0';
-    app.window = win;
-    status_init(&app.status);
-    /* Everything -- app maths, SDL mouse coordinates, drawing -- stays in
-     * window POINTS, and the renderer scales that to whatever pixels the
-     * display actually has. That is what makes the window sharp on a Retina
-     * screen without a single coordinate conversion anywhere else. */
-    SDL_RenderSetLogicalSize(ren, start_w, start_h);
-    app.layout = layout_for(start_w, start_h);
-    ui_init(&app.toolbar, app.layout.win_h);
-    app_update_title(&app);
+    app_init(&app, win, ren, start_w, start_h);
 
-    Uint32 hover_since = 0;   /* when the cursor settled on the hovered button */
-    int mouse_x = 0, mouse_y = 0;
     Uint32 last_ticks = SDL_GetTicks();
-    bool running = true;
-
-    while (running) {
+    while (app.running) {
         SDL_Event ev;
-        while (SDL_PollEvent(&ev)) {
-            if (ev.type == SDL_TEXTINPUT) {
-                if (prompt_takes_typing(app.prompt.kind)) {
-                    size_t len = strlen(app.prompt.text);
-                    snprintf(app.prompt.text + len, sizeof app.prompt.text - len, "%s", ev.text.text);
-                }
-            } else if (app.prompt.kind != PROMPT_NONE &&
-                        (ev.type == SDL_MOUSEBUTTONDOWN || ev.type == SDL_MOUSEBUTTONUP ||
-                         ev.type == SDL_MOUSEWHEEL)) {
-                /* The canvas is behind a question; clicking it would edit a
-                 * mechanism the user cannot currently see the whole of. */
-            } else if (ev.type == SDL_QUIT) {
-                /* Unsaved work is not thrown away without being asked. */
-                if (app.dirty && app.prompt.kind != PROMPT_QUIT) {
-                    prompt_open(&app, PROMPT_QUIT, "THIS MECHANISM HAS UNSAVED CHANGES",
-                                 "PRESS Y TO QUIT ANYWAY, ESC TO GO BACK AND SAVE IT", NULL);
-                } else {
-                    running = false;
-                }
-            } else if (ev.type == SDL_WINDOWEVENT && ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
-                int w = ev.window.data1, h = ev.window.data2;
-                SDL_RenderSetLogicalSize(ren, w, h);
-                app.layout = layout_for(w, h);
-                ui_init(&app.toolbar, app.layout.win_h);
-            } else if (ev.type == SDL_MOUSEBUTTONDOWN && ev.button.button == SDL_BUTTON_MIDDLE) {
-                /* Panning works in every mode, including mid-run: it is the
-                 * window moving, not the mechanism. */
-                app.drag_mode = DRAG_PAN;
-                app.pan_last_screen = (Vec2){ (double)ev.button.x, (double)ev.button.y };
-            } else if (ev.type == SDL_MOUSEBUTTONUP && ev.button.button == SDL_BUTTON_MIDDLE) {
-                if (app.drag_mode == DRAG_PAN) app.drag_mode = DRAG_NONE;
-            } else if (ev.type == SDL_MOUSEMOTION) {
-                mouse_x = ev.motion.x;
-                mouse_y = ev.motion.y;
-                if (app.drag_mode == DRAG_PAN) {
-                    app_pan_by(&app, ev.motion.x - app.pan_last_screen.x,
-                                      ev.motion.y - app.pan_last_screen.y);
-                    app.pan_last_screen = (Vec2){ (double)ev.motion.x, (double)ev.motion.y };
-                }
-                {
-                    /* A tooltip waits for the cursor to settle, so sweeping
-                     * down the strip doesn't flash a panel per button. */
-                    int was = app.toolbar.hover;
-                    app.toolbar.hover = ui_hit_test(&app.toolbar, ev.motion.x, ev.motion.y);
-                    if (app.toolbar.hover != was) hover_since = SDL_GetTicks();
-                }
-                /* A drag can only have started on the canvas (the toolbar
-                 * consumes its own press), so let it continue even if the
-                 * cursor strays over the strip. */
-                if (app.state == APP_EDIT) {
-                    Vec2 p = screen_to_world((Vec2){ (double)ev.motion.x, (double)ev.motion.y }, app.view_pan, app.view_zoom);
-                    if (app.drag_mode == DRAG_MOVE_CONNECTORS) {
-                        Vec2 delta = vec2_sub(p, app.drag_last);
-                        /* Snapshot on the first real movement, not on the press:
-                         * a click that moves nothing leaves no history behind. */
-                        if (!app.drag_pushed_undo && vec2_len(delta) > 0.0) {
-                            push_undo(&app);
-                            app.drag_pushed_undo = true;
-                        }
-                        for (int i = 0; i < app.mech.connector_count; i++) {
-                            if (app.mech.connectors[i].alive && app.mech.connectors[i].selected) {
-                                app.mech.connectors[i].pos = vec2_add(app.mech.connectors[i].pos, delta);
-                            }
-                        }
-                        app.drag_last = p;
-                    } else if (app.drag_mode == DRAG_PENDING_EMPTY) {
-                        if (vec2_dist(p, app.drag_start) > DRAG_THRESHOLD / app.view_zoom) app.drag_mode = DRAG_BOX_SELECT;
-                        app.drag_current = p;
-                    } else if (app.drag_mode == DRAG_BOX_SELECT) {
-                        app.drag_current = p;
-                    } else if (app.drag_mode == DRAG_DRAW_CAM) {
-                        stroke_push(&app.cam_stroke, &app.cam_stroke_count, &app.cam_stroke_capacity, p);
-                    } else if (app.drag_mode == DRAG_DRAW_PATH) {
-                        stroke_push(&app.path_stroke, &app.path_stroke_count, &app.path_stroke_capacity, p);
-                    }
-                }
-            } else if (ev.type == SDL_MOUSEBUTTONDOWN && ev.button.button == SDL_BUTTON_LEFT &&
-                        ui_contains(&app.toolbar, ev.button.x, ev.button.y)) {
-                /* Toolbar presses are handled in both edit and running mode. */
-                app.toolbar.pressed = ui_hit_test(&app.toolbar, ev.button.x, ev.button.y);
-            } else if (ev.type == SDL_MOUSEBUTTONUP && ev.button.button == SDL_BUTTON_LEFT &&
-                        app.toolbar.pressed >= 0) {
-                int released_on = ui_hit_test(&app.toolbar, ev.button.x, ev.button.y);
-                const UiButton *b = &app.toolbar.buttons[app.toolbar.pressed];
-                /* Through app_try_action, so pressing a greyed-out button says
-                 * what it wants rather than doing nothing at all. */
-                if (released_on == app.toolbar.pressed) app_try_action(&app, b->action);
-                app.toolbar.pressed = -1;
-            } else if (ev.type == SDL_KEYDOWN) {
-                bool quitting = (app.prompt.kind == PROMPT_QUIT) &&
-                                 (ev.key.keysym.sym == SDLK_y || ev.key.keysym.sym == SDLK_RETURN);
-                app_handle_key(&app, &ev.key);
-                if (quitting) running = false;
-            } else if (ev.type == SDL_MOUSEWHEEL) {
-                int mx, my;
-                SDL_GetMouseState(&mx, &my);
-                if (!ui_contains(&app.toolbar, mx, my)) {
-                    Vec2 screen_mouse = { (double)mx, (double)my };
-                    Vec2 world_before = screen_to_world(screen_mouse, app.view_pan, app.view_zoom);
-
-                    double factor = (ev.wheel.y > 0) ? ZOOM_STEP : 1.0 / ZOOM_STEP;
-                    double new_zoom = app.view_zoom * factor;
-                    if (new_zoom < ZOOM_MIN) new_zoom = ZOOM_MIN;
-                    if (new_zoom > ZOOM_MAX) new_zoom = ZOOM_MAX;
-
-                    app.view_pan.x = screen_mouse.x - world_before.x * new_zoom;
-                    app.view_pan.y = screen_mouse.y - world_before.y * new_zoom;
-                    app.view_zoom = new_zoom;
-                }
-            } else if (app.help_open && ev.type == SDL_MOUSEBUTTONDOWN &&
-                        ev.button.button == SDL_BUTTON_LEFT) {
-                /* A click anywhere puts the key list away, rather than landing
-                 * on the mechanism hidden behind it. */
-                app.help_open = false;
-            } else if (app.state == APP_EDIT && ev.type == SDL_MOUSEBUTTONDOWN && ev.button.button == SDL_BUTTON_LEFT &&
-                        app.gallery_open) {
-                int tile = gallery_hit(&app, ev.button.x, ev.button.y);
-                if (tile >= 0) app_insert_template(&app, tile);
-                else app.gallery_open = false;   /* a click outside dismisses it */
-            } else if (app.state == APP_EDIT && ev.type == SDL_MOUSEBUTTONDOWN && ev.button.button == SDL_BUTTON_LEFT &&
-                        app.path_tool != PATH_TOOL_NONE) {
-                Vec2 p = screen_to_world((Vec2){ (double)ev.button.x, (double)ev.button.y }, app.view_pan, app.view_zoom);
-                app.drag_mode = DRAG_DRAW_PATH;
-                app.drag_start = p;
-                app.path_stroke_count = 0;
-                app.path_ghost_count = 0;   /* the previous target, superseded */
-                stroke_push(&app.path_stroke, &app.path_stroke_count, &app.path_stroke_capacity, p);
-            } else if (app.state == APP_EDIT && ev.type == SDL_MOUSEBUTTONDOWN && ev.button.button == SDL_BUTTON_LEFT &&
-                        app.cam_draw_armed) {
-                Vec2 p = screen_to_world((Vec2){ (double)ev.button.x, (double)ev.button.y }, app.view_pan, app.view_zoom);
-                app.drag_mode = DRAG_DRAW_CAM;
-                app.drag_start = p;
-                app.cam_stroke_count = 0;
-                stroke_push(&app.cam_stroke, &app.cam_stroke_count, &app.cam_stroke_capacity, p);
-            } else if (ev.type == SDL_MOUSEBUTTONDOWN && ev.button.button == SDL_BUTTON_LEFT) {
-                /* Selecting works while running too: you have to be able to
-                 * point at the motor you want to speed up. Nothing that MOVES
-                 * a part is allowed -- see `editing` below. */
-                bool editing = (app.state == APP_EDIT);
-                Vec2 p = screen_to_world((Vec2){ (double)ev.button.x, (double)ev.button.y }, app.view_pan, app.view_zoom);
-                bool shift = (SDL_GetModState() & KMOD_SHIFT) != 0;
-                /* Aim at what is drawn: at high zoom the dot is bigger than a
-                 * flat ten-pixel target, and clicking it used to miss. */
-                double hit_px = fmax(CONNECTOR_HIT_RADIUS, handle_radius(app.view_zoom) + 2.0);
-                int hit_conn = mechanism_pick_connector(&app.mech, p, hit_px / app.view_zoom);
-                if (hit_conn >= 0) {
-                    if (shift) {
-                        app.mech.connectors[hit_conn].selected = !app.mech.connectors[hit_conn].selected;
-                        app.drag_mode = DRAG_NONE;
-                    } else {
-                        if (!app.mech.connectors[hit_conn].selected) {
-                            clear_selection(&app.mech);
-                            app.mech.connectors[hit_conn].selected = true;
-                        }
-                        if (editing) {
-                            app.drag_mode = DRAG_MOVE_CONNECTORS;
-                            app.drag_pushed_undo = false;
-                            app.drag_last = p;
-                        }
-                    }
-                } else {
-                    /* Bars first, then the joints drawn behind them: a cam
-                     * outline, a pitch circle, a Geneva wheel, a slider rail.
-                     * Picking one is how its proportions get edited. */
-                    double jt = JOINT_HIT_DIST / app.view_zoom;
-                    int hit_link = mechanism_pick_link_edge(&app.mech, p, LINK_EDGE_HIT_DIST / app.view_zoom);
-                    int hit_cam = (hit_link >= 0) ? -1
-                                    : mechanism_pick_cam(&app.mech, p, CAM_HIT_DIST / app.view_zoom);
-                    /* A wheel is picked before a bar, since a bar crossing a
-                     * wheel's face is the rarer thing to want. */
-                    int hit_wheel = (hit_cam >= 0) ? -1 : mechanism_pick_wheel(&app.mech, p, jt);
-                    if (hit_wheel >= 0) hit_link = -1;
-                    int hit_gear = (hit_link >= 0 || hit_cam >= 0 || hit_wheel >= 0)
-                                    ? -1 : mechanism_pick_gear(&app.mech, p, jt);
-                    int hit_gen = (hit_link >= 0 || hit_cam >= 0 || hit_gear >= 0)
-                                    ? -1 : mechanism_pick_geneva(&app.mech, p, jt);
-                    int hit_slid = (hit_link >= 0 || hit_cam >= 0 || hit_gear >= 0 || hit_gen >= 0)
-                                    ? -1 : mechanism_pick_slider(&app.mech, p, jt);
-                    /* Shift extends the selection whatever was clicked. It
-                     * used to do so only for pins and wheels, so the rule you
-                     * learn meshing two wheels quietly failed on a bar. */
-                    bool *flag = NULL;
-                    if (hit_link >= 0)       flag = &app.mech.links[hit_link].selected;
-                    else if (hit_cam >= 0)   flag = &app.mech.cams[hit_cam].selected;
-                    else if (hit_wheel >= 0) flag = &app.mech.links[hit_wheel].selected;
-                    else if (hit_gear >= 0)  flag = &app.mech.gears[hit_gear].selected;
-                    else if (hit_gen >= 0)   flag = &app.mech.genevas[hit_gen].selected;
-                    else if (hit_slid >= 0)  flag = &app.mech.sliders[hit_slid].selected;
-
-                    if (flag) {
-                        if (shift) {
-                            *flag = !*flag;
-                        } else {
-                            clear_selection(&app.mech);
-                            *flag = true;
-                        }
-                        app.drag_mode = DRAG_NONE;
-                    } else if (editing) {
-                        app.drag_mode = DRAG_PENDING_EMPTY;
-                        app.drag_start = p;
-                        app.drag_current = p;
-                    } else {
-                        clear_selection(&app.mech);
-                    }
-                }
-            } else if (app.state == APP_EDIT && ev.type == SDL_MOUSEBUTTONUP && ev.button.button == SDL_BUTTON_LEFT &&
-                        app.drag_mode == DRAG_DRAW_PATH) {
-                if (app.path_tool == PATH_TOOL_LINKAGE) app_synthesize_linkage(&app);
-                else app_synthesize_arms(&app);
-                app.path_stroke_count = 0;
-                app.path_tool = PATH_TOOL_NONE;
-                app.drag_mode = DRAG_NONE;
-            } else if (app.state == APP_EDIT && ev.type == SDL_MOUSEBUTTONUP && ev.button.button == SDL_BUTTON_LEFT &&
-                        app.drag_mode == DRAG_DRAW_CAM) {
-                if (app.cam_stroke_count >= 3) {
-                    app_create_cam(&app, app.cam_stroke, app.cam_stroke_count, app.drag_start);
-                } else {
-                    /* A click rather than a drag: give them a working default
-                     * cam right there instead of nothing. */
-                    app_create_cam(&app, NULL, 0, app.drag_start);
-                }
-                app.cam_stroke_count = 0;
-                app.cam_draw_armed = false;
-                app.drag_mode = DRAG_NONE;
-            } else if (app.state == APP_EDIT && ev.type == SDL_MOUSEBUTTONUP && ev.button.button == SDL_BUTTON_LEFT) {
-                if (app.drag_mode == DRAG_PENDING_EMPTY) {
-                    push_undo(&app);
-                    clear_selection(&app.mech);
-                    int id = mechanism_add_connector(&app.mech, app.drag_start, false);
-                    app.mech.connectors[id].selected = true;
-                } else if (app.drag_mode == DRAG_BOX_SELECT) {
-                    double x0 = fmin(app.drag_start.x, app.drag_current.x), x1 = fmax(app.drag_start.x, app.drag_current.x);
-                    double y0 = fmin(app.drag_start.y, app.drag_current.y), y1 = fmax(app.drag_start.y, app.drag_current.y);
-                    clear_selection(&app.mech);
-                    for (int i = 0; i < app.mech.connector_count; i++) {
-                        Connector *c = &app.mech.connectors[i];
-                        if (c->alive && c->pos.x >= x0 && c->pos.x <= x1 && c->pos.y >= y0 && c->pos.y <= y1) {
-                            c->selected = true;
-                        }
-                    }
-                    /* A body entirely inside the box is inside the box: drawing
-                     * round a mechanism and pressing DELETE should take the
-                     * bars with the pins. */
-                    for (int li = 0; li < app.mech.link_count; li++) {
-                        Link *l = &app.mech.links[li];
-                        if (!l->alive) continue;
-                        bool all_in = true;
-                        for (int k = 0; k < l->connector_count && all_in; k++) {
-                            if (!app.mech.connectors[l->connector_ids[k]].selected) all_in = false;
-                        }
-                        if (all_in) l->selected = true;
-                    }
-                }
-                app.drag_mode = DRAG_NONE;
-            }
-        }
+        while (SDL_PollEvent(&ev)) app_handle_event(&app, &ev);
 
         Uint32 now = SDL_GetTicks();
         double dt = (double)(now - last_ticks) / 1000.0;
         last_ticks = now;
 
-        if (app.state == APP_RUNNING && !app.jammed && (!app.paused || app.step_once)) {
-            if (dt > 0.05) dt = 0.05; /* clamp huge stalls (e.g. window drag) */
-            /* Paused-and-stepping advances one fixed frame; otherwise real
-             * time, scaled by whatever speed is set. */
-            dt = app.step_once ? SIM_STEP_DT : dt * app.sim_rate;
-            app.step_once = false;
-
-            for (int i = 0; i < app.pre_run_count; i++) app.frame_positions[i] = app.mech.connectors[i].pos;
-            for (int i = 0; i < app.frame_link_count; i++) app.frame_angles[i] = app.mech.links[i].accumulated_angle_rad;
-
-            SolverParams frame_params = app.params;
-            frame_params.gravity = effective_gravity(&app);
-            solver_advance(&app.mech, dt, frame_params);
-
-            if (solver_has_length_violation(&app.mech, app.params.length_tol_abs, app.params.length_tol_rel)) {
-                /* This step would only be reachable by stretching a
-                 * fixed-length link, so roll it back entirely and stop:
-                 * a rigid link is rigid, so the mechanism binds instead. */
-                for (int i = 0; i < app.pre_run_count; i++) app.mech.connectors[i].pos = app.frame_positions[i];
-                for (int i = 0; i < app.frame_link_count; i++) app.mech.links[i].accumulated_angle_rad = app.frame_angles[i];
-                app.jammed = true;
-                /* A condition that is still true, not a moment that has
-                 * passed: it stays up until the run is stopped or restarted. */
-                status_set_sticky(&app.status, STATUS_ERROR,
-                                   "JAMMED: A FIXED-LENGTH LINK WOULD HAVE TO CHANGE LENGTH HERE");
-                app_message(&app, STATUS_ERROR,
-                             "Mechanism jammed: a fixed-length link would have to change length here. "
-                             "Press STOP (or R), then adjust the geometry (or press VARY to let a "
-                             "link's length vary).");
-            } else {
-                app.sim_time += dt;
-                mechanism_trace_step(&app.mech, app.sim_time);
-            }
-        }
-
-        if (app.state == APP_EDIT) {
-            /* A joint's proportions are read off the geometry, so dragging a
-             * part while editing resizes it live -- the pitch circles you see
-             * are always the ones the solver will use. */
-            mechanism_refresh_joint_sizes(&app.mech);
-        }
-
-        ui_apply_state(&app.toolbar, app_ui_state(&app));
-
-        SDL_SetRenderDrawColor(ren, 20, 20, 20, 255);
-        SDL_RenderClear(ren);
-
-        /* Keep the mechanism inside the canvas so long links can't draw over
-         * the toolbar. */
-        SDL_Rect canvas_clip = { app.layout.canvas.x, app.layout.canvas.y,
-                                  app.layout.canvas.w, app.layout.canvas.h };
-        SDL_RenderSetClipRect(ren, &canvas_clip);
-        draw_mechanism(ren, &app.mech, app.drag_mode, app.drag_start, app.drag_current, app.view_pan, app.view_zoom);
-
-        /* The cam outline being drawn, closed back to its start so what you
-         * see is the shape that will actually be read. */
-        if (app.cam_stroke_count >= 2) {
-            for (int i = 1; i <= app.cam_stroke_count; i++) {
-                Vec2 a0 = world_to_screen(app.cam_stroke[i - 1], app.view_pan, app.view_zoom);
-                Vec2 a1 = world_to_screen(app.cam_stroke[i % app.cam_stroke_count], app.view_pan, app.view_zoom);
-                bool closing = (i == app.cam_stroke_count);
-                if (closing) render_line(ren, a0, a1, 120, 100, 150, 255);
-                else render_line(ren, a0, a1, 200, 175, 235, 255);
-            }
-        }
-        /* The path that was asked for, kept behind the result so the fit can
-         * be judged by eye. */
-        for (int i = 1; i < app.path_ghost_count; i++) {
-            render_line(ren, world_to_screen(app.path_ghost[i - 1], app.view_pan, app.view_zoom),
-                        world_to_screen(app.path_ghost[i], app.view_pan, app.view_zoom),
-                        95, 90, 120, 255);
-        }
-        if (app.path_ghost_closed && app.path_ghost_count > 2) {
-            render_line(ren, world_to_screen(app.path_ghost[app.path_ghost_count - 1], app.view_pan, app.view_zoom),
-                        world_to_screen(app.path_ghost[0], app.view_pan, app.view_zoom), 95, 90, 120, 255);
-        }
-
-        for (int i = 1; i < app.path_stroke_count; i++) {
-            render_line(ren, world_to_screen(app.path_stroke[i - 1], app.view_pan, app.view_zoom),
-                        world_to_screen(app.path_stroke[i], app.view_pan, app.view_zoom),
-                        150, 200, 255, 255);
-        }
-
-        /* What the simulation is doing right now. Paused used to look exactly
-         * like jammed, which looked exactly like a motor set to zero. */
-        if (app.state == APP_RUNNING && !app.jammed) {
-            char banner[96];
-            if (app.paused) snprintf(banner, sizeof banner, "PAUSED - SPACE RUNS ON, . STEPS");
-            else snprintf(banner, sizeof banner, "RUNNING AT %.2fX - < AND > CHANGE IT", app.sim_rate);
-            double bw = render_text_width(8.5, banner);
-            render_text(ren, (Vec2){ app.layout.canvas.x + app.layout.canvas.w - bw - 12.0, 12.0 },
-                        8.5, banner, app.paused ? 245 : 130, app.paused ? 195 : 200,
-                        app.paused ? 90 : 150, 255);
-        }
-
-        if (app.path_tool != PATH_TOOL_NONE) {
-            const char *hint = (app.path_tool == PATH_TOOL_LINKAGE)
-                ? "DRAW A PATH FOR A FOUR-BAR LINKAGE TO TRACE   ESC TO CANCEL"
-                : "DRAW ANY PATH FOR A CHAIN OF ARMS TO REDRAW   ESC TO CANCEL";
-            double w = render_text_width(9.0, hint);
-            render_text(ren, (Vec2){ app.layout.canvas.x + (app.layout.canvas.w - w) / 2.0, 16.0 },
-                        9.0, hint, 150, 200, 255, 255);
-        }
-        if (app.cam_draw_armed) {
-            const char *hint = "DRAG TO DRAW THE CAM OUTLINE   CLICK FOR A DEFAULT CAM   ESC TO CANCEL";
-            double w = render_text_width(9.0, hint);
-            render_text(ren, (Vec2){ app.layout.canvas.x + (app.layout.canvas.w - w) / 2.0, 16.0 },
-                        9.0, hint, 200, 175, 235, 255);
-        }
-        /* An empty canvas used to say nothing at all, with every instruction
-         * in a terminal the user may never have seen. */
-        if (!app.gallery_open && !app.help_open && app.prompt.kind == PROMPT_NONE &&
-            !mechanism_has_any_part(&app.mech)) {
-            const char *l1 = "CLICK TO PLACE A PIN, OR PRESS N FOR A GALLERY OF MECHANISMS";
-            const char *l2 = "PRESS H FOR EVERY KEY";
-            double w1 = render_text_width(10.0, l1), w2 = render_text_width(9.0, l2);
-            Vec2 mid = { app.layout.canvas.x + app.layout.canvas.w / 2.0,
-                          app.layout.canvas.y + app.layout.canvas.h / 2.0 };
-            render_text(ren, (Vec2){ mid.x - w1 / 2.0, mid.y - 14.0 }, 10.0, l1, 120, 126, 140, 255);
-            render_text(ren, (Vec2){ mid.x - w2 / 2.0, mid.y + 10.0 }, 9.0, l2, 100, 106, 120, 255);
-        }
-
-        if (app.gallery_open) {
-            UiRect panel = gallery_panel(&app);
-            render_rect_filled(ren, panel, 24, 25, 30, 255);
-            render_rect_outline(ren, panel, 90, 95, 110, 255);
-            const char *title = "PICK A MECHANISM";
-            double tw = render_text_width(10.0, title);
-            render_text(ren, (Vec2){ panel.x + (panel.w - tw) / 2.0, panel.y + 8.0 }, 10.0, title,
-                        205, 210, 220, 255);
-            int first = gallery_page_first(&app);
-            for (int i = first; i < first + gallery_page_size(&app); i++) {
-                UiRect tile = gallery_tile(&app, i);
-                bool hot = (gallery_hit(&app, mouse_x, mouse_y) == i);
-                render_rect_filled(ren, tile, hot ? 44 : 34, hot ? 46 : 36, hot ? 54 : 42, 255);
-                render_rect_outline(ren, tile, hot ? 255 : 66, hot ? 225 : 70, hot ? 70 : 80, 255);
-                draw_template_preview(ren, i, tile, hot);
-            }
-            int pages = gallery_page_count(&app);
-            if (pages > 1) {
-                char footer[64];
-                snprintf(footer, sizeof footer, "PAGE %d OF %d - ARROW KEYS TO TURN",
-                          app.gallery_page + 1, pages);
-                double fw = render_text_width(8.0, footer);
-                render_text(ren, (Vec2){ panel.x + (panel.w - fw) / 2.0,
-                                          panel.y + panel.h - GALLERY_FOOTER_H + 4.0 },
-                            8.0, footer, 150, 155, 168, 255);
-            }
-        }
-
-        if (app.help_open) draw_help(ren, &app);
-
-        /* The prompt sits over the canvas: it is a question about the whole
-         * mechanism, not about any part of it. */
-        if (app.prompt.kind != PROMPT_NONE) {
-            UiRect canvas = app.layout.canvas;
-            int w = canvas.w - 120; if (w > 640) w = 640; if (w < 240) w = 240;
-            UiRect panel = { canvas.x + (canvas.w - w) / 2, canvas.y + canvas.h / 3, w, 104 };
-            render_rect_filled(ren, panel, 26, 27, 33, 245);
-            render_rect_outline(ren, panel, 120, 130, 155, 255);
-
-            double tw = render_text_width(10.0, app.prompt.title);
-            render_text(ren, (Vec2){ panel.x + (panel.w - tw) / 2.0, panel.y + 14.0 },
-                        10.0, app.prompt.title, 215, 220, 232, 255);
-
-            if (prompt_takes_typing(app.prompt.kind)) {
-                /* The typed name, with a caret blinking on the end of it. */
-                UiRect field = { panel.x + 16, panel.y + 40, panel.w - 32, 26 };
-                render_rect_filled(ren, field, 16, 17, 21, 255);
-                render_rect_outline(ren, field, 80, 86, 100, 255);
-                double text_w = render_text_width(10.0, app.prompt.text);
-                double x = field.x + 8.0;
-                if (text_w > field.w - 16.0) x -= (text_w - (field.w - 16.0));  /* scroll left */
-                render_text(ren, (Vec2){ x, field.y + 8.0 }, 10.0, app.prompt.text,
-                            235, 238, 245, 255);
-                if ((SDL_GetTicks() / 500) % 2 == 0) {
-                    double cx = x + text_w + 2.0;
-                    render_line(ren, (Vec2){ cx, field.y + 6.0 }, (Vec2){ cx, field.y + 20.0 },
-                                235, 238, 245, 255);
-                }
-            }
-
-            double hw = render_text_width(8.0, app.prompt.hint);
-            render_text(ren, (Vec2){ panel.x + (panel.w - hw) / 2.0, panel.y + panel.h - 22.0 },
-                        8.0, app.prompt.hint, 150, 156, 170, 255);
-        }
-
-        SDL_RenderSetClipRect(ren, NULL);
-
-        render_status(ren, &app.status, app.layout.canvas, SDL_GetTicks());
-        render_plot(ren, &app.mech, app.layout.plot);
-        render_toolbar(ren, &app.toolbar, app.layout.win_h);
-        /* Last of all, so it sits over the canvas and the panels. */
-        if (app.toolbar.hover >= 0 && app.toolbar.hover < app.toolbar.count &&
-            SDL_GetTicks() - hover_since > TOOLTIP_DELAY_MS) {
-            const UiButton *hb = &app.toolbar.buttons[app.toolbar.hover];
-            render_tooltip(ren, hb->rect, hb->tip, app.layout.win_w, app.layout.win_h);
-        }
-
+        app_step(&app, dt);
+        app_draw(&app);
         SDL_RenderPresent(ren);
 
         SDL_Delay(16);
     }
 
-    free(app.cam_stroke);
-    free(app.path_stroke);
-    free(app.pre_run_positions);
-    free(app.frame_positions);
-    free(app.frame_angles);
-    mechanism_free(&app.mech);
-    clear_stack(app.undo_stack, &app.undo_count);
-    clear_stack(app.redo_stack, &app.redo_count);
+    app_shutdown(&app);
     SDL_DestroyRenderer(ren);
     SDL_DestroyWindow(win);
     SDL_Quit();
