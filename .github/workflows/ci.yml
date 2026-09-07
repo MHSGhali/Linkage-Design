@@ -1,0 +1,56 @@
+name: build and test
+
+# The build is -Werror, and the test suite is headless, so both of these run
+# anywhere without a display. The point of running on two platforms is that
+# this is C against SDL2: the compilers disagree about warnings, and the STL
+# export uses POSIX calls that only Linux and macOS are claimed to support.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install SDL2 (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsdl2-dev pkg-config
+
+      - name: Install SDL2 (macOS)
+        if: runner.os == 'macOS'
+        run: brew install sdl2 pkg-config
+
+      - name: Build
+        run: make
+
+      - name: Test
+        run: make test
+
+      - name: Test from an unrelated working directory
+        # The suite writes its temp files under TMPDIR rather than a path
+        # relative to the repo; this is what proves it.
+        run: cd "$RUNNER_TEMP" && "$GITHUB_WORKSPACE/tests/test_mechanism"
+
+      - name: Smoke-test the offscreen capture
+        # Renders a frame through the real drawing path with no display.
+        # Informational: it depends on SDL's dummy video driver being able to
+        # back a software renderer, which is a property of the runner image
+        # rather than of this program.
+        continue-on-error: true
+        env:
+          SDL_VIDEODRIVER: dummy
+        run: |
+          ./linkage_design --list-templates
+          mkdir -p "$RUNNER_TEMP/frames"
+          ./linkage_design --capture "four bar" 2 "$RUNNER_TEMP/frames"
+          ls -l "$RUNNER_TEMP/frames"
