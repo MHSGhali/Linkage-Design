@@ -5,10 +5,6 @@
 #include <string.h>
 #include "xalloc.h"
 
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
-
 #define UNDERCUT_SAMPLES 720
 #define TWO_PI (2.0 * M_PI)
 #define SAMPLE_STEP (TWO_PI / (double)CAM_PROFILE_SAMPLES)

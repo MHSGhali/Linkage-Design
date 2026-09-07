@@ -7,10 +7,6 @@
 #include <string.h>
 #include "xalloc.h"
 
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
-
 /* How finely a cam's surface is sampled for hit-testing. */
 #define CAM_PICK_SAMPLES 180
 

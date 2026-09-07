@@ -20,10 +20,6 @@
 #include "../src/mesh3d.h"
 #include "../src/print3d.h"
 
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
-
 static int failures = 0;
 
 /* Every file these tests write goes under one scratch directory, resolved

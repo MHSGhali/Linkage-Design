@@ -3,6 +3,15 @@
 
 #include <math.h>
 
+/* M_PI is POSIX, not ISO C: under -std=c11 glibc does not declare it, so the
+ * build failed on Linux while passing on macOS, whose libc offers it anyway.
+ * Defined here, once, because every file that does geometry already reaches
+ * this header -- it used to be copy-pasted into eight of them and forgotten
+ * in three. */
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 typedef struct {
     double x, y;
 } Vec2;

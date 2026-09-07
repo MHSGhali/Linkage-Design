@@ -12,10 +12,6 @@
 #include <sys/stat.h>
 #include "xalloc.h"
 
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
-
 /* How round a hole or a boss is drawn. A pin hole is only a few millimetres
  * across, so this is already finer than a printer can resolve. */
 #define HOLE_SEG 32

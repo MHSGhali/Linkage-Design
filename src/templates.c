@@ -3,10 +3,6 @@
 #include <math.h>
 #include <stddef.h>
 
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
-
 #define MOTOR_SPEED 90.0
 
 /* Every template is laid out about `centre` in units that `scale` multiplies,

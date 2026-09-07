@@ -2,10 +2,6 @@
 
 #include <math.h>
 
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
-
 /* Points spent on the arc across a tooth's tip and on the arc along the root
  * between two teeth. Both are shallow, so a handful reads as round. */
 #define TIP_INTERIOR 3

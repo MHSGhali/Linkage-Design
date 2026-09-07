@@ -5,10 +5,6 @@
 #include <string.h>
 #include "xalloc.h"
 
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
-
 /* An open stroke read as closed if its ends are within this fraction of the
  * stroke's overall size. */
 #define CLOSE_FRACTION 0.22

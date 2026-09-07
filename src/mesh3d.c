@@ -7,10 +7,6 @@
 #include <string.h>
 #include "xalloc.h"
 
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
-
 /* Points closer together than this are the same point. Outlines are in
  * millimetres and the finest feature we draw is a fifth of a millimetre, so
  * this is far below anything real and far above double-precision noise. */
