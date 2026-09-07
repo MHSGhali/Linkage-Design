@@ -17,10 +17,14 @@
 
 typedef enum {
     UI_NONE = 0,
+    UI_TEMPLATE,
     UI_JOINT,
     UI_ANCHOR,
     UI_LINK,
     UI_MOTOR,
+    UI_SLIDER,
+    UI_GEAR,
+    UI_GENEVA,
     UI_CAM,
     UI_LINKAGE,
     UI_ARMS,
@@ -42,6 +46,7 @@ typedef struct {
     UiAction action;
     const char *label;      /* e.g. "ANCHOR" */
     const char *hint;       /* hotkey reminder, e.g. "A", "^Z" ('^' draws a caret) */
+    const char *tip;        /* what it does and what it needs, shown on hover */
     UiRect rect;
     bool enabled;           /* preconditions met right now */
     bool active;            /* toggled on: gravity, motor, variable, traced, running */
@@ -68,6 +73,10 @@ typedef struct {
     bool drawing_cam;             /* the cam drawing tool is armed */
     bool drawing_linkage;         /* the four-bar path tool is armed */
     bool drawing_arms;            /* the arm-chain path tool is armed */
+    bool gallery_open;            /* the template gallery is showing */
+    bool can_make_slider;         /* three connectors selected */
+    bool can_make_gear;           /* two centres, or a pinion and a rack bar */
+    bool can_make_geneva;         /* a motor's centre and a free wheel's centre */
     bool has_selection;           /* any connector or link selected */
     bool can_undo, can_redo;
     bool gravity_on;              /* gravity is in effect (incl. the motorless default) */

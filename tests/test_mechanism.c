@@ -10,6 +10,8 @@
 #include "../src/ui.h"
 #include "../src/cam.h"
 #include "../src/synth.h"
+#include "../src/joints.h"
+#include "../src/templates.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -704,6 +706,10 @@ static UiState blank_ui_state(void) {
     s.drawing_cam = false;
     s.drawing_linkage = false;
     s.drawing_arms = false;
+    s.gallery_open = false;
+    s.can_make_slider = false;
+    s.can_make_gear = false;
+    s.can_make_geneva = false;
     s.has_selection = false;
     s.can_undo = false;
     s.can_redo = false;
@@ -716,7 +722,7 @@ static void test_toolbar_layout_is_well_formed(void) {
     Toolbar t;
     ui_init(&t);
 
-    check_true("toolbar has every requested button", t.count == 16);
+    check_true("toolbar has every requested button", t.count == 20);
 
     bool all_inside = true, no_overlap = true, all_have_labels = true;
     for (int i = 0; i < t.count; i++) {
@@ -732,8 +738,10 @@ static void test_toolbar_layout_is_well_formed(void) {
     check_true("no two buttons overlap", no_overlap);
     check_true("every button has a label", all_have_labels);
 
+    /* The strip runs the full height of the window (canvas plus plot panel),
+     * not just the canvas. */
     const UiButton *last = &t.buttons[t.count - 1];
-    check_true("the whole toolbar fits in the window height", last->rect.y + last->rect.h < 700);
+    check_true("the whole toolbar fits in the window height", last->rect.y + last->rect.h < 900);
 }
 
 static void test_toolbar_hit_testing(void) {
@@ -1719,6 +1727,570 @@ static void test_arm_chain_simulates_and_traces_the_path(void) {
     mechanism_free(&m);
 }
 
+
+/* --------------------------------------------------------------------------
+ * Sliders, gears, Geneva wheels (src/joints.c) and the template catalogue.
+ * ----------------------------------------------------------------------- */
+
+static void test_geneva_indexes_exactly(void) {
+    /* The whole point of a Geneva: each turn of the driver advances the wheel
+     * by exactly one slot, and it sits perfectly still in between. */
+    for (int slots = 3; slots <= 8; slots++) {
+        double step = 2.0 * M_PI / (double)slots;
+        bool exact = true, still = true, smooth = true;
+        double prev = geneva_wheel_angle(slots, -2.0 * M_PI, NULL);
+
+        for (int k = 1; k <= 5; k++) {
+            /* Mid-dwell, where the wheel must be exactly k steps along. */
+            double w = geneva_wheel_angle(slots, (double)(k - 1) * 2.0 * M_PI + M_PI, NULL);
+            /* Negative: an external Geneva turns its wheel the other way. */
+            if (fabs(w + (double)k * step) > 1e-9) exact = false;
+        }
+        for (double a = -2.0 * M_PI; a <= 4.0 * M_PI; a += 0.001) {
+            bool eng;
+            double w = geneva_wheel_angle(slots, a, &eng);
+            if (fabs(w - prev) > 0.02) smooth = false;   /* no jumps */
+            if (!eng) {
+                /* Locked means parked exactly on an index position, which is
+                 * the property that matters (and doesn't depend on where the
+                 * sample happens to fall relative to the engagement edge). */
+                double indexes = w / step;
+                if (fabs(indexes - floor(indexes + 0.5)) > 1e-9) still = false;
+            }
+            prev = w;
+        }
+        check_true("a Geneva advances exactly one slot per driver turn", exact);
+        check_true("...and does so opposite to the driver",
+                   geneva_wheel_angle(slots, 2.0 * M_PI + M_PI, NULL) < 0.0);
+        check_true("reversing the driver reverses the wheel",
+                   geneva_wheel_angle(slots, -(2.0 * M_PI + M_PI), NULL) > 0.0);
+        check_true("...and is perfectly still while locked", still);
+        check_true("...with no jump anywhere in the cycle", smooth);
+    }
+
+    /* The shock-free proportions: the pin enters and leaves along the slot. */
+    check_close("a 6-slot Geneva's crank is half its centre distance",
+                geneva_crank_radius(6, 100.0), 50.0, 1e-9);
+    check_close("...and the two are inverses",
+                geneva_center_distance(6, geneva_crank_radius(6, 100.0)), 100.0, 1e-9);
+    check_close("a 4-slot Geneva engages for 90 degrees either side",
+                geneva_engagement_half_angle(4), M_PI / 4.0, 1e-12);
+}
+
+static void test_crank_slider_gives_exactly_twice_the_crank(void) {
+    /* A slider on a rail through the crank centre travels exactly one crank
+     * diameter, and never leaves its rail. */
+    Mechanism m;
+    mechanism_init(&m);
+    int o    = mechanism_add_connector(&m, (Vec2){ 0, 0 }, true);
+    int a    = mechanism_add_connector(&m, (Vec2){ 60, 0 }, false);
+    int pist = mechanism_add_connector(&m, (Vec2){ 260, 0 }, false);
+    int r1   = mechanism_add_connector(&m, (Vec2){ -400, 0 }, true);
+    int r2   = mechanism_add_connector(&m, (Vec2){ 400, 0 }, true);
+    int crank_ids[2] = { o, a }, rod_ids[2] = { a, pist };
+    mechanism_add_link(&m, crank_ids, 2);
+    mechanism_add_link(&m, rod_ids, 2);
+    mechanism_toggle_driven(&m, 0, 90.0);
+    check_true("the slider is accepted", mechanism_add_slider(&m, pist, r1, r2) >= 0);
+
+    SolverParams p = solver_default_params();
+    solver_freeze(&m);
+    double lo = 1e30, hi = -1e30, off = 0.0;
+    for (int k = 0; k < 960; k++) {
+        solver_advance(&m, 1.0 / 240.0, p);
+        Vec2 q = m.connectors[pist].pos;
+        lo = fmin(lo, q.x); hi = fmax(hi, q.x);
+        off = fmax(off, fabs(q.y));
+    }
+    check_close("the piston's stroke is twice the crank", hi - lo, 120.0, 1e-3);
+    check_true("the piston never leaves its rail", off < 1e-6);
+
+    /* Degenerate rails are refused rather than dividing by zero. */
+    check_true("a zero-length rail is rejected", mechanism_add_slider(&m, pist, r1, r1) < 0);
+    mechanism_free(&m);
+}
+
+/* A rack travels the arc length rolled off its pinion. */
+static void test_rack_travels_the_arc_it_rolls(void) {
+    Mechanism m;
+    mechanism_init(&m);
+    int pc = mechanism_add_connector(&m, (Vec2){ 0, 0 }, true);
+    int pt = mechanism_add_connector(&m, (Vec2){ 50, 0 }, false);
+    int ra = mechanism_add_connector(&m, (Vec2){ -150, 50 }, false);
+    int rb = mechanism_add_connector(&m, (Vec2){ 150, 50 }, false);
+    int pin_ids[2] = { pc, pt }, rack_ids[2] = { ra, rb };
+    mechanism_add_link(&m, pin_ids, 2);
+    mechanism_add_link(&m, rack_ids, 2);
+    mechanism_toggle_driven(&m, 0, 90.0);
+    check_true("the rack is accepted",
+               mechanism_add_rack(&m, 0, pc, 1, ra, (Vec2){ 1, 0 }) >= 0);
+
+    SolverParams p = solver_default_params();
+    solver_freeze(&m);
+    Vec2 start = m.connectors[ra].pos;
+    for (int k = 0; k < 240; k++) solver_advance(&m, 1.0 / 240.0, p);
+    Vec2 now = m.connectors[ra].pos;
+    check_close("the rack travels the arc rolled off the pitch circle",
+                now.x - start.x, 50.0 * M_PI / 2.0, 1e-6);
+    check_close("...and doesn't drift off its axis", now.y - start.y, 0.0, 1e-9);
+    mechanism_free(&m);
+}
+
+/* A wheel is a body with a size of its own: put down on its own, resized on
+ * its own, meshed only when asked. That is what stops one button press from
+ * dropping a wheel on top of the last, and what lets one wheel drive several. */
+static void test_wheels_are_placed_and_sized_on_their_own(void) {
+    Mechanism m;
+    mechanism_init(&m);
+    int w = mechanism_add_wheel(&m, (Vec2){ 0, 0 }, 80.0);
+    check_true("a wheel can be put down on its own", w >= 0);
+    check_true("it is a wheel, not a bar", mechanism_is_gear_body(&m, w));
+    check_true("nothing is meshed with it", m.gear_count == 0);
+    check_close("it is the size it was asked for",
+                mechanism_gear_wheel_radius(&m, w, NULL), 80.0, 1e-12);
+
+    int centre = -1;
+    (void)mechanism_gear_wheel_radius(&m, w, &centre);
+    check_true("its hub is grounded", centre >= 0 && m.connectors[centre].is_anchor);
+    int mark = mechanism_wheel_mark(&m, w);
+    check_true("it carries a mark on its rim", mark >= 0 && mark != centre);
+    check_close("...which sits on the pitch circle, so a trace is the wheel itself",
+                vec2_dist(m.connectors[mark].pos, m.connectors[centre].pos), 80.0, 1e-9);
+    mechanism_set_traced(&m, mark, true);
+    check_true("...which can be traced like any other point", m.connectors[mark].traced);
+
+    /* Resizing moves the mark with the face rather than stranding it. */
+    mechanism_set_wheel_radius(&m, w, 160.0);
+    check_close("resizing changes the radius", m.links[w].wheel_radius, 160.0, 1e-12);
+    check_close("...and the rim mark rides out with it, still on the rim",
+                vec2_dist(m.connectors[mark].pos, m.connectors[centre].pos), 160.0, 1e-9);
+    check_true("...and the body is still rigid at its new size",
+               fabs(m.links[w].rest_dist[0] - 160.0) < 1e-9);
+
+    mechanism_set_wheel_radius(&m, w, 1.0);
+    check_close("a wheel cannot be shrunk to nothing",
+                m.links[w].wheel_radius, MECHANISM_WHEEL_MIN_RADIUS, 1e-12);
+    mechanism_free(&m);
+}
+
+/* Meshing is a separate act, and it makes the mesh real: two wheels of fixed
+ * size touch at exactly one distance, so the driven one slides into contact
+ * however far apart they were drawn. */
+static void test_meshing_slides_wheels_into_contact(void) {
+    Mechanism m;
+    mechanism_init(&m);
+    int a = mechanism_add_wheel(&m, (Vec2){ 0, 0 }, 80.0);
+    int b = mechanism_add_wheel(&m, (Vec2){ 400, 0 }, 120.0);   /* far too far apart */
+    mechanism_toggle_driven(&m, a, 90.0);
+
+    check_true("the two mesh", mechanism_mesh_wheels(&m, a, b) >= 0);
+    int ca = -1, cb = -1;
+    (void)mechanism_gear_wheel_radius(&m, a, &ca);
+    (void)mechanism_gear_wheel_radius(&m, b, &cb);
+    check_close("the driven wheel slid in until they touch",
+                vec2_dist(m.connectors[ca].pos, m.connectors[cb].pos), 200.0, 1e-9);
+    check_close("each wheel kept its own size", m.gears[0].driver_radius, 80.0, 1e-12);
+    check_close("...both of them", m.gears[0].driven_radius, 120.0, 1e-12);
+    check_true("meshing the same two again is refused", mechanism_mesh_wheels(&m, a, b) < 0);
+    check_true("...in either order", mechanism_mesh_wheels(&m, b, a) < 0);
+
+    /* Resizing a meshed wheel closes the gap again by itself. */
+    mechanism_set_wheel_radius(&m, b, 60.0);
+    mechanism_refresh_joint_sizes(&m);
+    check_close("resizing a meshed wheel keeps the mesh",
+                vec2_dist(m.connectors[ca].pos, m.connectors[cb].pos), 140.0, 1e-9);
+
+    /* And it turns at the ratio its size dictates. */
+    SolverParams p = solver_default_params();
+    solver_freeze(&m);
+    int mark = mechanism_wheel_mark(&m, b);
+    Vec2 d0 = vec2_sub(m.connectors[mark].pos, m.connectors[cb].pos);
+    double start = atan2(d0.y, d0.x);
+    for (int k = 0; k < 240; k++) solver_advance(&m, 1.0 / 240.0, p);
+    Vec2 d1 = vec2_sub(m.connectors[mark].pos, m.connectors[cb].pos);
+    double turned = (atan2(d1.y, d1.x) - start) * 180.0 / M_PI;
+    while (turned > 180.0) turned -= 360.0;      /* the same angle, read once round */
+    while (turned < -180.0) turned += 360.0;
+    check_close("an 80 driving a 60 turns it 4/3 as far, reversed", turned, -120.0, 1e-6);
+    mechanism_free(&m);
+}
+
+/* One wheel can drive several, because meshing names the wheels rather than
+ * guessing; and naming any wheel the driver turns the train round to suit. */
+static void test_one_wheel_drives_several(void) {
+    Mechanism m;
+    mechanism_init(&m);
+    int hub = mechanism_add_wheel(&m, (Vec2){ 0, 0 }, 120.0);
+    int left = mechanism_add_wheel(&m, (Vec2){ -260, 0 }, 80.0);
+    int right = mechanism_add_wheel(&m, (Vec2){ 260, 0 }, 80.0);
+    int below = mechanism_add_wheel(&m, (Vec2){ 0, 260 }, 80.0);
+    mechanism_toggle_driven(&m, hub, 90.0);
+
+    check_true("the hub drives one wheel", mechanism_mesh_wheels(&m, hub, left) >= 0);
+    check_true("...and a second", mechanism_mesh_wheels(&m, hub, right) >= 0);
+    check_true("...and a third", mechanism_mesh_wheels(&m, hub, below) >= 0);
+    check_true("three wheels share it", m.gear_count == 3);
+    check_true("a wheel already turned by something else is refused",
+               mechanism_mesh_wheels(&m, left, right) < 0);
+
+    mechanism_refresh_joint_sizes(&m);
+    SolverParams p = solver_default_params();
+    solver_freeze(&m);
+    int marks[3] = { mechanism_wheel_mark(&m, left), mechanism_wheel_mark(&m, right),
+                     mechanism_wheel_mark(&m, below) };
+    Vec2 was[3];
+    for (int k = 0; k < 3; k++) was[k] = m.connectors[marks[k]].pos;
+    for (int k = 0; k < 240; k++) solver_advance(&m, 1.0 / 240.0, p);
+    bool all_turned = true;
+    for (int k = 0; k < 3; k++) {
+        if (vec2_dist(m.connectors[marks[k]].pos, was[k]) < 1.0) all_turned = false;
+    }
+    check_true("all three are driven from the one hub", all_turned);
+
+    /* Now name an outer wheel the driver: the mesh it sits in must turn round. */
+    check_true("the train can be re-rooted", mechanism_orient_train_from(&m, left));
+    check_true("the chosen wheel is no longer driven by another",
+               !m.links[left].driven_externally);
+    check_true("...and the old hub now takes its motion from it",
+               m.links[hub].driven_externally);
+    bool from_left = false;
+    for (int i = 0; i < m.gear_count; i++) {
+        if (m.gears[i].driver_link_id == left && m.gears[i].driven_link_id == hub) from_left = true;
+    }
+    check_true("the mesh between them points outwards from it", from_left);
+    mechanism_free(&m);
+}
+
+/* A Geneva's crank radius is fixed by its slot count and centre distance, so
+ * both follow the geometry -- change either and it stays shock-free. */
+static void test_geneva_sizes_follow_the_geometry(void) {
+    Mechanism m;
+    mechanism_init(&m);
+    int dc = mechanism_add_connector(&m, (Vec2){ 0, 0 }, true);
+    int pin = mechanism_add_connector(&m, (Vec2){ 0, -60 }, false);
+    int wc = mechanism_add_connector(&m, (Vec2){ 200, 0 }, true);
+    int mk = mechanism_add_connector(&m, (Vec2){ 280, 0 }, false);
+    int da[2] = { dc, pin }, wa[2] = { wc, mk };
+    mechanism_add_link(&m, da, 2);
+    mechanism_add_link(&m, wa, 2);
+    mechanism_toggle_driven(&m, 0, 90.0);
+    int vi = mechanism_add_geneva(&m, 0, dc, 1, wc, 6);
+
+    check_close("the centre distance is read off the two centres",
+                m.genevas[vi].center_distance, 200.0, 1e-9);
+    check_close("the crank radius is the shock-free one for six slots",
+                m.genevas[vi].crank_radius, geneva_crank_radius(6, 200.0), 1e-9);
+
+    m.connectors[wc].pos = (Vec2){ 300, 0 };
+    mechanism_refresh_joint_sizes(&m);
+    check_close("moving the wheel restretches the centre distance",
+                m.genevas[vi].center_distance, 300.0, 1e-9);
+    check_close("...and the crank with it",
+                m.genevas[vi].crank_radius, geneva_crank_radius(6, 300.0), 1e-9);
+
+    m.genevas[vi].slot_count = 4;
+    mechanism_refresh_joint_sizes(&m);
+    check_close("fewer slots means a longer crank",
+                m.genevas[vi].crank_radius, geneva_crank_radius(4, 300.0), 1e-9);
+    check_true("...which is indeed longer",
+               m.genevas[vi].crank_radius > geneva_crank_radius(6, 300.0));
+    mechanism_free(&m);
+}
+
+/* Each joint can be clicked in its own right -- a wheel anywhere on its face,
+ * a slider on its rail, a Geneva on its rim -- which is how it is reached. */
+static void test_joints_can_be_picked(void) {
+    Mechanism m;
+    mechanism_init(&m);
+    int wa = mechanism_add_wheel(&m, (Vec2){ 0, 0 }, 40.0);
+    int wb = mechanism_add_wheel(&m, (Vec2){ 120, 0 }, 80.0);
+    check_true("a click on a wheel's rim finds that wheel",
+               mechanism_pick_wheel(&m, (Vec2){ 0, 40 }, 6.0) == wa);
+    check_true("a click on the other finds the other one",
+               mechanism_pick_wheel(&m, (Vec2){ 120, -80 }, 6.0) == wb);
+    check_true("a click well inside a wheel still finds it -- it is a disc",
+               mechanism_pick_wheel(&m, (Vec2){ 150, 30 }, 6.0) == wb);
+    check_true("a click in open space finds nothing",
+               mechanism_pick_wheel(&m, (Vec2){ 0, 400 }, 6.0) < 0);
+    mechanism_free(&m);
+
+    mechanism_init(&m);
+    int pist = mechanism_add_connector(&m, (Vec2){ 0, 0 }, false);
+    int ra = mechanism_add_connector(&m, (Vec2){ -100, 0 }, true);
+    int rb = mechanism_add_connector(&m, (Vec2){ 100, 0 }, true);
+    int sid = mechanism_add_slider(&m, pist, ra, rb);
+    check_true("a click along the rail finds the slider",
+               mechanism_pick_slider(&m, (Vec2){ 40, 3 }, 7.0) == sid);
+    check_true("a click well off it doesn't",
+               mechanism_pick_slider(&m, (Vec2){ 40, 60 }, 7.0) < 0);
+    mechanism_free(&m);
+
+    mechanism_init(&m);
+    int dc = mechanism_add_connector(&m, (Vec2){ 0, 0 }, true);
+    int pin = mechanism_add_connector(&m, (Vec2){ 0, -60 }, false);
+    int wc = mechanism_add_connector(&m, (Vec2){ 200, 0 }, true);
+    int mk = mechanism_add_connector(&m, (Vec2){ 280, 0 }, false);
+    int da[2] = { dc, pin }, wl[2] = { wc, mk };
+    mechanism_add_link(&m, da, 2);
+    mechanism_add_link(&m, wl, 2);
+    mechanism_toggle_driven(&m, 0, 90.0);
+    int vi = mechanism_add_geneva(&m, 0, dc, 1, wc, 6);
+    double wr = mechanism_geneva_wheel_radius(&m.genevas[vi]);
+    check_true("a click on the Geneva wheel's rim finds it",
+               mechanism_pick_geneva(&m, (Vec2){ 200, wr }, 7.0) == vi);
+    check_true("a click between the two centres finds nothing",
+               mechanism_pick_geneva(&m, (Vec2){ 120, 0 }, 7.0) < 0);
+    mechanism_free(&m);
+}
+
+/* The gear train, crank-slider and Geneva used by the tests below. These used
+ * to be lifted from the template catalogue; they are built here by hand now
+ * that those three are made by their toolbar buttons instead -- which is also
+ * a truer test, since it is the same sequence of calls the buttons make. */
+static int build_test_gear_train(Mechanism *m) {
+    double r1 = 70, r2 = 45, r3 = 90;
+    int c1 = mechanism_add_connector(m, (Vec2){ -160, 0 }, true);
+    int t1 = mechanism_add_connector(m, (Vec2){ -160 + r1, 0 }, false);
+    int c2 = mechanism_add_connector(m, (Vec2){ -160 + r1 + r2, 0 }, true);
+    int t2 = mechanism_add_connector(m, (Vec2){ -160 + r1 + 2 * r2, 0 }, false);
+    int c3 = mechanism_add_connector(m, (Vec2){ -160 + r1 + 2 * r2 + r3, 0 }, true);
+    int t3 = mechanism_add_connector(m, (Vec2){ -160 + r1 + 2 * r2 + 2 * r3, 0 }, false);
+    int a[2] = { c1, t1 }, b[2] = { c2, t2 }, c[2] = { c3, t3 };
+    int g1 = mechanism_add_link(m, a, 2);
+    int g2 = mechanism_add_link(m, b, 2);
+    int g3 = mechanism_add_link(m, c, 2);
+    mechanism_toggle_driven(m, g1, 90.0);
+    mechanism_add_gear(m, g1, c1, g2, c2, r2 / r1, false);
+    mechanism_add_gear(m, g2, c2, g3, c3, r3 / r2, false);
+    mechanism_set_traced(m, t3, true);
+    return t3;
+}
+
+static void build_test_crank_slider(Mechanism *m) {
+    int o    = mechanism_add_connector(m, (Vec2){ -140, 0 }, true);
+    int a    = mechanism_add_connector(m, (Vec2){ -80, 0 }, false);
+    int pist = mechanism_add_connector(m, (Vec2){ 120, 0 }, false);
+    int r1   = mechanism_add_connector(m, (Vec2){ -20, 0 }, true);
+    int r2   = mechanism_add_connector(m, (Vec2){ 260, 0 }, true);
+    int crank_ids[2] = { o, a }, rod_ids[2] = { a, pist };
+    int crank = mechanism_add_link(m, crank_ids, 2);
+    mechanism_add_link(m, rod_ids, 2);
+    mechanism_toggle_driven(m, crank, 90.0);
+    mechanism_add_slider(m, pist, r1, r2);
+    mechanism_set_traced(m, pist, true);
+}
+
+static void build_test_geneva(Mechanism *m) {
+    int slots = 6;
+    double c_dist = 150.0;
+    double a = geneva_crank_radius(slots, c_dist);
+    double entry = geneva_engagement_half_angle(slots);
+    int dc  = mechanism_add_connector(m, (Vec2){ -c_dist / 2, 0 }, true);
+    int pin = mechanism_add_connector(m, (Vec2){ -c_dist / 2 + a * cos(entry),
+                                                 -a * sin(entry) }, false);
+    int wc  = mechanism_add_connector(m, (Vec2){ c_dist / 2, 0 }, true);
+    int mk  = mechanism_add_connector(m, (Vec2){ c_dist / 2 - c_dist * 0.55, 0 }, false);
+    int d[2] = { dc, pin }, w[2] = { wc, mk };
+    int driver = mechanism_add_link(m, d, 2);
+    int wheel = mechanism_add_link(m, w, 2);
+    mechanism_toggle_driven(m, driver, 90.0);
+    mechanism_add_geneva(m, driver, dc, wheel, wc, slots);
+    mechanism_set_traced(m, mk, true);
+}
+
+/* Pressing GEAR again adds another wheel to the end of the train. Each one has
+ * to mesh with the last, keep the chain in a line, and carry the drive on
+ * through -- a train that merely looks right but doesn't turn is no use. */
+static void test_gear_chain_runs_smoothly(void) {
+    Mechanism m;
+    mechanism_init(&m);
+    build_test_gear_train(&m);
+    check_true("the train has two meshes", m.gear_count == 2);
+
+    int rim = -1;
+    for (int c = 0; c < m.connector_count; c++) {
+        if (m.connectors[c].alive && m.connectors[c].traced) rim = c;
+    }
+    check_true("the last gear's rim is traced", rim >= 0);
+
+    SolverParams p = solver_default_params();
+    solver_freeze(&m);
+
+    /* Ten seconds, long enough for the middle gear to wrap several times. */
+    const double dt = 1.0 / 240.0;
+    Vec2 prev = m.connectors[rim].pos;
+    double worst = 0.0, total = 0.0;
+    for (int k = 0; k < 2400; k++) {
+        solver_advance(&m, dt, p);
+        double step = vec2_dist(prev, m.connectors[rim].pos);
+        if (step > worst) worst = step;
+        total += step;
+        prev = m.connectors[rim].pos;
+    }
+    double mean = total / 2400.0;
+
+    check_true("the last gear moves at all", total > 100.0);
+    /* A smooth constant rotation moves the same distance every frame; a wrap
+     * would show up as one frame moving many times the rest. */
+    check_true("the last gear never jumps", worst < mean * 1.5);
+
+    mechanism_free(&m);
+}
+
+static void test_geneva_drives_a_real_wheel(void) {
+    /* End to end through the solver, not just the closed form: build the
+     * driver and wheel out of parts and check the wheel steps and dwells. */
+    Mechanism m;
+    mechanism_init(&m);
+    int slots = 6;
+    double c = 150.0, a = geneva_crank_radius(slots, c);
+    double entry = geneva_engagement_half_angle(slots);
+    int dc = mechanism_add_connector(&m, (Vec2){ 0, 0 }, true);
+    int pin = mechanism_add_connector(&m, (Vec2){ a * cos(entry), -a * sin(entry) }, false);
+    int wc = mechanism_add_connector(&m, (Vec2){ c, 0 }, true);
+    int mark = mechanism_add_connector(&m, (Vec2){ c + 80, 0 }, false);  /* starts at angle 0 */
+    int drv[2] = { dc, pin }, whl[2] = { wc, mark };
+    mechanism_add_link(&m, drv, 2);
+    mechanism_add_link(&m, whl, 2);
+    mechanism_toggle_driven(&m, 0, 90.0);
+    check_true("the Geneva is accepted", mechanism_add_geneva(&m, 0, dc, 1, wc, slots) >= 0);
+
+    SolverParams p = solver_default_params();
+    solver_freeze(&m);
+
+    /* 90 deg/s, so four seconds is one driver turn and one index. */
+    double dt = 1.0 / 240.0;
+    int still_frames = 0, moving_frames = 0;
+    Vec2 prev = m.connectors[mark].pos;
+    for (int k = 0; k < 960; k++) {
+        solver_advance(&m, dt, p);
+        double moved = vec2_dist(prev, m.connectors[mark].pos);
+        if (moved < 1e-9) still_frames++; else moving_frames++;
+        prev = m.connectors[mark].pos;
+    }
+    Vec2 d = vec2_sub(m.connectors[mark].pos, m.connectors[wc].pos);
+    /* The driver runs forwards, so the wheel must have gone BACK one sixth --
+     * an external Geneva reverses, which is what the pin sweeping past the
+     * line of centres does to the slot it sits in. */
+    check_close("one driver turn indexes the wheel exactly one sixth, the other way",
+                atan2(d.y, d.x), -2.0 * M_PI / 6.0, 1e-6);
+    check_true("the wheel keeps its radius", fabs(vec2_len(d) - 80.0) < 1e-9);
+    check_true("the wheel is locked still for most of the turn",
+               still_frames > moving_frames);
+    check_true("...but does move for part of it", moving_frames > 100);
+    mechanism_free(&m);
+}
+
+/* Every template must build, run for six seconds without binding, and
+ * actually move the point it traces. A template that jams is worse than no
+ * template at all. */
+static void test_every_template_runs(void) {
+    check_true("the catalogue holds nine mechanisms", templates_count() == 9);
+
+    bool all_run = true, all_move = true, all_named = true;
+    for (int i = 0; i < templates_count(); i++) {
+        const Template *t = templates_get(i);
+        if (!t || !t->name || !t->name[0] || !t->blurb || !t->blurb[0]) { all_named = false; continue; }
+
+        Mechanism m;
+        mechanism_init(&m);
+        t->build(&m, (Vec2){ 0, 0 }, 1.0);
+
+        int traced = -1;
+        for (int c = 0; c < m.connector_count; c++) {
+            if (m.connectors[c].alive && m.connectors[c].traced) traced = c;
+        }
+        if (traced < 0) all_move = false;
+
+        SolverParams p = solver_default_params();
+        solver_freeze(&m);
+        double travel = 0.0;
+        Vec2 prev = (traced >= 0) ? m.connectors[traced].pos : (Vec2){ 0, 0 };
+        for (int k = 0; k < 1440; k++) {
+            solver_advance(&m, 1.0 / 240.0, p);
+            if (solver_has_length_violation(&m, p.length_tol_abs, p.length_tol_rel)) {
+                all_run = false;
+                break;
+            }
+            if (traced >= 0) {
+                travel += vec2_dist(prev, m.connectors[traced].pos);
+                prev = m.connectors[traced].pos;
+            }
+        }
+        if (travel < 10.0) all_move = false;
+        mechanism_free(&m);
+    }
+    check_true("every template has a name and a description", all_named);
+    check_true("every template runs six seconds without binding", all_run);
+    check_true("every template's traced point actually moves", all_move);
+}
+
+static void test_joint_deletion_cascades(void) {
+    /* The new elements are defined by links and connectors, so removing one
+     * has to take the element with it or the mechanism is left referring to
+     * something that no longer exists. */
+    Mechanism m;
+    mechanism_init(&m);
+    build_test_gear_train(&m);
+    check_true("the gear train has gears", m.gear_count == 2);
+    mechanism_delete_link(&m, 1);                        /* the idler */
+    check_true("deleting a gear's link deletes the gear pairs that used it",
+               !m.gears[0].alive && !m.gears[1].alive);
+    mechanism_free(&m);
+
+    mechanism_init(&m);
+    build_test_crank_slider(&m);
+    check_true("the crank-slider has a slider", m.slider_count == 1);
+    int rail = m.sliders[0].rail_a_id;
+    mechanism_delete_connector(&m, rail);
+    check_true("deleting a rail point deletes the slider", !m.sliders[0].alive);
+    mechanism_free(&m);
+
+    /* Undo snapshots everything, so a clone must carry the new arrays. */
+    mechanism_init(&m);
+    build_test_geneva(&m);
+    Mechanism clone;
+    mechanism_clone(&m, &clone);
+    check_true("a clone carries the Geneva", clone.geneva_count == m.geneva_count);
+    mechanism_delete_geneva(&m, 0);
+    check_true("...independently of the original", clone.genevas[0].alive && !m.genevas[0].alive);
+    mechanism_free(&clone);
+    mechanism_free(&m);
+}
+
+/* Every button says what it does on hover. A missing or shouty tip is a button
+ * nobody can learn from, and the stroke font only draws what it knows. */
+static void test_every_button_has_a_tooltip(void) {
+    Toolbar t;
+    ui_init(&t);
+    bool all_present = true, all_sane = true, all_drawable = true;
+    for (int i = 0; i < t.count; i++) {
+        const char *tip = t.buttons[i].tip;
+        if (!tip || !tip[0]) { all_present = false; continue; }
+        size_t len = strlen(tip);
+        if (len < 20 || len > 220) all_sane = false;
+        for (const char *c = tip; *c; c++) {
+            bool ok = (*c >= 'A' && *c <= 'Z') || (*c >= 'a' && *c <= 'z') ||
+                       (*c >= '0' && *c <= '9') ||
+                       *c == ' ' || *c == '.' || *c == ',' || *c == '-' ||
+                       *c == '/' || *c == '+' || *c == ':';
+            if (!ok) all_drawable = false;
+        }
+    }
+    check_true("every button carries a tooltip", all_present);
+    check_true("each one is a sentence, not a word or an essay", all_sane);
+    check_true("and uses only characters the stroke font can draw", all_drawable);
+
+    /* The one that needed explaining most: GEAR does two different things. */
+    const char *gear = NULL;
+    for (int i = 0; i < t.count; i++) {
+        if (t.buttons[i].action == UI_GEAR) gear = t.buttons[i].tip;
+    }
+    check_true("the GEAR tip exists", gear != NULL);
+    check_true("...and says how to mesh: select the wheels first",
+               gear && strstr(gear, "mesh") && strstr(gear, "selected"));
+}
+
 static void test_cam_button_enablement(void) {
     Toolbar t;
     ui_init(&t);
@@ -1733,6 +2305,33 @@ static void test_cam_button_enablement(void) {
     s.drawing_cam = true;
     ui_apply_state(&t, s);
     check_true("CAM is lit while the drawing tool is armed", button_for(&t, UI_CAM)->active);
+
+    /* The joint-making buttons need the right selection, and say so by
+     * greying out rather than by failing when pressed. */
+    s = blank_ui_state();
+    ui_apply_state(&t, s);
+    check_true("SLIDER is off without a selection", !button_for(&t, UI_SLIDER)->enabled);
+    check_true("GEAR is off without a selection", !button_for(&t, UI_GEAR)->enabled);
+    check_true("GENEVA is off without a selection", !button_for(&t, UI_GENEVA)->enabled);
+
+    s.can_make_slider = true;
+    ui_apply_state(&t, s);
+    check_true("SLIDER lights up for three connectors", button_for(&t, UI_SLIDER)->enabled);
+    check_true("...without enabling GEAR", !button_for(&t, UI_GEAR)->enabled);
+
+    s = blank_ui_state();
+    s.can_make_gear = true;
+    ui_apply_state(&t, s);
+    check_true("GEAR lights up for two centres", button_for(&t, UI_GEAR)->enabled);
+
+    s = blank_ui_state();
+    s.can_make_geneva = true;
+    ui_apply_state(&t, s);
+    check_true("GENEVA lights up for a motor and a wheel", button_for(&t, UI_GENEVA)->enabled);
+    s.editing = false;
+    s.running = true;
+    ui_apply_state(&t, s);
+    check_true("GENEVA is off while running", !button_for(&t, UI_GENEVA)->enabled);
 
     /* Both path tools are the same shape of tool: no selection, lit while
      * armed, and only one of them armed at a time. */
@@ -1798,7 +2397,20 @@ int main(void) {
     test_lift_and_timing_adjustments();
     test_follower_tracks_a_drawn_cam();
     test_trace_records_sample_times();
+    test_every_button_has_a_tooltip();
     test_cam_button_enablement();
+    test_geneva_indexes_exactly();
+    test_crank_slider_gives_exactly_twice_the_crank();
+    test_rack_travels_the_arc_it_rolls();
+    test_wheels_are_placed_and_sized_on_their_own();
+    test_meshing_slides_wheels_into_contact();
+    test_one_wheel_drives_several();
+    test_geneva_sizes_follow_the_geometry();
+    test_joints_can_be_picked();
+    test_gear_chain_runs_smoothly();
+    test_geneva_drives_a_real_wheel();
+    test_every_template_runs();
+    test_joint_deletion_cascades();
     test_stroke_preparation();
     test_fourbar_pose_matches_closed_form();
     test_grashof_classification();

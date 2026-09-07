@@ -2,9 +2,11 @@
 
 A general-purpose 2D mechanism editor and simulator: build a planar
 mechanism by hand out of connectors (joints), anchors (grounded connectors),
-and rigid links (each owning any number of connectors, not just simple
-two-point bars), add disc cams with translating roller followers, mark one
-link as a constant-speed motor, then forward-simulate the resulting motion.
+rigid links (each owning any number of connectors, not just simple two-point
+bars), sliders and pins-in-slots, gears, racks, disc cams and Geneva wheels,
+mark a link as a constant-speed motor, then forward-simulate the resulting
+motion. Or start from the **template gallery** of famous mechanisms and take
+one apart.
 Or work the other way round: **draw a path you want a point to follow and the
 program designs a machine that traces it** — either a neat four-bar linkage,
 or, for shapes no linkage can manage, a chain of rotating arms that will
@@ -45,7 +47,28 @@ disabled, RUN becomes STOP, and GRAVITY and CLEAR keep working.
   - Click a link's edge: select that link
   - Drag a selected connector: move the whole selection (reshapes any
     attached links — rest lengths are only frozen when you press `R`)
+- Hovering a toolbar button for a moment shows a **tooltip** saying what it
+  does and what it wants selected first — the buttons that behave differently
+  depending on the selection (GEAR above all) say so there.
 - **Edit mode** (keyboard):
+  - `S`, `O`, `W`: **SLIDER**, **GEAR**, **GENEVA**. Press one with nothing
+    selected and it draws a whole working assembly into the middle of the view
+    — motor, bars, joint and a traced point, running the moment you press `R`.
+    You do not have to know what to arrange first. Everything about it is then
+    editable by hand: see **Editing a joint** below.
+
+    If you *have* the right parts selected it joins those instead, so a joint
+    can still be added to something you built yourself:
+
+    - `S`: three connectors — the two farthest apart become the rail and the
+      third the pin that runs along it. Rails on anchors give a slide on
+      ground; rails on a moving link give a pin in that link's slot.
+    - `O`: two grounded centres to mesh a gear pair, or a grounded centre plus
+      a point on a free bar for a rack and pinion.
+    - `W`: the motor's centre and the wheel's centre.
+  - `N`: open the **TEMPLATE gallery** — a grid of famous mechanisms; click one
+    to drop it on the canvas, running and ready. See **The template gallery**
+    below.
   - `J`: place a connector at the centre of the view and select it (the
     JOINT button does the same, for when you'd rather not aim a click)
   - `L`: link the selected connectors (rigid; needs 2+ selected)
@@ -118,6 +141,145 @@ Every link's length is drawn as a live numeral alongside it (a small
 hand-drawn seven-segment display — no font dependency), rotated to run
 parallel to the link and offset just clear of it, reflecting its connectors'
 current positions.
+
+## The template gallery
+
+TEMPLATE (`N`) opens a grid of nine standard mechanisms — the ones a theory
+of machines course works through. Click one and it lands on the canvas as
+ordinary parts: drag them, retime the motor, trace different points, export
+them. Nothing in a template is special-cased.
+
+Each tile is a real miniature, built by running the very same code the button
+inserts and scaling the result to fit, so a tile can never drift out of step
+with what you actually get.
+
+**Every one of them can also be built by hand.** The templates use no private
+back door: each is assembled from the same connectors, links, motors, sliders,
+gears, cams and Geneva wheels the toolbar gives you, so a template is a
+starting point or a worked example rather than a black box. Drop one in and
+take it apart, or build your own from nothing.
+
+The crank-slider, the gear train and the Geneva are **not** in the gallery, and
+that is deliberate: their own toolbar buttons draw them outright. Press SLIDER,
+GEAR or GENEVA on an empty canvas and the whole assembly appears, ready to be
+dragged into whatever proportions you wanted — a template would only be a worse
+copy of what the button already gives you.
+
+| | |
+|---|---|
+| FOUR BAR | Grashof crank-rocker; the coupler point traces the classic bean |
+| DRAG LINK | both grounded links turn right round (proportions 5:7:8:9) |
+| PARALLEL | a parallelogram: the coupler translates without ever rotating |
+| HOEKEN | traces a very nearly straight line at nearly constant speed |
+| YOKE | Scotch yoke: exactly sinusoidal motion, no rod distortion |
+| QUICK RTN | Whitworth's quick return: slow cutting stroke, fast return |
+| SCISSOR | crossed arms on a sliding foot |
+| RACK | rack and pinion: rotation into travel |
+| CAM | a profile driving a translating roller follower |
+
+Two notes on what is and isn't here. **Watt's own straight-line linkage is a
+double-rocker** — a constant-speed motor cannot drive it round, it would just
+bind — so the gallery carries Hoeken's linkage, which does the same job and can
+be cranked. And a **scissor lift pinned at both top corners has zero mobility**;
+the template slides at one of them, which is how real ones are built too.
+
+## Joints beyond the pin
+
+Connectors are revolute joints: two links sharing one turns about it. Three
+more kinds of joint make the rest of the catalogue possible.
+
+**Sliders and pins-in-slots** are one constraint: a connector held on the line
+through two others. When the two rail points are anchors that is a prismatic
+joint sliding on ground — a piston, a scissor lift's foot. When they belong to
+a moving link it is a pin running in that link's slot — the Whitworth's slotted
+lever, the Scotch yoke. A slider dragged off its rail binds the mechanism, the
+same as stretching a fixed-length link.
+
+**Gears** roll without slipping, so their rotations are locked in the ratio of
+their radii: opposite in sense for an external mesh, the same for an internal
+one. A **rack** is the limiting case of a gear of infinite radius, so the
+pinion's rotation becomes travel along the rack's axis — exactly the arc length
+rolled off the pitch circle.
+
+**Geneva wheels** turn steady rotation into interrupted rotation: the driver's
+pin enters a slot, indexes the wheel one step, and leaves, and a locking disc
+holds it still until the pin comes round again. The wheel turns the **opposite**
+way to the driver, as an external Geneva does -- the pin sweeping forwards past
+the line of centres swings the slot it occupies backwards. The wheel's angle is computed
+in closed form from the driver's, which is exact and cannot jam. The
+proportions are the standard shock-free ones — the pin has to enter and leave
+*along* the slot, which forces the crank radius to be the centre distance times
+sin(pi/slots) and fixes everything else. Trace the wheel and the plot shows the
+staircase: a step, a long dwell, a step.
+
+Gears and Geneva wheels are *posed* from their driver rather than solved, in
+the same dependency-ordered pass that places motors — so a gear can drive a
+gear that drives another, and each is placed only once its driver has been.
+
+### A gear is a wheel, not a bar
+
+Every other body here is a bar between pins, but a gear is a disc, and drawing
+a rod from its centre out to some point on it would be a spoke nobody asked
+for. So a wheel is exactly that: a hub, a pitch circle, and **a mark on its
+rim** — and that mark is a connector like any other, so TRACE plots its path
+and the time-series panel shows it. The mark sits *on* the pitch circle rather
+than somewhere inside it, so tracing a wheel draws a circle of the wheel's own
+radius: the trace is the gear, not a smaller circle of no significance. It
+exports to Blender as a disc, meshed or not.
+
+A wheel is also a body with **a size of its own**, not a share of the gap
+between two centres. Click anywhere on its face to select it and `+`/`-`
+resize that wheel alone.
+
+### Building a gear train
+
+**To mesh two gears: click one wheel's face, shift-click the other, press
+GEAR.** Shift-click is what adds a second wheel to the selection.
+
+GEAR does one of two things, and which one is plain from what is selected:
+
+| selected | GEAR does |
+|---|---|
+| nothing | puts down **one** wheel, on its own, clear of whatever is already there |
+| two or more wheels | **meshes** them, in the order they were made |
+
+So wheels get placed and sized first and connected afterwards. One press is one
+wheel — pressing it repeatedly never stacks wheels on the same spot, and never
+connects anything you did not ask it to.
+
+Meshing makes the mesh real: two wheels of fixed size touch at exactly one
+distance, so the driven one **slides along the line of centres until they
+touch**, however far apart they were drawn. Afterwards, dragging a meshed wheel
+swings it round its partner instead of pulling the teeth apart, and resizing
+either one closes the gap again by itself.
+
+Because meshing names the wheels rather than guessing, **one wheel can drive
+several** — mesh a hub to one wheel, then to another, then to a third. A wheel
+takes its motion from one place, so meshing onto a wheel that is already driven
+is refused.
+
+Press `M` on a wheel and it becomes the one that drives. The rest of its train
+is re-pointed to flow outwards from it, so any wheel can be named the driver
+whatever order you happened to mesh things in. The driving wheel is drawn in
+the motor's colour, since it has no red bar to give it away.
+
+### Editing a joint### Editing a joint
+
+A joint is a thing you can click, not just a rule you declared once. Click a
+Geneva wheel's rim or its locking disc, or a slider's rail, and that joint is
+selected. Then:
+
+- `+`/`-` change **a Geneva's slot count** (and, on a wheel, its radius). The
+  same keys still change motor speed and cam lift when one of those is what's
+  selected.
+- DELETE removes it and leaves the bars standing. Deleting a wheel takes any
+  mesh it was part of with it.
+
+A Geneva's proportions are still read off the geometry before every solve: its
+crank radius follows its centre distance and slot count, and a rack's pitch
+radius is simply how far the pinion's centre stands off the bar, so sliding the
+bar retimes it. What is drawn on the canvas — each radius, the slot count — is
+what the solver uses.
 
 ## Designing from a path
 
@@ -260,6 +422,12 @@ Each rod is a unit-depth cylinder scaled along its local Z per frame, so
 variable-length links animate their length correctly too. (Apply the scale
 in Blender before exporting for print.)
 
+Sliders, gears and Geneva wheels come across too: a slider's rail becomes a
+slim bar (without it the piston would appear to float, since a rail is often
+just two bare anchors), and gears and Geneva wheels become discs at their pitch
+radius, keyframed from the joints already in the frame table rather than
+needing one of their own.
+
 **Cams are exported as real solids**, not skeletons: each one becomes a closed
 watertight mesh swept from its actual cut profile (already offset inward by
 the roller radius) to `CAM_THICKNESS_MM`, keyframed with the rotation it has
@@ -299,6 +467,12 @@ otherwise-unconstrained degrees of freedom, not a separate physics engine.
 `src/export.c` writes the Blender script; undo/redo (in `src/main.c`) is a
 pair of bounded stacks of full `mechanism_clone()` snapshots — one pushed
 before each edit, the other filled by undoing and discarded by the next edit.
+
+`src/joints.c` owns the kinematics of the sliding, gear and Geneva joints, and
+`src/templates.c` the catalogue. Neither has an SDL dependency, so the Geneva's
+indexing law and every template in the gallery are covered by the headless
+tests -- including one that builds all nine, runs each for six seconds, and
+fails if any binds or fails to move the point it traces.
 
 `src/synth.c` owns both path tools. Both start by resampling the stroke to even
 arc length -- a freehand stroke bunches up wherever the hand slowed, which

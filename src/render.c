@@ -33,6 +33,55 @@ void render_rect_outline(SDL_Renderer *ren, UiRect r, Uint8 red, Uint8 green, Ui
     SDL_RenderDrawRect(ren, &sr);
 }
 
+void render_circle_outline(SDL_Renderer *ren, Vec2 center, double radius, Uint8 red, Uint8 green, Uint8 blue, Uint8 alpha) {
+    if (radius < 0.5) return;
+    int steps = (int)(radius * 0.9);
+    if (steps < 16) steps = 16;
+    if (steps > 240) steps = 240;
+    Vec2 prev = { center.x + radius, center.y };
+    for (int i = 1; i <= steps; i++) {
+        double a = 2.0 * M_PI * (double)i / (double)steps;
+        Vec2 p = { center.x + radius * cos(a), center.y + radius * sin(a) };
+        render_line(ren, prev, p, red, green, blue, alpha);
+        prev = p;
+    }
+}
+
+void render_dashed_line(SDL_Renderer *ren, Vec2 a, Vec2 b, double dash,
+                         Uint8 red, Uint8 green, Uint8 blue, Uint8 alpha) {
+    double len = vec2_len(vec2_sub(b, a));
+    if (len < 1e-6 || dash < 0.5) return;
+    Vec2 dir = vec2_scale(vec2_sub(b, a), 1.0 / len);
+    for (double t = 0.0; t < len; t += dash * 2.0) {
+        double e = fmin(t + dash, len);
+        render_line(ren, vec2_add(a, vec2_scale(dir, t)), vec2_add(a, vec2_scale(dir, e)),
+                    red, green, blue, alpha);
+    }
+}
+
+void render_geneva_wheel(SDL_Renderer *ren, Vec2 center_screen, double radius_px,
+                          int slots, double angle, Uint8 red, Uint8 green, Uint8 blue, Uint8 alpha) {
+    if (slots < 3 || radius_px < 2.0) return;
+    render_circle_outline(ren, center_screen, radius_px, red, green, blue, alpha);
+
+    /* One radial slot per index position, cut in from the rim. */
+    double slot_depth = radius_px * 0.55;
+    double half_width = radius_px * 0.055;
+    for (int i = 0; i < slots; i++) {
+        double a = angle + 2.0 * M_PI * (double)i / (double)slots;
+        Vec2 dir = { cos(a), sin(a) };
+        Vec2 side = vec2_perp(dir);
+        Vec2 outer = vec2_add(center_screen, vec2_scale(dir, radius_px));
+        Vec2 inner = vec2_add(center_screen, vec2_scale(dir, radius_px - slot_depth));
+        for (int sgn = -1; sgn <= 1; sgn += 2) {
+            Vec2 off = vec2_scale(side, sgn * half_width);
+            render_line(ren, vec2_add(outer, off), vec2_add(inner, off), red, green, blue, alpha);
+        }
+        render_line(ren, vec2_add(inner, vec2_scale(side, -half_width)),
+                    vec2_add(inner, vec2_scale(side, half_width)), red, green, blue, alpha);
+    }
+}
+
 void render_ground_hatch(SDL_Renderer *ren, Vec2 pos, double size, Uint8 red, Uint8 green, Uint8 blue, Uint8 alpha) {
     SDL_SetRenderDrawColor(ren, red, green, blue, alpha);
     double y0 = pos.y + size;
@@ -220,6 +269,28 @@ double render_text_width(double height, const char *text) {
     return total;
 }
 
+/* Marks the stroke font carries beyond its letters, so running text can say
+ * "+/-" and "shift-click" instead of spelling them out. Coordinates are in the
+ * same 0..1 by 0..2 box the letters use. */
+static const float SLASH_PTS[] = { 1.0f, 0.0f, 0.0f, 2.0f };
+static const float MINUS_PTS[] = { 0.0f, 1.0f, 1.0f, 1.0f };
+static const float DOT_PTS[]   = { 0.35f, 2.0f, 0.55f, 2.0f };
+static const float COMMA_PTS[] = { 0.55f, 1.9f, 0.25f, 2.3f };
+static const Glyph SLASH_GLYPH = { SLASH_PTS, (int)(sizeof SLASH_PTS / sizeof SLASH_PTS[0]) };
+static const Glyph MINUS_GLYPH = { MINUS_PTS, (int)(sizeof MINUS_PTS / sizeof MINUS_PTS[0]) };
+static const Glyph DOT_GLYPH   = { DOT_PTS,   (int)(sizeof DOT_PTS / sizeof DOT_PTS[0]) };
+static const Glyph COMMA_GLYPH = { COMMA_PTS, (int)(sizeof COMMA_PTS / sizeof COMMA_PTS[0]) };
+
+static const Glyph *mark_for(char c) {
+    switch (c) {
+    case '/': return &SLASH_GLYPH;
+    case '-': return &MINUS_GLYPH;
+    case '.': return &DOT_GLYPH;
+    case ',': return &COMMA_GLYPH;
+    default:  return NULL;
+    }
+}
+
 void render_text(SDL_Renderer *ren, Vec2 top_left, double height, const char *text,
                   Uint8 red, Uint8 green, Uint8 blue, Uint8 alpha) {
     double w = height * 0.55;
@@ -228,7 +299,24 @@ void render_text(SDL_Renderer *ren, Vec2 top_left, double height, const char *te
     double cursor_x = 0.0;
 
     for (const char *p = text; *p; p++) {
+        /* Digits come from the seven-segment numerals the dimensions use, so
+         * text and numbers on the canvas are the same hand. */
+        if (*p >= '0' && *p <= '9') {
+            render_digit(ren, (Vec2){ top_left.x + cursor_x, top_left.y }, 0.0, 0.0,
+                          height, *p - '0', red, green, blue, alpha);
+            cursor_x += spacing;
+            continue;
+        }
+        if (*p == '+') {
+            double cx = top_left.x + cursor_x, cy = top_left.y + half_h;
+            render_line(ren, (Vec2){ cx, cy }, (Vec2){ cx + w, cy }, red, green, blue, alpha);
+            render_line(ren, (Vec2){ cx + w / 2, cy - half_h / 2 },
+                             (Vec2){ cx + w / 2, cy + half_h / 2 }, red, green, blue, alpha);
+            cursor_x += spacing;
+            continue;
+        }
         const Glyph *g = glyph_for(*p);
+        if (!g) g = mark_for(*p);
         if (g) {
             bool pen_down = false;
             Vec2 prev = { 0, 0 };
@@ -357,6 +445,67 @@ void render_trace_color(int connector_id, Uint8 *r, Uint8 *g, Uint8 *b) {
 
 static bool connector_is_plottable(const Connector *c) {
     return c->alive && c->traced && c->path_count >= 2;
+}
+
+/* ---------------------------------------------------------------------------
+ * Hover tooltips
+ * ------------------------------------------------------------------------ */
+#define TIP_TEXT_H 10.0
+#define TIP_LINE_H 15.0
+#define TIP_PAD 8.0
+#define TIP_MAX_W 300.0
+#define TIP_MAX_LINES 8
+
+void render_tooltip(SDL_Renderer *ren, UiRect anchor, const char *text, int win_w, int win_h) {
+    if (!text || !*text) return;
+
+    /* Break the text into lines that fit, on word boundaries. */
+    char lines[TIP_MAX_LINES][96];
+    int line_count = 0;
+    double widest = 0.0;
+    const char *p = text;
+    while (*p && line_count < TIP_MAX_LINES) {
+        int len = 0, last_space = -1;
+        char buf[96];
+        while (*p == ' ') p++;
+        while (p[len] && len < (int)sizeof buf - 1) {
+            buf[len] = p[len];
+            if (p[len] == ' ') last_space = len;
+            buf[len + 1] = '\0';
+            if (render_text_width(TIP_TEXT_H, buf) > TIP_MAX_W) {
+                if (last_space > 0) { len = last_space; buf[len] = '\0'; }
+                break;
+            }
+            len++;
+        }
+        buf[len] = '\0';
+        if (len == 0) break;
+        snprintf(lines[line_count], sizeof lines[0], "%s", buf);
+        double w = render_text_width(TIP_TEXT_H, lines[line_count]);
+        if (w > widest) widest = w;
+        line_count++;
+        p += len;
+    }
+    if (line_count == 0) return;
+
+    UiRect panel = {
+        anchor.x + anchor.w + 10,
+        anchor.y,
+        (int)(widest + 2 * TIP_PAD),
+        (int)(line_count * TIP_LINE_H + 2 * TIP_PAD - (TIP_LINE_H - TIP_TEXT_H)),
+    };
+    /* Keep it on screen: a tooltip that runs off the edge tells you nothing. */
+    if (panel.x + panel.w > win_w - 6) panel.x = win_w - 6 - panel.w;
+    if (panel.x < 6) panel.x = 6;
+    if (panel.y + panel.h > win_h - 6) panel.y = win_h - 6 - panel.h;
+    if (panel.y < 6) panel.y = 6;
+
+    render_rect_filled(ren, panel, 28, 30, 38, 245);
+    render_rect_outline(ren, panel, 120, 130, 150, 255);
+    for (int i = 0; i < line_count; i++) {
+        render_text(ren, (Vec2){ panel.x + TIP_PAD, panel.y + TIP_PAD + i * TIP_LINE_H },
+                     TIP_TEXT_H, lines[i], 210, 214, 224, 255);
+    }
 }
 
 void render_plot(SDL_Renderer *ren, const Mechanism *m, UiRect panel) {

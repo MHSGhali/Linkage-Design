@@ -14,8 +14,14 @@
  * Levenberg damping term is scaled by the largest diagonal of JtJ across the
  * whole problem, so a residual an order of magnitude smaller in its natural
  * units would simply be ignored. RES_AXIS is therefore multiplied by a
- * characteristic length of the mechanism, putting both kinds in length^2. */
-typedef enum { RES_PAIR, RES_AXIS } ResidualKind;
+ * characteristic length of the mechanism, putting both kinds in length^2.
+ *
+ * RES_RAIL is the same idea for a slider or pin-in-slot: a pin held on the
+ * line through two other connectors. Unlike RES_AXIS the line can itself be
+ * moving -- that is what makes it a pin running in a slot rather than a
+ * prismatic joint on ground -- so the rail's own endpoints get Jacobian
+ * entries too. */
+typedef enum { RES_PAIR, RES_AXIS, RES_RAIL } ResidualKind;
 
 typedef struct {
     ResidualKind kind;
@@ -23,7 +29,8 @@ typedef struct {
     double rest;       /* RES_PAIR */
     Vec2 axis_point;   /* RES_AXIS: a point on the axis (the cam centre) */
     Vec2 axis_normal;  /* RES_AXIS: unit normal to the axis */
-    double scale;      /* RES_AXIS: characteristic length */
+    int rail_a, rail_b; /* RES_RAIL: the two connectors defining the line */
+    double scale;      /* RES_AXIS / RES_RAIL: characteristic length */
 } Residual;
 
 /* Largest rest distance anywhere in the mechanism -- the natural length scale
@@ -73,6 +80,22 @@ static double follower_local_angle(const Mechanism *m, const Cam *c, int cam_id)
     return atan2(c->axis_dir.y, c->axis_dir.x) - mechanism_cam_angle(m, cam_id);
 }
 
+/* Picks the connector of `link` farthest from `centre` to read the body's
+ * rotation from -- the longest lever gives the least noisy angle. */
+static int farthest_reference(const Mechanism *m, int link_id, int center_id) {
+    const Link *l = &m->links[link_id];
+    Vec2 centre = m->connectors[center_id].pos;
+    int ref = -1;
+    double best = 0.0;
+    for (int i = 0; i < l->connector_count; i++) {
+        int cid = l->connector_ids[i];
+        if (cid == center_id) continue;
+        double d = vec2_dist(m->connectors[cid].pos, centre);
+        if (d > best) { best = d; ref = cid; }
+    }
+    return ref;
+}
+
 SolverParams solver_default_params(void) {
     SolverParams p;
     p.max_iters = 30;
@@ -90,6 +113,7 @@ SolverParams solver_default_params(void) {
 }
 
 void solver_freeze(Mechanism *m) {
+    mechanism_refresh_joint_sizes(m);
     for (int i = 0; i < m->connector_count; i++) {
         m->connectors[i].prev_pos = m->connectors[i].pos;
     }
@@ -107,13 +131,17 @@ void solver_freeze(Mechanism *m) {
             }
         }
 
-        if (l->is_driven) {
+        if ((l->is_driven || l->driven_externally) &&
+            l->pivot_connector_id >= 0 && l->pivot_connector_id < m->connector_count) {
             free(l->frozen_local_offset);
             l->frozen_local_offset = malloc((size_t)k * sizeof(Vec2));
             Vec2 pivot_pos = m->connectors[l->pivot_connector_id].pos;
             for (int i = 0; i < k; i++) {
                 l->frozen_local_offset[i] = vec2_sub(m->connectors[l->connector_ids[i]].pos, pivot_pos);
             }
+            /* A rack translates from where it started rather than turning
+             * about a pivot, so remember where that was. */
+            l->frozen_pivot_pos = pivot_pos;
             l->accumulated_angle_rad = 0.0;
         }
     }
@@ -122,20 +150,9 @@ void solver_freeze(Mechanism *m) {
         Cam *c = &m->cams[ci];
         if (!cam_is_usable(m, c)) continue;
         if (c->body_link_id < 0 || c->body_link_id >= m->link_count) continue;
-        const Link *l = &m->links[c->body_link_id];
         Vec2 centre = m->connectors[c->center_connector_id].pos;
 
-        /* Read the cam's rotation off whichever of its body link's connectors
-         * sits farthest from the centre -- the longest lever gives the least
-         * noisy angle. */
-        int ref = -1;
-        double best = 0.0;
-        for (int i = 0; i < l->connector_count; i++) {
-            int cid = l->connector_ids[i];
-            if (cid == c->center_connector_id) continue;
-            double d = vec2_dist(m->connectors[cid].pos, centre);
-            if (d > best) { best = d; ref = cid; }
-        }
+        int ref = farthest_reference(m, c->body_link_id, c->center_connector_id);
         c->ref_connector_id = ref;
         if (ref >= 0) {
             Vec2 d = vec2_sub(m->connectors[ref].pos, centre);
@@ -153,18 +170,125 @@ void solver_freeze(Mechanism *m) {
         c->last_angle = 0.0;
         c->in_contact = false;
     }
+
+    for (int gi = 0; gi < m->gear_count; gi++) {
+        Gear *g = &m->gears[gi];
+        if (!g->alive || g->driver_link_id < 0 || g->driver_center_id < 0) continue;
+        g->driver_ref_id = farthest_reference(m, g->driver_link_id, g->driver_center_id);
+        g->frozen_driver_angle = 0.0;
+        if (g->driver_ref_id >= 0) {
+            Vec2 d = vec2_sub(m->connectors[g->driver_ref_id].pos, m->connectors[g->driver_center_id].pos);
+            g->frozen_driver_angle = atan2(d.y, d.x);
+        }
+    }
+
+    for (int vi = 0; vi < m->geneva_count; vi++) {
+        Geneva *gv = &m->genevas[vi];
+        if (!gv->alive || gv->driver_link_id < 0 || gv->driver_center_id < 0) continue;
+        gv->driver_ref_id = farthest_reference(m, gv->driver_link_id, gv->driver_center_id);
+        gv->frozen_driver_angle = 0.0;
+        if (gv->driver_ref_id >= 0) {
+            Vec2 d = vec2_sub(m->connectors[gv->driver_ref_id].pos, m->connectors[gv->driver_center_id].pos);
+            gv->frozen_driver_angle = atan2(d.y, d.x);
+        }
+        gv->center_distance = vec2_dist(m->connectors[gv->driver_center_id].pos,
+                                         m->connectors[gv->wheel_center_id].pos);
+        gv->crank_radius = geneva_crank_radius(gv->slot_count, gv->center_distance);
+        gv->engaged = false;
+    }
 }
 
-/* A motor's pivot is usually an anchor, but it need not be: a motor can be
- * mounted on a part that another motor moves, which is exactly what a chain
- * of rotating arms is. So the driven links are posed in dependency order --
- * anchors first, then whatever their motion has now settled -- rather than in
- * array order, which would pose a child arm from its parent's stale position.
+/* How far a body has turned since the run started -- the UNWRAPPED total, not
+ * an angle.
  *
- * The frozen offsets are captured relative to each pivot, and each link's
- * accumulated angle is absolute, so an arm turning at k times the base rate
- * sweeps k turns per cycle in world terms. That is what makes the chain sum
- * a Fourier series rather than a nest of relative rotations. */
+ * That distinction matters: a Geneva counts whole turns of its driver, and a
+ * gear ratio multiplies them. Reading the angle back off the geometry with
+ * atan2 wraps at half a turn, which would make the driven body jump every time
+ * its driver passed the wrap point.
+ *
+ * A motor keeps exactly the number wanted in its accumulated angle. A body
+ * that is itself posed by a gear or a Geneva does not, but its driver's total
+ * is knowable the same way, so the chain is followed back to whatever motor is
+ * at the end of it. That is what lets a gear drive a gear that drives another
+ * without the last one stuttering. Anything else -- a body moved by a linkage
+ * rather than by a motor -- falls back to the measured angle, which is right so
+ * long as it does not itself go right round. */
+static double body_total_rotation(const Mechanism *m, int link_id, int center_id,
+                                   int ref_id, double frozen_angle, int depth) {
+    if (link_id >= 0 && link_id < m->link_count && depth < 32) {
+        const Link *l = &m->links[link_id];
+        if (l->is_driven && l->pivot_connector_id == center_id) return l->accumulated_angle_rad;
+
+        if (l->driven_externally) {
+            for (int gi = 0; gi < m->gear_count; gi++) {
+                const Gear *g = &m->gears[gi];
+                if (!g->alive || g->kind == GEAR_RACK || g->driven_link_id != link_id) continue;
+                double in = body_total_rotation(m, g->driver_link_id, g->driver_center_id,
+                                                 g->driver_ref_id, g->frozen_driver_angle, depth + 1);
+                return gear_driven_rotation(g, in);
+            }
+            for (int vi = 0; vi < m->geneva_count; vi++) {
+                const Geneva *gv = &m->genevas[vi];
+                if (!gv->alive || gv->wheel_link_id != link_id) continue;
+                double in = body_total_rotation(m, gv->driver_link_id, gv->driver_center_id,
+                                                 gv->driver_ref_id, gv->frozen_driver_angle, depth + 1);
+                return geneva_wheel_angle(gv->slot_count, in, NULL);
+            }
+        }
+    }
+    return mechanism_body_rotation(m, center_id, ref_id, frozen_angle);
+}
+
+static double driver_rotation(const Mechanism *m, int link_id, int center_id,
+                               int ref_id, double frozen_angle) {
+    return body_total_rotation(m, link_id, center_id, ref_id, frozen_angle, 0);
+}
+
+/* Places a link's connectors by rotating its frozen shape about its pivot. */
+static void pose_link_rotated(Mechanism *m, Link *l, double angle, bool *settled) {
+    int pivot = l->pivot_connector_id;
+    Vec2 pivot_pos = m->connectors[pivot].pos;
+    for (int i = 0; i < l->connector_count; i++) {
+        int cid = l->connector_ids[i];
+        if (cid == pivot) continue;
+        m->connectors[cid].pos = vec2_add(pivot_pos, vec2_rotate(l->frozen_local_offset[i], angle));
+        if (settled) settled[cid] = true;
+    }
+    if (settled) settled[pivot] = true;
+}
+
+/* Places a rack: its whole frozen shape slid along the rack axis. */
+static void pose_link_translated(Mechanism *m, Link *l, Vec2 offset, bool *settled) {
+    for (int i = 0; i < l->connector_count; i++) {
+        int cid = l->connector_ids[i];
+        m->connectors[cid].pos = vec2_add(vec2_add(l->frozen_pivot_pos, l->frozen_local_offset[i]), offset);
+        if (settled) settled[cid] = true;
+    }
+}
+
+static bool link_fully_settled(const Mechanism *m, int link_id, const bool *settled) {
+    const Link *l = &m->links[link_id];
+    for (int i = 0; i < l->connector_count; i++) {
+        if (!settled[l->connector_ids[i]]) return false;
+    }
+    return true;
+}
+
+/* Poses everything whose position is dictated rather than solved: motors,
+ * gears and Geneva wheels.
+ *
+ * A motor's pivot is usually an anchor, but it need not be: a motor can be
+ * mounted on a part that another motor moves, which is exactly what a chain of
+ * rotating arms is. Gears and Geneva wheels go further still -- each reads its
+ * driver's rotation, so it can only be placed once that driver has been. So
+ * all three are posed in dependency order, anchors first and then whatever
+ * their motion has settled, rather than in array order, which would place a
+ * body from its driver's stale position.
+ *
+ * The frozen offsets are captured relative to each pivot, and each driven
+ * link's accumulated angle is absolute, so an arm turning at k times the base
+ * rate sweeps k turns per cycle in world terms. That is what makes a chain of
+ * arms sum a Fourier series rather than nest relative rotations. */
 static void pose_driven_links(Mechanism *m) {
     if (m->link_count <= 0) return;
 
@@ -175,22 +299,50 @@ static void pose_driven_links(Mechanism *m) {
     bool progress = true;
     while (progress) {
         progress = false;
+
         for (int li = 0; li < m->link_count; li++) {
             Link *l = &m->links[li];
             if (!l->alive || !l->is_driven || posed[li]) continue;
             int pivot = l->pivot_connector_id;
             if (pivot < 0 || pivot >= m->connector_count || !settled[pivot]) continue;
             if (!l->frozen_local_offset) continue;
-
-            Vec2 pivot_pos = m->connectors[pivot].pos;
-            for (int i = 0; i < l->connector_count; i++) {
-                int cid = l->connector_ids[i];
-                if (cid == pivot) continue;
-                m->connectors[cid].pos =
-                    vec2_add(pivot_pos, vec2_rotate(l->frozen_local_offset[i], l->accumulated_angle_rad));
-                settled[cid] = true;
-            }
+            pose_link_rotated(m, l, l->accumulated_angle_rad, settled);
             posed[li] = true;
+            progress = true;
+        }
+
+        for (int gi = 0; gi < m->gear_count; gi++) {
+            Gear *g = &m->gears[gi];
+            if (!g->alive || g->driven_link_id < 0 || posed[g->driven_link_id]) continue;
+            if (g->driver_link_id < 0 || !link_fully_settled(m, g->driver_link_id, settled)) continue;
+            Link *driven = &m->links[g->driven_link_id];
+            if (!driven->alive || !driven->frozen_local_offset) continue;
+
+            double turn = driver_rotation(m, g->driver_link_id, g->driver_center_id,
+                                           g->driver_ref_id, g->frozen_driver_angle);
+            if (g->kind == GEAR_RACK) {
+                pose_link_translated(m, driven, vec2_scale(g->rack_axis, gear_rack_travel(g, turn)), settled);
+            } else {
+                pose_link_rotated(m, driven, gear_driven_rotation(g, turn), settled);
+            }
+            posed[g->driven_link_id] = true;
+            progress = true;
+        }
+
+        for (int vi = 0; vi < m->geneva_count; vi++) {
+            Geneva *gv = &m->genevas[vi];
+            if (!gv->alive || gv->wheel_link_id < 0 || posed[gv->wheel_link_id]) continue;
+            if (gv->driver_link_id < 0 || !link_fully_settled(m, gv->driver_link_id, settled)) continue;
+            Link *wheel = &m->links[gv->wheel_link_id];
+            if (!wheel->alive || !wheel->frozen_local_offset) continue;
+
+            double turn = driver_rotation(m, gv->driver_link_id, gv->driver_center_id,
+                                           gv->driver_ref_id, gv->frozen_driver_angle);
+            bool engaged = false;
+            double angle = geneva_wheel_angle(gv->slot_count, turn, &engaged);
+            gv->engaged = engaged;
+            pose_link_rotated(m, wheel, angle, settled);
+            posed[gv->wheel_link_id] = true;
             progress = true;
         }
     }
@@ -199,13 +351,11 @@ static void pose_driven_links(Mechanism *m) {
     free(settled);
 }
 
-/* Grounded, or carried rigidly by a motor -- fixed no matter what else is
- * going on, including for force integration. */
 static bool connector_is_anchored_or_driven(const Mechanism *m, int cid) {
     if (m->connectors[cid].is_anchor) return true;
     for (int li = 0; li < m->link_count; li++) {
         const Link *l = &m->links[li];
-        if (!l->alive || !l->is_driven) continue;
+        if (!l->alive || !(l->is_driven || l->driven_externally)) continue;
         for (int i = 0; i < l->connector_count; i++) {
             if (l->connector_ids[i] == cid) return true;
         }
@@ -289,6 +439,14 @@ static double eval_residuals(const Mechanism *m, const int *free_index, const do
         if (res_list[k].kind == RES_AXIS) {
             Vec2 p = get_pos(m, free_index, xvec, res_list[k].ci);
             rr = vec2_dot(vec2_sub(p, res_list[k].axis_point), res_list[k].axis_normal) * res_list[k].scale;
+        } else if (res_list[k].kind == RES_RAIL) {
+            Vec2 p = get_pos(m, free_index, xvec, res_list[k].ci);
+            Vec2 a = get_pos(m, free_index, xvec, res_list[k].rail_a);
+            Vec2 b = get_pos(m, free_index, xvec, res_list[k].rail_b);
+            Vec2 d = vec2_sub(b, a);
+            double len = vec2_len(d);
+            /* Signed distance from the pin to the rail line. */
+            rr = (len > 1e-12) ? (vec2_cross(d, vec2_sub(p, a)) / len) * res_list[k].scale : 0.0;
         } else {
             Vec2 pi = get_pos(m, free_index, xvec, res_list[k].ci);
             Vec2 pj = get_pos(m, free_index, xvec, res_list[k].cj);
@@ -310,6 +468,36 @@ static void build_jacobian(const Mechanism *m, const int *free_index, const doub
             if (free_index[ci] >= 0) {
                 J[k * n + 2 * free_index[ci]] = res_list[k].axis_normal.x * res_list[k].scale;
                 J[k * n + 2 * free_index[ci] + 1] = res_list[k].axis_normal.y * res_list[k].scale;
+            }
+            continue;
+        }
+        if (res_list[k].kind == RES_RAIL) {
+            int pin = res_list[k].ci, ra = res_list[k].rail_a, rb = res_list[k].rail_b;
+            Vec2 p = get_pos(m, free_index, xvec, pin);
+            Vec2 a = get_pos(m, free_index, xvec, ra);
+            Vec2 b = get_pos(m, free_index, xvec, rb);
+            Vec2 d = vec2_sub(b, a), q = vec2_sub(p, a);
+            double len = vec2_len(d);
+            if (len < 1e-12) continue;
+            double f = vec2_cross(d, q);          /* len * signed distance */
+            double sc = res_list[k].scale;
+
+            /* r = cross(d, q) / |d|, differentiated through both the pin and
+             * the rail's own endpoints (the rail may be part of a moving
+             * link). */
+            if (free_index[pin] >= 0) {
+                J[k * n + 2 * free_index[pin]] += (-d.y / len) * sc;
+                J[k * n + 2 * free_index[pin] + 1] += (d.x / len) * sc;
+            }
+            if (free_index[ra] >= 0) {
+                double dfx = -q.y + d.y, dfy = -d.x + q.x;
+                J[k * n + 2 * free_index[ra]] += (dfx / len + f * d.x / (len * len * len)) * sc;
+                J[k * n + 2 * free_index[ra] + 1] += (dfy / len + f * d.y / (len * len * len)) * sc;
+            }
+            if (free_index[rb] >= 0) {
+                double dfx = q.y, dfy = -q.x;
+                J[k * n + 2 * free_index[rb]] += (dfx / len - f * d.x / (len * len * len)) * sc;
+                J[k * n + 2 * free_index[rb] + 1] += (dfy / len - f * d.y / (len * len * len)) * sc;
             }
             continue;
         }
@@ -352,7 +540,7 @@ static bool solve_pass(Mechanism *m, SolverParams params, bool enforce_variable_
             Link *l = &m->links[li];
             /* Driven links are exactly satisfied by construction. Variable
              * links are enforced or not depending on which pass this is. */
-            if (!l->alive || l->is_driven) continue;
+            if (!l->alive || l->is_driven || l->driven_externally) continue;
             if (!l->rigid && !enforce_variable_links) continue;
             int k = l->connector_count;
             for (int i = 0; i < k; i++) {
@@ -372,9 +560,33 @@ static bool solve_pass(Mechanism *m, SolverParams params, bool enforce_variable_
             }
         }
 
+        double scale = characteristic_length(m);
+
+        /* Sliders and pins-in-slots: the pin is held on the rail's line. */
+        for (int si = 0; si < m->slider_count; si++) {
+            const Slider *sl = &m->sliders[si];
+            if (!sl->alive) continue;
+            if (sl->pin_connector_id < 0 || sl->rail_a_id < 0 || sl->rail_b_id < 0) continue;
+            if (!m->connectors[sl->pin_connector_id].alive) continue;
+            /* Nothing to solve if every point involved is already placed. */
+            if (free_index[sl->pin_connector_id] < 0 &&
+                free_index[sl->rail_a_id] < 0 && free_index[sl->rail_b_id] < 0) continue;
+            if (nres >= cap) {
+                cap *= 2;
+                res_list = realloc(res_list, (size_t)cap * sizeof(Residual));
+            }
+            res_list[nres].kind = RES_RAIL;
+            res_list[nres].ci = sl->pin_connector_id;
+            res_list[nres].cj = sl->pin_connector_id;
+            res_list[nres].rest = 0.0;
+            res_list[nres].rail_a = sl->rail_a_id;
+            res_list[nres].rail_b = sl->rail_b_id;
+            res_list[nres].scale = scale;
+            nres++;
+        }
+
         /* An airborne follower still slides on its guide axis. (In contact it
          * is a fixed connector, so there is nothing to constrain.) */
-        double scale = characteristic_length(m);
         for (int ci = 0; ci < m->cam_count; ci++) {
             const Cam *c = &m->cams[ci];
             if (!cam_is_usable(m, c)) continue;
@@ -507,8 +719,9 @@ static bool solve_pass(Mechanism *m, SolverParams params, bool enforce_variable_
 static bool has_length_violation(const Mechanism *m, double abs_tol, double rel_tol, bool include_variable) {
     for (int li = 0; li < m->link_count; li++) {
         const Link *l = &m->links[li];
-        /* Driven links are posed rigidly by construction, so they can't bind. */
-        if (!l->alive || l->is_driven) continue;
+        /* Driven and externally posed links are placed rigidly by
+         * construction, so they can't bind. */
+        if (!l->alive || l->is_driven || l->driven_externally) continue;
         if (!l->rigid && !include_variable) continue;
 
         int k = l->connector_count;
@@ -521,6 +734,18 @@ static bool has_length_violation(const Mechanism *m, double abs_tol, double rel_
                 if (fabs(actual - rest) > allowed) return true;
             }
         }
+    }
+
+    for (int si = 0; si < m->slider_count; si++) {
+        const Slider *sl = &m->sliders[si];
+        if (!sl->alive || sl->pin_connector_id < 0) continue;
+        if (!m->connectors[sl->pin_connector_id].alive) continue;
+        Vec2 a = m->connectors[sl->rail_a_id].pos, b = m->connectors[sl->rail_b_id].pos;
+        Vec2 d = vec2_sub(b, a);
+        double len = vec2_len(d);
+        if (len < 1e-9) continue;
+        double off = fabs(vec2_cross(d, vec2_sub(m->connectors[sl->pin_connector_id].pos, a)) / len);
+        if (off > fmax(abs_tol, rel_tol * len)) return true;
     }
 
     /* Cam contact is one-sided and so can never bind, but the follower's
@@ -550,6 +775,9 @@ static bool has_variable_link(const Mechanism *m) {
 }
 
 bool solver_solve_at_current_angle(Mechanism *m, SolverParams params) {
+    /* Sizes follow the geometry, so a part that has been dragged changes the
+     * mechanism's proportions rather than leaving a gear pair separated. */
+    mechanism_refresh_joint_sizes(m);
     pose_driven_links(m);
 
     /* With no variable-length links there is nothing to decide. */

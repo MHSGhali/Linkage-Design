@@ -15,6 +15,8 @@ static inline double vec2_len(Vec2 a) { return sqrt(vec2_dot(a, a)); }
 static inline double vec2_dist2(Vec2 a, Vec2 b) { Vec2 d = vec2_sub(a, b); return vec2_dot(d, d); }
 static inline double vec2_dist(Vec2 a, Vec2 b) { return sqrt(vec2_dist2(a, b)); }
 static inline Vec2 vec2_perp(Vec2 a) { return (Vec2){ -a.y, a.x }; }
+/* The scalar 2D cross product: positive when b is counter-clockwise of a. */
+static inline double vec2_cross(Vec2 a, Vec2 b) { return a.x * b.y - a.y * b.x; }
 static inline Vec2 vec2_from_angle(double angle) { return (Vec2){ cos(angle), sin(angle) }; }
 static inline Vec2 vec2_rotate(Vec2 v, double angle) {
     double c = cos(angle), s = sin(angle);

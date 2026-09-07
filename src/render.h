@@ -8,6 +8,10 @@
 
 void render_line(SDL_Renderer *ren, Vec2 a, Vec2 b, Uint8 red, Uint8 green, Uint8 blue, Uint8 alpha);
 void render_circle(SDL_Renderer *ren, Vec2 center, double radius, Uint8 red, Uint8 green, Uint8 blue, Uint8 alpha);
+void render_circle_outline(SDL_Renderer *ren, Vec2 center, double radius, Uint8 red, Uint8 green, Uint8 blue, Uint8 alpha);
+/* A line drawn as dashes -- used for guides that aren't parts, like a
+ * slider's rail or a gear's pitch circle. */
+void render_dashed_line(SDL_Renderer *ren, Vec2 a, Vec2 b, double dash, Uint8 red, Uint8 green, Uint8 blue, Uint8 alpha);
 
 void render_rect_filled(SDL_Renderer *ren, UiRect r, Uint8 red, Uint8 green, Uint8 blue, Uint8 alpha);
 void render_rect_outline(SDL_Renderer *ren, UiRect r, Uint8 red, Uint8 green, Uint8 blue, Uint8 alpha);
@@ -43,6 +47,10 @@ double render_text_width(double height, const char *text);
  * and group separators) down the left edge, `strip_height` tall. */
 void render_toolbar(SDL_Renderer *ren, const Toolbar *t, int strip_height);
 
+/* A hover tooltip for `anchor` (the button being pointed at), wrapped to fit
+ * and kept inside the window. Drawn last, over everything else. */
+void render_tooltip(SDL_Renderer *ren, UiRect anchor, const char *text, int win_w, int win_h);
+
 /* The colour a traced connector is drawn in, both as a dot in the canvas and
  * as its curves in the plot, so the two can be matched by eye. Stable per
  * connector id. */
@@ -53,6 +61,11 @@ void render_trace_color(int connector_id, Uint8 *r, Uint8 *g, Uint8 *b);
  * cam's world-space dimensions to pixels. */
 void render_cam(SDL_Renderer *ren, const Cam *cam, Vec2 center_screen, double angle, double zoom,
                  Uint8 red, Uint8 green, Uint8 blue, Uint8 alpha);
+
+/* Draws a Geneva wheel: its rim, the radial slots cut into it, and the locking
+ * arcs between them, turned to `angle`. */
+void render_geneva_wheel(SDL_Renderer *ren, Vec2 center_screen, double radius_px,
+                          int slots, double angle, Uint8 red, Uint8 green, Uint8 blue, Uint8 alpha);
 
 /* Draws the x(t) and y(t) time-series panel for every traced connector, on a
  * shared auto-scaled axis, filling `panel`. */
