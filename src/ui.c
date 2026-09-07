@@ -28,7 +28,8 @@ static const ButtonSpec BUTTON_SPECS[] = {
       "Join the selected pins into one rigid bar. Select 2 or more pins first.", false },
     { UI_MOTOR,   "MOTOR",   "M",
       "Turn the selected body at a steady speed about its anchor. On a gear wheel this "
-      "makes it the one that drives. +/- change the speed.", false },
+      "makes it the one that drives. +/- change the speed; on a wheel, where +/- resize "
+      "it instead, Alt+/- do.", false },
     { UI_SLIDER,  "SLIDER",  "S",
       "With nothing selected, draw a whole crank-slider. With 3 pins selected, the two "
       "farthest apart become the rail and the third slides along it.", true  },

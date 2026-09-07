@@ -1068,8 +1068,9 @@ static void app_add_gear(App *a) {
     int mark = mechanism_wheel_mark(&a->mech, link);
     if (mark >= 0) mechanism_set_traced(&a->mech, mark, true);
     app_fit_view(a, false);   /* wheels step outwards to find space; keep them in view */
-    app_message(a, STATUS_INFO, "Wheel added, radius %.0f. +/- resizes it, M makes it the driver, and "
-            "selecting two or more wheels and pressing GEAR meshes them.", r);
+    app_message(a, STATUS_INFO, "Wheel added, radius %.0f. +/- resizes it (Alt+/- sets its speed "
+            "once it drives), M makes it the driver, and selecting two or more wheels and "
+            "pressing GEAR meshes them.", r);
 }
 
 static void app_add_geneva(App *a) {
@@ -1158,7 +1159,14 @@ static void app_adjust_wheel_radius(App *a, double factor) {
     push_undo(a);
     mechanism_set_wheel_radius(&a->mech, wheels[0], r * factor);
     mechanism_refresh_joint_sizes(&a->mech);
-    app_message(a, STATUS_INFO, "Wheel radius %.0f.", a->mech.links[wheels[0]].wheel_radius);
+    /* On a wheel that drives, +/- is ambiguous -- size or speed? Size wins,
+     * and this is where to mention the key that means the other one. */
+    if (a->mech.links[wheels[0]].is_driven) {
+        app_message(a, STATUS_INFO, "Wheel radius %.0f. Alt+/- changes its speed instead.",
+                     a->mech.links[wheels[0]].wheel_radius);
+    } else {
+        app_message(a, STATUS_INFO, "Wheel radius %.0f.", a->mech.links[wheels[0]].wheel_radius);
+    }
 }
 
 /* +/- on a selected Geneva changes the number of slots, which is the whole
@@ -1330,6 +1338,7 @@ static const KeyNote EXTRA_KEYS[] = {
     { "ARROWS",        "PAN (TURN GALLERY PAGES)" },
     { "0",             "RESET THE VIEW TO 1:1" },
     { "+ -",           "RESIZE OR RETIME WHATEVER IS SELECTED" },
+    { "ALT + -",       "ALWAYS THE MOTOR'S SPEED, EVEN ON A WHEEL" },
     { "[ ]",           "SHIFT A SELECTED CAM'S TIMING" },
     { ".",             "STEP ONE FRAME WHILE PAUSED" },
     { "< >",           "RUN SLOWER OR FASTER" },
@@ -2197,6 +2206,9 @@ static void app_handle_key(App *a, const SDL_KeyboardEvent *key) {
     SDL_Keymod mod = SDL_GetModState();
     bool cmd = (mod & (KMOD_CTRL | KMOD_GUI)) != 0;
     bool shift = (mod & KMOD_SHIFT) != 0;
+    /* Alt, not shift, is the modifier on +/-: on most keyboards "+" IS
+     * shift-equals, so shift is not free to mean anything there. */
+    bool alt = (mod & KMOD_ALT) != 0;
 
     if (prompt_handle_key(a, k)) return;
 
@@ -2274,17 +2286,25 @@ static void app_handle_key(App *a, const SDL_KeyboardEvent *key) {
     case SDLK_LEFTBRACKET:  app_adjust_cam_timing(a, -CAM_TIMING_STEP); return;
     case SDLK_RIGHTBRACKET: app_adjust_cam_timing(a, CAM_TIMING_STEP); return;
 
-    /* +/- means "more of whatever is selected". */
+    /* +/- means "more of whatever is selected": a cam's lift, a wheel's
+     * radius, a Geneva's slot count -- and, when the selected thing has no
+     * size of its own, its motor's speed.
+     *
+     * A DRIVEN WHEEL is both of those things at once, and size won the
+     * cascade, which left the speed of a motorised gear with no key at all.
+     * Alt+/- always means the speed, so both are reachable on the one part. */
     case SDLK_EQUALS:
     case SDLK_KP_PLUS:
-        if (find_single_selected_cam(&a->mech) >= 0) app_adjust_cam_lift(a, CAM_LIFT_SCALE);
+        if (alt) app_adjust_motor_speed(a, MOTOR_SPEED_STEP_DEG_S);
+        else if (find_single_selected_cam(&a->mech) >= 0) app_adjust_cam_lift(a, CAM_LIFT_SCALE);
         else if (gather_selected_wheels(&a->mech, NULL, 0) == 1) app_adjust_wheel_radius(a, WHEEL_RESIZE_STEP);
         else if (find_single_selected_geneva(&a->mech) >= 0) app_adjust_geneva_slots(a, 1);
         else app_adjust_motor_speed(a, MOTOR_SPEED_STEP_DEG_S);
         return;
     case SDLK_MINUS:
     case SDLK_KP_MINUS:
-        if (find_single_selected_cam(&a->mech) >= 0) app_adjust_cam_lift(a, 1.0 / CAM_LIFT_SCALE);
+        if (alt) app_adjust_motor_speed(a, -MOTOR_SPEED_STEP_DEG_S);
+        else if (find_single_selected_cam(&a->mech) >= 0) app_adjust_cam_lift(a, 1.0 / CAM_LIFT_SCALE);
         else if (gather_selected_wheels(&a->mech, NULL, 0) == 1) app_adjust_wheel_radius(a, 1.0 / WHEEL_RESIZE_STEP);
         else if (find_single_selected_geneva(&a->mech) >= 0) app_adjust_geneva_slots(a, -1);
         else app_adjust_motor_speed(a, -MOTOR_SPEED_STEP_DEG_S);

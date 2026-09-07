@@ -88,7 +88,9 @@ terminal for anyone running it from one.
   - `L`: link the selected connectors (rigid; needs 2+ selected)
   - `A`: toggle anchor (grounded) on the selected connectors
   - `M`: toggle the selected link as a driven motor (it must have exactly
-    one anchor connector, which becomes the pivot); `+`/`-` adjust its speed
+    one anchor connector, which becomes the pivot); `+`/`-` adjust its speed.
+    On a **gear wheel** `+`/`-` resize the wheel instead, so `Alt`+`+`/`-` is
+    the speed there — it always means the motor, whatever is selected.
   - `K`: the cam tool. Arm it, then **drag on the canvas to draw the cam's
     outline** — the shape you draw becomes the cam. Nothing needs selecting
     first: the shaft, its motor, and the roller follower are all created for
