@@ -1721,7 +1721,7 @@ static void app_print3d(App *a) {
         snprintf(suggestion, sizeof suggestion, "linkage_parts");
     }
     prompt_open(a, PROMPT_PRINT, "PRINT STL PARTS INTO FOLDER",
-                 "FOLDER, THEN OPTIONS: M= PIN= T= CLR= GAP= WALL= BL= PA= FIT=PIN|M3", suggestion);
+                 "FOLDER, THEN OPTIONS: M= PIN= T= CLR= GAP= WALL= BL= PA= FIT= BASE= ASM=", suggestion);
 }
 
 static void app_save(App *a) {
@@ -2077,6 +2077,17 @@ static void draw_mechanism(SDL_Renderer *ren, const Mechanism *m, DragMode drag_
      * few pixels, and the whole point is the tooth COUNT being visible. */
     static Vec2 tooth_scratch[GEARING_MAX_TEETH * (2 * CANVAS_FLANK_SAMPLES + 9) + 8];
     static Vec2 tooth_screen[GEARING_MAX_TEETH * (2 * CANVAS_FLANK_SAMPLES + 9) + 8];
+    /* The orientation each wheel has to be drawn at for its teeth to fall into
+     * its neighbour's spaces rather than land on their tips. Recomputed each
+     * frame, which is cheap and means it stays right as the train turns and as
+     * wheels are dragged about. */
+    static double *tooth_phase = NULL;
+    static int tooth_phase_cap = 0;
+    if (m->link_count > tooth_phase_cap) {
+        double *grown = realloc(tooth_phase, (size_t)m->link_count * sizeof(double));
+        if (grown) { tooth_phase = grown; tooth_phase_cap = m->link_count; }
+    }
+    if (tooth_phase && tooth_phase_cap >= m->link_count) mechanism_gear_phases(m, tooth_phase);
     for (int li = 0; li < m->link_count; li++) {
         int centre = -1;
         double r = mechanism_gear_wheel_radius(m, li, &centre);
@@ -2095,12 +2106,7 @@ static void draw_mechanism(SDL_Renderer *ren, const Mechanism *m, DragMode drag_
          * They are drawn at the wheel's live rotation, so a running train
          * shows its teeth going through each other's spaces. */
         int teeth = mechanism_wheel_teeth(m, li);
-        int mark = mechanism_wheel_mark(m, li);
-        double spin = 0.0;
-        if (mark >= 0 && m->connectors[mark].alive) {
-            Vec2 d = vec2_sub(m->connectors[mark].pos, m->connectors[centre].pos);
-            if (vec2_len(d) > 1e-9) spin = atan2(d.y, d.x);
-        }
+        double spin = (tooth_phase && li < tooth_phase_cap) ? tooth_phase[li] : 0.0;
         GearSpec spec = { m->gear_module, teeth, GEARING_PRESSURE_ANGLE, 0.0,
                           CANVAS_FLANK_SAMPLES };
         int cap = gearing_outline_capacity(&spec);

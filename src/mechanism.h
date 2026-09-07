@@ -271,6 +271,17 @@ double mechanism_gear_wheel_radius(const Mechanism *m, int link_id, int *center_
 /* A wheel's tooth count, or 0 if that link is not a wheel. */
 int mechanism_wheel_teeth(const Mechanism *m, int link_id);
 
+/* The angle each wheel has to be ORIENTED at for its teeth to fall into the
+ * spaces of the wheels it is meshed with, written into `angles_out` (one entry
+ * per link; non-wheels get 0). Without this a train drawn -- or printed --
+ * from each wheel's own rim mark has its teeth landing tip to tip.
+ *
+ * A wheel meshed with nothing keeps its rim mark's direction, and every wheel
+ * meshed to it follows from that. Because the ratios are exact tooth counts,
+ * a phasing worked out at one pose stays correct as the train turns, so this
+ * can be called every frame and its answer simply used. */
+void mechanism_gear_phases(const Mechanism *m, double *angles_out);
+
 /* Changes the module every wheel is cut to. Each wheel keeps its tooth count,
  * so the whole mechanism scales and every ratio survives; meshes then slide
  * back into contact at the new centre distances. False on a nonsense module. */

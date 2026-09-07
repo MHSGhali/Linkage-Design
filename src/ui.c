@@ -70,7 +70,8 @@ static const ButtonSpec BUTTON_SPECS[] = {
       "Write the motion out as a Blender script, ready to run and play.", false },
     { UI_PRINT,   "PRINT",   "+E",
       "Write a folder of STL parts you can print and bolt together: gears with real "
-      "teeth, plates with pin holes, a baseplate and the pins to join them.", false },
+      "teeth, plates with pin holes, a baseplate, the pins to join them, and the whole "
+      "thing assembled so you can see what goes where.", false },
     { UI_RUN,     "RUN",     "R",
       "Start or stop the simulation. Stopping puts every part back where it started.", false },
     { UI_HELP,    "HELP",    "H",

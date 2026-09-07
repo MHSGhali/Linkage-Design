@@ -6,6 +6,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 /* How finely a cam's surface is sampled for hit-testing. */
 #define CAM_PICK_SAMPLES 180
 
@@ -1140,4 +1144,65 @@ int mechanism_pick_link_edge(const Mechanism *m, Vec2 p, double dist_thresh) {
         }
     }
     return best;
+}
+
+void mechanism_gear_phases(const Mechanism *m, double *angles_out) {
+    if (!angles_out) return;
+    for (int li = 0; li < m->link_count; li++) {
+        angles_out[li] = 0.0;
+        int centre = -1;
+        if (!(mechanism_gear_wheel_radius(m, li, &centre) > 0.0) || centre < 0) continue;
+        int mark = mechanism_wheel_mark(m, li);
+        if (mark < 0 || !m->connectors[mark].alive) continue;
+        Vec2 d = vec2_sub(m->connectors[mark].pos, m->connectors[centre].pos);
+        if (vec2_len(d) > 1e-9) angles_out[li] = atan2(d.y, d.x);
+    }
+    if (m->link_count <= 0) return;
+
+    /* Walk each train outwards from whichever wheel is reached first, keeping
+     * that one's own orientation and turning every wheel it drives to suit. */
+    bool *placed = calloc((size_t)m->link_count, sizeof(bool));
+    int *queue = malloc((size_t)m->link_count * sizeof(int));
+    if (!placed || !queue) { free(placed); free(queue); return; }
+
+    for (int root = 0; root < m->link_count; root++) {
+        if (placed[root] || !mechanism_is_gear_body(m, root)) continue;
+        int head = 0, tail = 0;
+        placed[root] = true;
+        queue[tail++] = root;
+
+        while (head < tail) {
+            int a = queue[head++];
+            for (int gi = 0; gi < m->gear_count; gi++) {
+                const Gear *g = &m->gears[gi];
+                if (!g->alive || g->kind != GEAR_EXTERNAL) continue;
+                int b, ca, cb;
+                if (g->driver_link_id == a) { b = g->driven_link_id; ca = g->driver_center_id; cb = g->driven_center_id; }
+                else if (g->driven_link_id == a) { b = g->driver_link_id; ca = g->driven_center_id; cb = g->driver_center_id; }
+                else continue;
+                if (b < 0 || b >= m->link_count || placed[b]) continue;
+                if (ca < 0 || cb < 0 || !m->connectors[ca].alive || !m->connectors[cb].alive) continue;
+
+                int na = mechanism_wheel_teeth(m, a), nb = mechanism_wheel_teeth(m, b);
+                if (na <= 0 || nb <= 0) continue;
+
+                /* Along the line of centres, `a` presents whatever it presents;
+                 * `b` has to present the opposite. Put a tooth space of `b` on
+                 * that line, then roll it back by however far `a` is turned
+                 * from having a tooth there -- scaled by the tooth ratio,
+                 * because that is what rolling without slipping means. */
+                Vec2 sep = vec2_sub(m->connectors[cb].pos, m->connectors[ca].pos);
+                if (vec2_len(sep) < 1e-9) continue;
+                double phi = atan2(sep.y, sep.x);
+                double pitch_b = 2.0 * M_PI / (double)nb;
+                angles_out[b] = phi + M_PI - pitch_b * 0.5
+                                 - (angles_out[a] - phi) * (double)na / (double)nb;
+
+                placed[b] = true;
+                queue[tail++] = b;
+            }
+        }
+    }
+    free(placed);
+    free(queue);
 }

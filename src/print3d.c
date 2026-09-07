@@ -32,6 +32,11 @@
 #define BASE_MARGIN 8.0
 /* How far a pin stands proud of the top layer, for its cap to grip. */
 #define PIN_CAP_ENGAGEMENT 1.6
+/* How tall a pin's head is. */
+#define PIN_HEAD_HEIGHT 1.6
+/* In the exploded view, how far apart consecutive levels are pulled, as a
+ * multiple of the plate thickness. Far enough to see between them. */
+#define EXPLODE_SPREAD 7.0
 
 PrintParams print_default_params(void) {
     PrintParams p;
@@ -45,6 +50,7 @@ PrintParams print_default_params(void) {
     p.pressure_angle = GEARING_PRESSURE_ANGLE;
     p.m3_hardware = false;
     p.baseplate = true;
+    p.assembly = true;
     return p;
 }
 
@@ -89,6 +95,12 @@ bool print_parse_options(PrintParams *p, const char *opts, char *err, size_t err
             else { if (err) snprintf(err, err_size, "fit= takes 'pin' or 'm3', not '%s'.", val); return false; }
             continue;
         }
+        if (strcmp(key, "asm") == 0) {
+            if (strcmp(val, "on") == 0) w.assembly = true;
+            else if (strcmp(val, "off") == 0) w.assembly = false;
+            else { if (err) snprintf(err, err_size, "asm= takes 'on' or 'off', not '%s'.", val); return false; }
+            continue;
+        }
         if (strcmp(key, "base") == 0) {
             if (strcmp(val, "on") == 0) w.baseplate = true;
             else if (strcmp(val, "off") == 0) w.baseplate = false;
@@ -113,7 +125,7 @@ bool print_parse_options(PrintParams *p, const char *opts, char *err, size_t err
         else if (strcmp(key, "pa") == 0)   w.pressure_angle = clamp(num, 14.0, 30.0) * M_PI / 180.0;
         else {
             if (err) snprintf(err, err_size,
-                              "No option called '%s'. Try m, pin, t, clr, gap, wall, bl, pa, fit, base.",
+                              "No option called '%s'. Try m, pin, t, clr, gap, wall, bl, pa, fit, base, asm.",
                               key);
             return false;
         }
@@ -287,6 +299,18 @@ static void layout_free(Layout *L) {
 
 /* --- Writing parts ------------------------------------------------------- */
 
+/* Where a part goes in the assembled machine: its own origin rotated by
+ * `angle`, moved to `offset`, with its underside at height `z`. Parts already
+ * built in world coordinates (link plates, rails, the baseplate) just use a
+ * zero angle and offset. `shelf` is which level it lifts to in the exploded
+ * view, where the point is to see what goes where rather than what touches. */
+typedef struct {
+    double angle;
+    Vec2 offset;
+    double z;
+    int shelf;
+} Place;
+
 typedef struct {
     const char *dir;
     FILE *man;
@@ -295,7 +319,43 @@ typedef struct {
     int written;
     int failed;
     int warnings;
+    /* Every part, stamped where it belongs -- once touching, once pulled
+     * apart. These are what say how the pile goes together; the individual
+     * STLs only say what to print. */
+    Mesh3 assembled;
+    Mesh3 exploded;
+    double shelf_gap;
+    int top_shelf;
 } Ctx;
+
+static Place place_at(double angle, Vec2 offset, double z, int shelf) {
+    Place at = { angle, offset, z, shelf };
+    return at;
+}
+
+/* Appends `src` to `dst`, turned and moved into place. */
+static void stamp(Mesh3 *dst, const Mesh3 *src, Place at, double lift) {
+    double ca = cos(at.angle), sa = sin(at.angle);
+    for (int t = 0; t < src->tri_count; t++) {
+        Vec3 v[3];
+        for (int k = 0; k < 3; k++) {
+            Vec3 q = src->verts[t * 3 + k];
+            v[k].x = q.x * ca - q.y * sa + at.offset.x;
+            v[k].y = q.x * sa + q.y * ca + at.offset.y;
+            v[k].z = q.z + at.z + lift;
+        }
+        mesh3d_add_tri(dst, v[0], v[1], v[2]);
+    }
+}
+
+static void record_placements(Ctx *c, const Mesh3 *mesh, const Place *places, int count) {
+    if (!c->p.assembly) return;
+    for (int i = 0; i < count; i++) {
+        stamp(&c->assembled, mesh, places[i], 0.0);
+        stamp(&c->exploded, mesh, places[i], (double)places[i].shelf * c->shelf_gap);
+        if (places[i].shelf > c->top_shelf) c->top_shelf = places[i].shelf;
+    }
+}
 
 static void warn(Ctx *c, const char *fmt, ...) {
     va_list ap;
@@ -347,10 +407,35 @@ static bool is_driven_pivot(const Mechanism *m, int cid) {
     return false;
 }
 
+/* Writes a finished mesh out and stamps it into the assembly wherever it
+ * belongs -- which for a pin or a spacer is several places at once. */
+static bool publish(Ctx *c, const char *name, const char *what, const char *where,
+                     Mesh3 *mesh, bool ok, const Place *places, int place_count) {
+    if (ok && !mesh3d_is_closed(mesh)) {
+        ok = false;
+        warn(c, "%s: the sweep did not close up, so it was not written.", name);
+    }
+
+    char path[1024];
+    snprintf(path, sizeof path, "%s/%s.stl", c->dir, name);
+    if (ok && !(ok = mesh3d_write_stl(mesh, name, path))) {
+        warn(c, "%s: could not be written to %s.", name, path);
+    }
+
+    if (ok) {
+        fprintf(c->man, "  %-26s %-38s %s, %d triangles\n", name, what, where, mesh->tri_count);
+        record_placements(c, mesh, places, place_count);
+        c->written++;
+    } else {
+        c->failed++;
+    }
+    return ok;
+}
+
 /* Extrudes one region, checks it is a solid, writes it and logs it. */
-static bool emit(Ctx *c, const char *name, const char *what, int layer,
-                  const Vec2 *outer, int outer_n, const Loop2 *holes, int hole_n,
-                  double thickness) {
+static bool emit_placed(Ctx *c, const char *name, const char *what, int layer,
+                         const Vec2 *outer, int outer_n, const Loop2 *holes, int hole_n,
+                         double thickness, const Place *places, int place_count) {
     if (outer_n < 3) { c->failed++; warn(c, "%s: no outline to sweep.", name); return false; }
 
     Mesh3 mesh;
@@ -362,26 +447,19 @@ static bool emit(Ctx *c, const char *name, const char *what, int layer,
     if (!ok) {
         warn(c, "%s: could not be swept into a solid -- its outline crosses itself, "
                 "or a hole falls outside it.", name);
-    } else if (!mesh3d_is_closed(&mesh)) {
-        ok = false;
-        warn(c, "%s: the sweep did not close up, so it was not written.", name);
     }
 
-    char path[1024];
-    snprintf(path, sizeof path, "%s/%s.stl", c->dir, name);
-    if (ok && !(ok = mesh3d_write_stl(&mesh, name, path))) {
-        warn(c, "%s: could not be written to %s.", name, path);
-    }
-
-    if (ok) {
-        fprintf(c->man, "  %-26s %-38s layer %d, %.1f mm thick, %d triangles\n",
-                 name, what, layer, thickness, mesh.tri_count);
-        c->written++;
-    } else {
-        c->failed++;
-    }
+    char where[64];
+    snprintf(where, sizeof where, "layer %d, %.1f mm thick", layer, thickness);
+    ok = publish(c, name, what, where, &mesh, ok, places, place_count);
     mesh3d_free(&mesh);
     return ok;
+}
+
+static bool emit(Ctx *c, const char *name, const char *what, int layer,
+                  const Vec2 *outer, int outer_n, const Loop2 *holes, int hole_n,
+                  double thickness, Place at) {
+    return emit_placed(c, name, what, layer, outer, outer_n, holes, hole_n, thickness, &at, 1);
 }
 
 /* --- Outline scratch ----------------------------------------------------- */
@@ -440,6 +518,33 @@ static void add_hole(Scratch *s, Vec2 at, double diameter) {
     s->hole_n++;
 }
 
+/* --- Heights -------------------------------------------------------------
+ *
+ * Everything is measured from the TOP FACE of the baseplate, which is z = 0;
+ * the plate itself hangs below. Layer 0 does not sit straight on the plate: a
+ * pin through a joint that is NOT anchored has to get its head in somewhere,
+ * and that somewhere is the gap underneath. */
+
+static double part_standoff(const Ctx *c) {
+    return PIN_HEAD_HEIGHT + c->p.layer_gap;
+}
+
+/* z of the underside, and of the top face, of layer `l`. */
+static double layer_base(const Ctx *c, int l) {
+    return part_standoff(c) + (double)l * (c->p.thickness + c->p.layer_gap);
+}
+
+static double layer_top(const Ctx *c, int l) {
+    return layer_base(c, l) + c->p.thickness;
+}
+
+/* Where a part on layer `l` goes, given how its own origin is turned and where
+ * that origin sits in the world. */
+static Place on_layer(const Ctx *c, int l, double angle, Vec2 offset) {
+    if (l < 0) l = 0;
+    return place_at(angle, offset, layer_base(c, l), l + 1);
+}
+
 /* --- Parts --------------------------------------------------------------- */
 
 /* Every link that is not something more specific: a flat plate covering its
@@ -477,13 +582,16 @@ static void emit_link_plate(Ctx *c, const Layout *L, int li) {
     snprintf(name, sizeof name, "link_%d", li);
     snprintf(what, sizeof what, "link plate, %d pin%s%s", np, np == 1 ? "" : "s",
               l->is_driven ? ", motor-driven" : "");
-    emit(c, name, what, L->layer[li], s.outer, n, s.holes, s.hole_n, c->p.thickness);
+    /* A plate is drawn round the pins where they actually are, so it is
+     * already in world coordinates and only has to be lifted to its layer. */
+    emit(c, name, what, L->layer[li], s.outer, n, s.holes, s.hole_n, c->p.thickness,
+         on_layer(c, L->layer[li], 0.0, (Vec2){ 0.0, 0.0 }));
 
     scratch_free(&s);
     free(pins);
 }
 
-static void emit_gear(Ctx *c, const Layout *L, int li) {
+static void emit_gear(Ctx *c, const Layout *L, int li, const double *phase) {
     int centre = -1;
     (void)mechanism_gear_wheel_radius(c->m, li, &centre);
     int teeth = mechanism_wheel_teeth(c->m, li);
@@ -505,7 +613,11 @@ static void emit_gear(Ctx *c, const Layout *L, int li) {
     snprintf(name, sizeof name, "gear_%d", li);
     snprintf(what, sizeof what, "spur gear, %d teeth, module %.2f, pitch r %.2f",
               teeth, c->p.module, gearing_pitch_radius(c->p.module, teeth));
-    emit(c, name, what, L->layer[li], s.outer, n, s.holes, s.hole_n, c->p.thickness);
+    /* Turned to the angle that drops its teeth into its neighbours' spaces --
+     * placed at each wheel's own rim mark instead, a train would assemble tip
+     * to tip and not turn at all. */
+    emit(c, name, what, L->layer[li], s.outer, n, s.holes, s.hole_n, c->p.thickness,
+         on_layer(c, L->layer[li], phase ? phase[li] : 0.0, c->m->connectors[centre].pos));
 
     if (teeth < GEARING_WEAK_TEETH) {
         warn(c, "gear_%d has only %d teeth; below %d the flanks are short and the "
@@ -555,7 +667,26 @@ static void emit_rack(Ctx *c, const Layout *L, int gi) {
     snprintf(what, sizeof what, "rack, %d teeth, module %.2f, %.1f mm long",
               gearing_rack_teeth(c->p.module, length), c->p.module, length);
     int layer = (g->driven_link_id < L->link_count) ? L->layer[g->driven_link_id] : 0;
-    emit(c, name, what, layer, s.outer, n, s.holes, s.hole_n, c->p.thickness);
+
+    /* The rack is cut with its pitch line along its own x axis, so placing it
+     * means putting that line exactly a pitch radius from the pinion's centre,
+     * with the teeth facing the pinion -- not lining it up with the bar that
+     * was drawn, which sits wherever it was dragged to. */
+    Vec2 axis = vec2_scale(vec2_sub(b1, b0), 1.0 / length);
+    Vec2 left = vec2_perp(axis);
+    Vec2 pinion = c->m->connectors[g->driver_center_id].pos;
+    double side = vec2_dot(vec2_sub(pinion, b0), left);
+    double angle = atan2(axis.y, axis.x);
+    Vec2 towards = left;
+    if (side < 0.0) { towards = vec2_scale(left, -1.0); angle += M_PI; }
+    double rp = gearing_pitch_radius(c->p.module,
+                                     mechanism_wheel_teeth(c->m, g->driver_link_id));
+    Vec2 mid = vec2_scale(vec2_add(b0, b1), 0.5);
+    Vec2 on_pitch_line = vec2_sub(pinion, vec2_scale(towards, rp));
+    Vec2 origin = vec2_add(on_pitch_line,
+                            vec2_scale(axis, vec2_dot(vec2_sub(mid, pinion), axis)));
+    emit(c, name, what, layer, s.outer, n, s.holes, s.hole_n, c->p.thickness,
+         on_layer(c, layer, angle, origin));
     scratch_free(&s);
 }
 
@@ -606,7 +737,11 @@ static void emit_cam(Ctx *c, const Layout *L, int ci) {
     snprintf(what, sizeof what, "disc cam, base r %.1f, lift %.1f%s",
               cam->base_radius, cam->lift, key_r > 0.0 ? ", keyed" : "");
     int layer = L->layer[L->link_count + ci];
-    emit(c, name, what, layer < 0 ? 0 : layer, s.outer, CAM_SEG, s.holes, s.hole_n, c->p.thickness);
+    /* A cam's profile is already in the frame its body is in at rest, so it
+     * needs no turning -- only moving onto its shaft. */
+    emit(c, name, what, layer < 0 ? 0 : layer, s.outer, CAM_SEG, s.holes, s.hole_n,
+         c->p.thickness,
+         on_layer(c, layer, 0.0, c->m->connectors[cam->center_connector_id].pos));
 
     if (cam_is_undercut(cam)) {
         warn(c, "cam_%d is undercut: the roller cannot reach into its tightest "
@@ -623,7 +758,8 @@ static void emit_cam(Ctx *c, const Layout *L, int ci) {
             snprintf(name, sizeof name, "roller_%d", ci);
             snprintf(what, sizeof what, "cam roller, r %.2f", cam->roller_radius);
             emit(c, name, what, layer < 0 ? 0 : layer, rs.outer, rn, rs.holes, rs.hole_n,
-                 c->p.thickness);
+                 c->p.thickness,
+                 on_layer(c, layer, 0.0, c->m->connectors[cam->follower_connector_id].pos));
             scratch_free(&rs);
         }
     }
@@ -704,7 +840,15 @@ static void emit_geneva(Ctx *c, const Layout *L, int vi) {
     snprintf(name, sizeof name, "geneva_wheel_%d", vi);
     snprintf(what, sizeof what, "Geneva wheel, %d slots, rim r %.1f", slots, rim);
     int layer = (gv->wheel_link_id >= 0) ? L->layer[gv->wheel_link_id] : 0;
-    emit(c, name, what, layer < 0 ? 0 : layer, s.outer, n, s.holes, s.hole_n, c->p.thickness);
+    /* Show it at the instant that explains it: one slot facing the driver with
+     * the crank pin sitting at the bottom of it. Anywhere else in the cycle and
+     * the two parts look unrelated. */
+    Vec2 wheel_c = c->m->connectors[gv->wheel_center_id].pos;
+    Vec2 driver_c = c->m->connectors[gv->driver_center_id].pos;
+    Vec2 apart = vec2_sub(driver_c, wheel_c);
+    double towards_driver = atan2(apart.y, apart.x);
+    emit(c, name, what, layer < 0 ? 0 : layer, s.outer, n, s.holes, s.hole_n, c->p.thickness,
+         on_layer(c, layer, towards_driver, wheel_c));
     scratch_free(&s);
 
     /* The driver: an arm from the shaft out to the crank pin. */
@@ -718,7 +862,8 @@ static void emit_geneva(Ctx *c, const Layout *L, int vi) {
         snprintf(name, sizeof name, "geneva_driver_%d", vi);
         snprintf(what, sizeof what, "Geneva driver arm, crank r %.2f", gv->crank_radius);
         int dl = (gv->driver_link_id >= 0) ? L->layer[gv->driver_link_id] : 0;
-        emit(c, name, what, dl < 0 ? 0 : dl, ds.outer, dn, ds.holes, ds.hole_n, c->p.thickness);
+        emit(c, name, what, dl < 0 ? 0 : dl, ds.outer, dn, ds.holes, ds.hole_n, c->p.thickness,
+             on_layer(c, dl, towards_driver + M_PI, driver_c));
         scratch_free(&ds);
     }
 
@@ -759,7 +904,8 @@ static bool emit_rail(Ctx *c, int si, Vec2 *mount_a, Vec2 *mount_b) {
     char name[64], what[160];
     snprintf(name, sizeof name, "rail_%d", si);
     snprintf(what, sizeof what, "slider rail, %.1f mm of travel", len);
-    bool ok = emit(c, name, what, 0, s.outer, n, s.holes, s.hole_n, c->p.thickness);
+    bool ok = emit(c, name, what, 0, s.outer, n, s.holes, s.hole_n, c->p.thickness,
+                    on_layer(c, 0, 0.0, (Vec2){ 0.0, 0.0 }));
     scratch_free(&s);
 
     /* Only a rail that was actually written needs bolting down. Reporting the
@@ -773,41 +919,35 @@ static bool emit_rail(Ctx *c, int si, Vec2 *mount_a, Vec2 *mount_b) {
 
 /* --- Assembly hardware --------------------------------------------------- */
 
-/* z of the top of layer `l`, measured from the top face of the baseplate. */
-static double layer_top(const Ctx *c, int l) {
-    return (double)(l + 1) * c->p.thickness + (double)l * c->p.layer_gap;
-}
-
-static void emit_pin(Ctx *c, double length, int quantity) {
+/* A headed pin, plus the cap that goes on the far end of it. `places` says
+ * every joint this length of pin belongs in, so the assembly gets one at each
+ * while only one STL is written. */
+static void emit_pin(Ctx *c, double length, const Place *places, const Place *cap_places,
+                      int quantity) {
     double shaft_r = c->p.pin_diameter * 0.5;
     double head_r = shaft_r + c->p.wall;
-    double head_h = 1.6;
 
     Mesh3 mesh;
     mesh3d_init(&mesh);
     Vec2 ring[HOLE_SEG];
     int hn = mesh3d_circle((Vec2){ 0, 0 }, head_r, HOLE_SEG, ring, HOLE_SEG);
     Region2 head = { { ring, hn }, NULL, 0 };
-    bool ok = mesh3d_extrude(&mesh, &head, 0.0, head_h);
+    bool ok = mesh3d_extrude(&mesh, &head, 0.0, PIN_HEAD_HEIGHT);
 
     Vec2 shaft_ring[HOLE_SEG];
     int sn = mesh3d_circle((Vec2){ 0, 0 }, shaft_r, HOLE_SEG, shaft_ring, HOLE_SEG);
     Region2 shaft = { { shaft_ring, sn }, NULL, 0 };
-    ok = mesh3d_extrude(&mesh, &shaft, head_h, head_h + length) && ok;
+    /* Head and shaft are two separate closed solids sitting face to face, not
+     * one shell. A slicer unions overlapping bodies, which is exactly what a
+     * printer does with them, and the closedness check is happy either way
+     * because every edge still has its partner within its own solid. */
+    ok = mesh3d_extrude(&mesh, &shaft, PIN_HEAD_HEIGHT, PIN_HEAD_HEIGHT + length) && ok;
 
-    char name[64], path[1024];
+    char name[64], what[64], where[64];
     snprintf(name, sizeof name, "pin_%.1fmm", length);
-    snprintf(path, sizeof path, "%s/%s.stl", c->dir, name);
-    /* Two prisms stacked face to face are two closed solids, not one: the
-     * slicer unions them, and that is exactly what a printer does with
-     * overlapping bodies. So this one is not asked to be a single shell. */
-    if (ok && mesh3d_write_stl(&mesh, name, path)) {
-        fprintf(c->man, "  %-26s %-38s x%d\n", name,
-                 c->p.m3_hardware ? "pin (unused in M3 mode)" : "headed pin", quantity);
-        c->written++;
-    } else {
-        c->failed++;
-    }
+    snprintf(what, sizeof what, "%s", c->p.m3_hardware ? "pin (unused in M3 mode)" : "headed pin");
+    snprintf(where, sizeof where, "x%d", quantity);
+    publish(c, name, what, where, &mesh, ok, places, quantity);
     mesh3d_free(&mesh);
 
     /* The cap that stops the stack sliding back off the pin. */
@@ -817,13 +957,14 @@ static void emit_pin(Ctx *c, double length, int quantity) {
         add_hole(&cs, (Vec2){ 0, 0 }, press_hole(c));
         char cname[64], cwhat[160];
         snprintf(cname, sizeof cname, "cap_%.1fmm", length);
-        snprintf(cwhat, sizeof cwhat, "push-on cap for pin_%.1fmm", length);
-        emit(c, cname, cwhat, 0, cs.outer, cn, cs.holes, cs.hole_n, PIN_CAP_ENGAGEMENT);
+        snprintf(cwhat, sizeof cwhat, "push-on cap for pin_%.1fmm, x%d", length, quantity);
+        emit_placed(c, cname, cwhat, 0, cs.outer, cn, cs.holes, cs.hole_n,
+                     PIN_CAP_ENGAGEMENT, cap_places, quantity);
         scratch_free(&cs);
     }
 }
 
-static void emit_spacer(Ctx *c, double height, int quantity) {
+static void emit_spacer(Ctx *c, double height, const Place *places, int quantity) {
     Scratch s;
     if (!scratch_init(&s, HOLE_SEG, 1)) return;
     int n = mesh3d_circle((Vec2){ 0, 0 }, running_hole(c) * 0.5 + c->p.wall, HOLE_SEG,
@@ -832,7 +973,7 @@ static void emit_spacer(Ctx *c, double height, int quantity) {
     char name[64], what[160];
     snprintf(name, sizeof name, "spacer_%.2fmm", height);
     snprintf(what, sizeof what, "spacer washer, %.2f mm tall, x%d", height, quantity);
-    emit(c, name, what, 0, s.outer, n, s.holes, s.hole_n, height);
+    emit_placed(c, name, what, 0, s.outer, n, s.holes, s.hole_n, height, places, quantity);
     scratch_free(&s);
 }
 
@@ -868,11 +1009,20 @@ bool print3d_export(const Mechanism *m, PrintParams p, const char *dir,
         return false;
     }
 
-    Ctx c = { dir, man, p, m, 0, 0, 0 };
+    Ctx c = { dir, man, p, m, 0, 0, 0, { NULL, 0, 0 }, { NULL, 0, 0 },
+              p.thickness * EXPLODE_SPREAD, 0 };
+    mesh3d_init(&c.assembled);
+    mesh3d_init(&c.exploded);
 
     Layout layout;
     layout_build(&layout, m);
     if (!layout.layer) { fclose(man); return false; }
+
+    /* Wheels have to be turned so their teeth interleave; each wheel's own rim
+     * mark points wherever it happens to point. */
+    double *phase = (m->link_count > 0)
+                     ? malloc((size_t)m->link_count * sizeof(double)) : NULL;
+    if (phase) mechanism_gear_phases(m, phase);
 
     fprintf(man, "Linkage Design -- printable parts\n");
     fprintf(man, "=================================\n\n");
@@ -916,7 +1066,7 @@ bool print3d_export(const Mechanism *m, PrintParams p, const char *dir,
         for (int k = 0; k < rack_links; k++) if (rack_link[k] == li) is_rack = true;
         if (is_rack) continue;
         if (is_geneva_body(m, li)) continue;
-        if (mechanism_is_gear_body(m, li)) emit_gear(&c, &layout, li);
+        if (mechanism_is_gear_body(m, li)) emit_gear(&c, &layout, li, phase);
         else emit_link_plate(&c, &layout, li);
     }
     for (int gi = 0; gi < m->gear_count; gi++) {
@@ -971,10 +1121,13 @@ bool print3d_export(const Mechanism *m, PrintParams p, const char *dir,
     }
 
     fprintf(man, "\nAssembly\n");
-    fprintf(man, "  Layer 0 sits on the baseplate; each layer above it is %.2f mm higher.\n",
-             p.thickness + p.layer_gap);
+    fprintf(man, "  The baseplate's top face is height 0. Layer 0 stands %.2f mm above it --\n",
+             part_standoff(&c));
+    fprintf(man, "  room for a pin head at a joint that is not anchored -- and each layer\n");
+    fprintf(man, "  above that is a further %.2f mm up.\n", p.thickness + p.layer_gap);
 
-    /* Pins and spacers, one of each distinct size. */
+    /* Pins and spacers: one STL per distinct size, but one PLACE per joint, so
+     * the assembly shows a pin standing in every hole. */
     double pin_lengths[64];
     int pin_counts[64];
     int pin_kinds = 0;
@@ -983,32 +1136,67 @@ bool print3d_export(const Mechanism *m, PrintParams p, const char *dir,
     int spacer_kinds = 0;
     double base_thickness = p.thickness * BASE_THICKNESS_FACTOR;
 
+    int max_places = m->connector_count > 0 ? m->connector_count : 1;
+    Place *pin_places = calloc((size_t)(64 * max_places), sizeof(Place));
+    Place *cap_places = calloc((size_t)(64 * max_places), sizeof(Place));
+    Place *spacer_places = calloc((size_t)(64 * max_places), sizeof(Place));
+    if (!pin_places || !cap_places || !spacer_places) {
+        free(pin_places); free(cap_places); free(spacer_places);
+        free(lowest); free(highest); free(used);
+        layout_free(&layout); fclose(man);
+        return false;
+    }
+    /* Pins and caps sit above everything in the exploded view, which is where
+     * you would be holding them if you were putting the thing together. */
+    int pin_shelf = layout.max_layer + 2;
+
     for (int cid = 0; cid < m->connector_count; cid++) {
         if (!m->connectors[cid].alive || highest[cid] < 0) continue;
         if (is_wheel_rim_mark(m, cid)) continue;
-        double length = layer_top(&c, highest[cid]) + PIN_CAP_ENGAGEMENT;
-        if (p.baseplate && m->connectors[cid].is_anchor) length += base_thickness;
+        Vec2 at = m->connectors[cid].pos;
+        bool anchored = p.baseplate && m->connectors[cid].is_anchor;
+
+        /* An anchored pin is pressed through the baseplate and headed
+         * underneath it. A moving one cannot be headed under the plate -- the
+         * plate is solid there -- so its head goes in the standoff gap ABOVE
+         * the plate, resting on it, which is what that gap is for. */
+        double head_bottom = anchored ? -base_thickness - PIN_HEAD_HEIGHT : 0.0;
+        double shaft_top = layer_top(&c, highest[cid]) + PIN_CAP_ENGAGEMENT;
+        double length = shaft_top - (head_bottom + PIN_HEAD_HEIGHT);
         length = ceil(length * 2.0) / 2.0;   /* round to the half millimetre */
 
         int slot = -1;
         for (int i = 0; i < pin_kinds; i++) if (fabs(pin_lengths[i] - length) < 1e-6) slot = i;
         if (slot < 0 && pin_kinds < 64) { pin_lengths[pin_kinds] = length; pin_counts[pin_kinds] = 0; slot = pin_kinds++; }
-        if (slot >= 0) pin_counts[slot]++;
+        if (slot >= 0 && pin_counts[slot] < max_places) {
+            pin_places[slot * max_places + pin_counts[slot]] =
+                place_at(0.0, at, head_bottom, pin_shelf);
+            cap_places[slot * max_places + pin_counts[slot]] =
+                place_at(0.0, at, layer_top(&c, highest[cid]), pin_shelf);
+            pin_counts[slot]++;
+        }
 
         /* Anything on the pin below the lowest occupied layer, or in a gap
          * between two occupied ones, has to be packed out. */
         for (int lay = 0; lay <= highest[cid]; lay++) {
             if (lay < 64 && (used[cid] & (1ULL << lay))) continue;
             double h = p.thickness + p.layer_gap;
-            int s = -1;
-            for (int i = 0; i < spacer_kinds; i++) if (fabs(spacer_heights[i] - h) < 1e-6) s = i;
-            if (s < 0 && spacer_kinds < 64) { spacer_heights[spacer_kinds] = h; spacer_counts[spacer_kinds] = 0; s = spacer_kinds++; }
-            if (s >= 0) spacer_counts[s]++;
+            int si = -1;
+            for (int i = 0; i < spacer_kinds; i++) if (fabs(spacer_heights[i] - h) < 1e-6) si = i;
+            if (si < 0 && spacer_kinds < 64) { spacer_heights[spacer_kinds] = h; spacer_counts[spacer_kinds] = 0; si = spacer_kinds++; }
+            if (si >= 0 && spacer_counts[si] < max_places) {
+                spacer_places[si * max_places + spacer_counts[si]] =
+                    place_at(0.0, at, layer_base(&c, lay), lay + 1);
+                spacer_counts[si]++;
+            }
         }
     }
 
     if (!p.m3_hardware) {
-        for (int i = 0; i < pin_kinds; i++) emit_pin(&c, pin_lengths[i], pin_counts[i]);
+        for (int i = 0; i < pin_kinds; i++) {
+            emit_pin(&c, pin_lengths[i], pin_places + (size_t)i * max_places,
+                      cap_places + (size_t)i * max_places, pin_counts[i]);
+        }
     } else {
         fprintf(man, "  Hardware to buy:\n");
         for (int i = 0; i < pin_kinds; i++) {
@@ -1016,7 +1204,13 @@ bool print3d_export(const Mechanism *m, PrintParams p, const char *dir,
                      pin_counts[i], ceil(pin_lengths[i]));
         }
     }
-    for (int i = 0; i < spacer_kinds; i++) emit_spacer(&c, spacer_heights[i], spacer_counts[i]);
+    for (int i = 0; i < spacer_kinds; i++) {
+        emit_spacer(&c, spacer_heights[i], spacer_places + (size_t)i * max_places,
+                     spacer_counts[i]);
+    }
+    free(pin_places);
+    free(cap_places);
+    free(spacer_places);
 
     /* The baseplate, which is what actually holds the gear centres apart. */
     if (p.baseplate) {
@@ -1050,7 +1244,8 @@ bool print3d_export(const Mechanism *m, PrintParams p, const char *dir,
                     }
                     for (int i = 0; i < extra_mount_count; i++) add_hole(&s, extra_mounts[i], press_hole(&c));
                     emit(&c, "baseplate", "ground plate; holds every anchor", 0,
-                         s.outer, on, s.holes, s.hole_n, base_thickness);
+                         s.outer, on, s.holes, s.hole_n, base_thickness,
+                         place_at(0.0, (Vec2){ 0.0, 0.0 }, -base_thickness, 0));
                     scratch_free(&s);
                 }
                 free(pts);
@@ -1084,6 +1279,40 @@ bool print3d_export(const Mechanism *m, PrintParams p, const char *dir,
                  g->driver_link_id, ta, gi, gearing_pitch_radius(p.module, ta));
     }
 
+    /* The two views of the whole thing. Neither is a part to print: they are
+     * what tells you which part goes where, which a folder of separate STLs
+     * cannot say on its own. */
+    if (p.assembly && c.assembled.tri_count > 0) {
+        char path[1024];
+        fprintf(man, "\nHow it goes together\n");
+
+        if (!mesh3d_shells_are_closed(&c.assembled)) {
+            warn(&c, "the assembled view has an open edge in it, which means a part "
+                     "was placed wrong; trust the individual parts over it.");
+        }
+
+        snprintf(path, sizeof path, "%s/assembly.stl", dir);
+        if (mesh3d_write_stl(&c.assembled, "assembly", path)) {
+            fprintf(man, "  %-26s %-38s %d triangles\n", "assembly",
+                     "every part where it belongs", c.assembled.tri_count);
+        } else {
+            warn(&c, "the assembled view could not be written.");
+        }
+
+        snprintf(path, sizeof path, "%s/assembly_exploded.stl", dir);
+        if (mesh3d_write_stl(&c.exploded, "assembly_exploded", path)) {
+            fprintf(man, "  %-26s %-38s %d triangles\n", "assembly_exploded",
+                     "the same, lifted apart by layer", c.exploded.tri_count);
+        } else {
+            warn(&c, "the exploded view could not be written.");
+        }
+        fprintf(man, "  Layers are pulled %.1f mm apart in the exploded view; pins and caps\n",
+                 c.shelf_gap);
+        fprintf(man, "  sit above everything, over the holes they drop into.\n");
+        fprintf(man, "  Neither file is a part to print. They are several solids touching,\n");
+        fprintf(man, "  not one watertight shell -- open them to see what goes where.\n");
+    }
+
     fprintf(man, "\n%d part%s written", c.written, c.written == 1 ? "" : "s");
     if (c.failed) fprintf(man, ", %d could not be", c.failed);
     if (c.warnings) fprintf(man, ", %d warning%s above", c.warnings, c.warnings == 1 ? "" : "s");
@@ -1092,6 +1321,9 @@ bool print3d_export(const Mechanism *m, PrintParams p, const char *dir,
     free(lowest);
     free(highest);
     free(used);
+    free(phase);
+    mesh3d_free(&c.assembled);
+    mesh3d_free(&c.exploded);
     layout_free(&layout);
     fclose(man);
 

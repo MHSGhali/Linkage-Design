@@ -15,10 +15,13 @@
  *
  * The motion is produced by simulating a private copy of the mechanism, so
  * the live one is left untouched. A driven mechanism is sampled over one
- * full revolution of its fastest motor; one with no motor is sampled over a
- * few seconds of gravity. If the mechanism binds partway (a fixed-length
- * link would have to change length), sampling stops there and the animation
- * covers only the part it could actually reach.
+ * full revolution of its SLOWEST motor -- with one motor the two are the same,
+ * but a drawing machine's arms turn at whole multiples of a base rate and it
+ * is one turn of the slowest that completes the figure -- extended to as many
+ * driver turns as a gear ratio or a Geneva needs to come back round. One with
+ * no motor is sampled over a few seconds of gravity. If the mechanism binds
+ * partway (a fixed-length link would have to change length), sampling stops
+ * there and the animation covers only the part it could actually reach.
  *
  * Convention: 1 mechanism world unit = 1 mm; the script sets the Blender
  * scene's display units to millimeters and converts coordinates to meters

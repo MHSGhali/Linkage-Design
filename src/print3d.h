@@ -50,6 +50,8 @@ typedef struct {
     bool m3_hardware;       /* size holes for M3 screws and list the hardware,
                               * instead of generating printed pins */
     bool baseplate;         /* emit the ground plate that fixes the anchors */
+    bool assembly;          /* also write the whole machine assembled, and
+                              * pulled apart layer by layer, as two more STLs */
 } PrintParams;
 
 PrintParams print_default_params(void);

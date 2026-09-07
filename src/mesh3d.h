@@ -63,10 +63,17 @@ bool mesh3d_extrude(Mesh3 *m, const Region2 *r, double z0, double z1);
  * because mesh3d_extrude is built on it and the tests want it directly. */
 bool mesh3d_triangulate(Mesh3 *m, const Region2 *r, double z, bool up);
 
-/* Whether the soup is a closed surface: every directed edge is matched by
+/* Whether the soup is ONE closed surface: every directed edge is matched by
  * exactly one edge running the other way. This is the printability check --
  * a mesh that fails it is not a solid. An empty mesh is not closed. */
 bool mesh3d_is_closed(const Mesh3 *m);
+
+/* Whether the soup is a closed surface, allowing SEVERAL of them: every
+ * directed edge is matched by as many running the other way. Use this for an
+ * assembly, where separate solids touch face to face -- coincident faces make
+ * an edge appear four times rather than two, which is not a hole and must not
+ * be read as one. Every mesh that passes mesh3d_is_closed passes this too. */
+bool mesh3d_shells_are_closed(const Mesh3 *m);
 
 /* Writes a binary STL. `name` goes in the 80-byte header, for anyone who
  * opens the file in a text editor. False if the file could not be written. */

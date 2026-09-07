@@ -118,8 +118,8 @@ terminal for anyone running it from one.
     its x and y are plotted against time below (see **The motion plot**).
     Both reset each time you press `R`.
   - `Shift+E`: write a folder of printable STL parts — gears with real teeth,
-    plates with pin holes, a baseplate and the pins to join them (see
-    **Printing it** below).
+    plates with pin holes, a baseplate, the pins to join them, and two views
+    of the whole thing assembled (see **Printing it** below).
   - `E`: export the mechanism to a ready-to-run Blender Python script. You are
     asked for the file name, and told if one of that name already exists (see
     **Exporting to Blender** below).
@@ -227,10 +227,12 @@ lever, the Scotch yoke. A slider dragged off its rail binds the mechanism, the
 same as stretching a fixed-length link.
 
 **Gears** roll without slipping, so their rotations are locked in the ratio of
-their radii: opposite in sense for an external mesh, the same for an internal
-one. A **rack** is the limiting case of a gear of infinite radius, so the
-pinion's rotation becomes travel along the rack's axis — exactly the arc length
-rolled off the pitch circle.
+their tooth counts: opposite in sense for an external mesh, the same for an
+internal one. A count, not a quotient of measurements — which is why the ratio
+comes out exact and why a pair either meshes or does not (see **A gear is a
+wheel, not a bar**). A **rack** is the limiting case of a gear of infinite
+radius, so the pinion's rotation becomes travel along the rack's axis — exactly
+the arc length rolled off the pitch circle.
 
 **Geneva wheels** turn steady rotation into interrupted rotation: the driver's
 pin enters a slot, indexes the wheel one step, and leaves, and a locking disc
@@ -296,7 +298,14 @@ is re-pointed to flow outwards from it, so any wheel can be named the driver
 whatever order you happened to mesh things in. The driving wheel is drawn in
 the motor's colour, since it has no red bar to give it away.
 
-### Editing a joint### Editing a joint
+A wheel is **a whole number of teeth on a shared module**, not a free radius,
+so the number beside it is its tooth count and the ratio of a mesh is an exact
+ratio of counts — 24 and 12 turn at exactly 2:1, not at 1.9997:1. The teeth
+drawn on the canvas are the real involute outline, turned so they interleave
+with their neighbour's, and they are the same teeth the STL export cuts. See
+**Printing it**.
+
+### Editing a joint
 
 A joint is a thing you can click, not just a rule you declared once. Click a
 Geneva wheel's rim or its locking disc, or a slider's rail, and that joint is
@@ -441,9 +450,12 @@ to give.
 Cmd/Ctrl+`S` writes the mechanism to a `.linkage` file: a plain-text document
 listing the pins, bodies, joints and cam profiles, which reopens with
 Cmd/Ctrl+`O` exactly as you left it — same geometry, same motors, same motion.
-Everything that can be worked out again (rest lengths, pitch radii, recorded
+Everything that can be worked out again (rest lengths, mesh radii, recorded
 traces) is left out and rebuilt on opening, so the file stays small and
-readable.
+readable. A wheel's **tooth count** and the mechanism's **module** are choices
+rather than derivations, so those are written down; a file from before gears
+had teeth still opens, and each of its wheels is put on the nearest whole tooth
+as it loads.
 
 The title bar shows the file's name and marks it with `*` while there are
 unsaved changes, and closing the window with changes outstanding asks first.
@@ -465,12 +477,15 @@ it builds one cylinder per link edge and one empty per joint (named
 watch the mechanism run exactly as it does here.
 
 The motion is produced by simulating a private copy of the mechanism, so
-exporting never disturbs what's on screen. A driven mechanism is sampled
-over one full revolution of its fastest motor, so the animation loops
-cleanly; a motorless one is sampled over a few seconds of gravity. If the
-mechanism binds partway, sampling stops at the bind and the animation covers
-only what it could actually reach. Playback is set to real time via the
-scene's frame rate.
+exporting never disturbs what's on screen. A driven mechanism is sampled over
+one full revolution of its **slowest** motor, so the animation loops cleanly:
+with a single motor the slowest and the fastest are the same, but a drawing
+machine's arms turn at whole multiples of a base rate and it is one turn of the
+slowest that completes the figure. A gear ratio or a Geneva needs several
+driver turns to come back round, and the sample is stretched to cover them. A
+motorless mechanism is sampled over a few seconds of gravity. If the mechanism
+binds partway, sampling stops at the bind and the animation covers only what it
+could actually reach. Playback is set to real time via the scene's frame rate.
 
 Each rod is a unit-depth cylinder scaled along its local Z per frame, so
 variable-length links animate their length correctly too. (Apply the scale
@@ -485,8 +500,7 @@ needing one of their own.
 **Cams are exported as real solids**, not skeletons: each one becomes a closed
 watertight mesh swept from its actual cut profile (already offset inward by
 the roller radius) to `CAM_THICKNESS_MM`, keyframed with the rotation it has
-in the simulation, and its roller comes along as a cylinder. That is the part
-you would send to a printer.
+in the simulation, and its roller comes along as a cylinder.
 
 Convention: **1 world unit = 1 mm** — the script sets the scene's display
 units to millimeters accordingly. Rod radius is a constant
@@ -519,6 +533,7 @@ gearbox m=1.5 t=4 pin=3 fit=m3
 | `pa=` | pressure angle, degrees | 20 |
 | `fit=` | `pin` for printed pins, `m3` for M3 hardware | `pin` |
 | `base=` | `on` or `off` for the baseplate | `on` |
+| `asm=` | `on` or `off` for the two assembled views | `on` |
 
 Nonsense values are clamped rather than refused; an unknown key stops the
 export and says which one it was. Every setting actually used is written at the
@@ -530,15 +545,15 @@ Two gears mesh only if they share a module and have whole tooth counts, and
 then they mesh at exactly one centre distance — `module * (Na + Nb) / 2`. A
 pair drawn a third of a tooth apart looks fine on screen and prints as two
 wheels that jam or never touch. So **a wheel's size is now a tooth count**:
-`+`/`-` step it a whole tooth at a time, meshing sets the centre distance
-exactly, and the number beside a wheel is its tooth count rather than its
-radius. The canvas draws the real involute outline, from the same generator the
+`+`/`-` resize it and it lands on a whole number of teeth, meshing sets the
+centre distance exactly, and the number beside a wheel is its tooth count
+rather than its radius. The canvas draws the real involute outline, from the same generator the
 STL export extrudes, so the mesh you judge by eye is the mesh that prints.
 
 A pitch radius is `module * teeth / 2`, so at the default module of 2 a 30 mm
 wheel is a 30-tooth wheel. Below 14 teeth the flanks get short and the manifest
-says so; below 8 a 20-degree involute has no usable flank left and the wheel is
-refused.
+says so; below 8 a 20-degree involute has no usable flank left at all, so no
+wheel is ever cut smaller than that however far you shrink it.
 
 ### What comes out
 
@@ -565,6 +580,35 @@ refused.
   to the lengths the stack needs. In `fit=m3` mode the pins are replaced by a
   shopping list in the manifest.
 
+### Seeing how it goes together
+
+A folder of separate parts tells you what to print, not what goes where. So
+the export also writes the whole machine put together:
+
+- **`assembly.stl`** — every part where it belongs: turned to its own angle,
+  moved to its joint, and lifted to its layer, with the pins standing in their
+  holes and the caps on top.
+- **`assembly_exploded.stl`** — the same thing, with each layer lifted clear of
+  the one below and the pins floating above the holes they drop into.
+
+Neither is a part to print. They are several solids touching, not one
+watertight shell, so they are checked differently from the parts: a part must
+have every edge shared by exactly two triangles, while these must only have no
+edge left unpartnered. `mesh3d_shells_are_closed` is that weaker check.
+
+Heights are measured from the baseplate's **top face**, which is zero; the
+plate hangs below. Layer 0 stands a pin-head plus a gap above it, because a
+pin through a joint that is *not* anchored has nowhere else to put its head —
+the plate is solid under it. An anchored pin is the other way round: it presses
+down through the plate and is headed underneath.
+
+**Meshed gears are phased to interleave.** Each wheel's rim mark points
+wherever it happens to point, so placing gears at their marks would assemble a
+train tip to tip. `mechanism_gear_phases` walks each train and turns every
+wheel so its teeth fall into its neighbour's spaces. Because the ratios are
+exact tooth counts, a phasing worked out at one pose stays correct as the train
+turns — so the canvas uses the same function and draws teeth that really mesh.
+
 ### Layers, so nothing prints into itself
 
 Two bodies that share a pin cannot both sit at z = 0, and two gears that mesh
@@ -587,6 +631,15 @@ outlines the exporter would print, places them at the centre distance the
 manifest states, and turns them through several teeth, asserting that they
 never overlap (or the printed pair jams) and stay within a backlash of contact
 (or there is no drive at all, just two discs spinning past each other).
+
+`test_meshed_gears_are_phased_to_interleave` asks the same question of the
+placement the *assembly* uses — a three-wheel train with odd and even tooth
+counts, each wheel at its own centre and its own phase — which is what says the
+assembled view is showing you something true rather than something plausible.
+`test_the_export_shows_how_it_goes_together` then checks that the assembly
+spans the whole mechanism rather than piling parts on the origin, that the
+exploded view really separates, and that a moving joint's pin stays above the
+baseplate while an anchored one reaches down through it.
 
 
 ## How it works
@@ -611,13 +664,20 @@ Gravity is a Verlet integration step applied to free connectors before that
 same Gauss-Newton solve, which then projects them back onto the rigid-link
 constraint manifold — so gravity is just an external force on
 otherwise-unconstrained degrees of freedom, not a separate physics engine.
-`src/gearing.c` owns involute tooth geometry -- the one place tooth shape is
-decided, shared by the model, the canvas and the export. `src/mesh3d.c` turns
-flat outlines into watertight prisms (ear clipping with hole bridging, then
-extrusion) and writes binary STL. `src/print3d.c` builds the parts, assigns
-layers and writes the manifest. `src/export.c` writes the Blender script; undo/redo (in `src/main.c`) is a
+
+`src/export.c` writes the Blender script; undo/redo (in `src/main.c`) is a
 pair of bounded stacks of full `mechanism_clone()` snapshots — one pushed
 before each edit, the other filled by undoing and discarded by the next edit.
+
+The printable side is three files. `src/gearing.c` owns involute tooth
+geometry: the one place tooth shape is decided, shared by the model (which
+snaps every wheel to it), the canvas (which draws it) and the export (which
+extrudes it). `src/mesh3d.c` is the geometry kernel — ear clipping with hole
+bridging, extrusion into a closed prism, and a binary STL writer — plus the
+two closedness checks that decide whether what it built is a solid at all.
+`src/print3d.c` decides what parts a mechanism needs, works out which layer
+each goes on, places them into the assembled views and writes the manifest.
+None of the three touches SDL, so all of it is covered by the headless tests.
 
 `src/joints.c` owns the kinematics of the sliding, gear and Geneva joints, and
 `src/templates.c` the catalogue. Neither has an SDL dependency, so the Geneva's

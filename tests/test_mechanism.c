@@ -2945,10 +2945,15 @@ static void test_every_exported_part_is_a_printable_solid(void) {
             snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
             Mesh3 mesh;
             if (!read_stl(path, &mesh)) { unreadable++; continue; }
-            /* A printed pin is a head and a shaft, two solids the slicer
-             * unions, so it is exempt from being one closed shell. */
-            if (strncmp(e->d_name, "pin_", 4) != 0 && !mesh3d_is_closed(&mesh)) {
+            /* The two assembly views are several solids touching, not one
+             * shell, so they answer a different question -- see below. */
+            bool is_view = (strncmp(e->d_name, "assembly", 8) == 0);
+            if (!is_view && !mesh3d_is_closed(&mesh)) {
                 printf("      %s is not watertight\n", e->d_name);
+                unclosed++;
+            }
+            if (is_view && !mesh3d_shells_are_closed(&mesh)) {
+                printf("      %s has an open edge\n", e->d_name);
                 unclosed++;
             }
             mesh3d_free(&mesh);
@@ -3185,6 +3190,220 @@ static void test_a_geneva_slot_reaches_the_pin(void) {
     wipe_dir(dir);
 }
 
+/* --------------------------------------------------------------------------
+ * The assembled view.
+ *
+ * A folder of separate parts does not say how they stack, so the export also
+ * writes the whole machine put together. That view is only worth having if
+ * every part is genuinely where it belongs -- and the hardest case is the
+ * gears, which have to be turned so their teeth fall into each other's spaces.
+ * ----------------------------------------------------------------------- */
+
+static void test_meshed_gears_are_phased_to_interleave(void) {
+    Mechanism m;
+    mechanism_init(&m);
+    /* Three wheels in a train, so the phasing has to propagate rather than
+     * just work for one pair. Odd and even tooth counts both appear, which is
+     * where a fixed half-pitch fudge would come apart. */
+    int a = mechanism_add_wheel(&m, (Vec2){ 0, 0 }, 40.0);
+    int b = mechanism_add_wheel(&m, (Vec2){ 130, 20 }, 17.0);
+    int c = mechanism_add_wheel(&m, (Vec2){ 40, -120 }, 25.0);
+    mechanism_mesh_wheels(&m, a, b);
+    mechanism_mesh_wheels(&m, b, c);
+    mechanism_refresh_joint_sizes(&m);
+
+    double *phase = malloc((size_t)m.link_count * sizeof(double));
+    mechanism_gear_phases(&m, phase);
+
+    PrintParams p = print_default_params();
+    bool all_ok = true;
+    double worst_overlap = 0.0, loosest = 0.0;
+
+    for (int gi = 0; gi < m.gear_count; gi++) {
+        const Gear *g = &m.gears[gi];
+        if (!g->alive || g->kind != GEAR_EXTERNAL) continue;
+        int la = g->driver_link_id, lb = g->driven_link_id;
+        int ta = mechanism_wheel_teeth(&m, la), tb = mechanism_wheel_teeth(&m, lb);
+        Vec2 ca = m.connectors[g->driver_center_id].pos;
+        Vec2 cb = m.connectors[g->driven_center_id].pos;
+
+        GearSpec sa = { m.gear_module, ta, p.pressure_angle, p.backlash, 10 };
+        GearSpec sb = { m.gear_module, tb, p.pressure_angle, p.backlash, 10 };
+        int capa = gearing_outline_capacity(&sa), capb = gearing_outline_capacity(&sb);
+        Vec2 *pa = malloc((size_t)capa * sizeof(Vec2));
+        Vec2 *pb = malloc((size_t)capb * sizeof(Vec2));
+        int na = gearing_tooth_outline(&sa, pa, capa);
+        int nb = gearing_tooth_outline(&sb, pb, capb);
+
+        /* Exactly the placement the assembly uses: each wheel turned to its
+         * phase and moved to its own centre. */
+        for (int i = 0; i < na; i++) pa[i] = vec2_add(vec2_rotate(pa[i], phase[la]), ca);
+        for (int i = 0; i < nb; i++) pb[i] = vec2_add(vec2_rotate(pb[i], phase[lb]), cb);
+
+        double overlap = 0.0, closest = 1e18;
+        for (int i = 0; i < na; i++) {
+            if (point_in_poly(pb, nb, pa[i])) {
+                double d = point_to_poly_distance(pb, nb, pa[i]);
+                if (d > overlap) overlap = d;
+            }
+            if (vec2_dist(pa[i], cb) < gearing_pitch_radius(m.gear_module, tb) + m.gear_module) {
+                double d = point_to_poly_distance(pb, nb, pa[i]);
+                if (d < closest) closest = d;
+            }
+        }
+        for (int i = 0; i < nb; i++) {
+            if (point_in_poly(pa, na, pb[i])) {
+                double d = point_to_poly_distance(pa, na, pb[i]);
+                if (d > overlap) overlap = d;
+            }
+        }
+        if (overlap > worst_overlap) worst_overlap = overlap;
+        if (closest > loosest) loosest = closest;
+        if (overlap > 1e-6 || closest > 2.0 * p.backlash) all_ok = false;
+
+        free(pa);
+        free(pb);
+    }
+
+    if (!all_ok) {
+        printf("      (worst overlap %.6f mm, loosest contact %.6f mm)\n", worst_overlap, loosest);
+    }
+    check_true("every meshed pair in the assembly interleaves: no overlap anywhere, "
+                "and the flanks still meet", all_ok);
+
+    /* A wheel meshed with nothing has no phasing to obey, so it keeps the
+     * direction its own rim mark points. */
+    Mechanism lone;
+    mechanism_init(&lone);
+    int w = mechanism_add_wheel(&lone, (Vec2){ 0, 0 }, 30.0);
+    double solo[8];
+    mechanism_gear_phases(&lone, solo);
+    int lc = -1;
+    mechanism_gear_wheel_radius(&lone, w, &lc);
+    int mark = mechanism_wheel_mark(&lone, w);
+    Vec2 d = vec2_sub(lone.connectors[mark].pos, lone.connectors[lc].pos);
+    check_close("a lone wheel keeps the orientation of its own rim mark",
+                 solo[w], atan2(d.y, d.x), 1e-12);
+
+    free(phase);
+    mechanism_free(&m);
+    mechanism_free(&lone);
+}
+
+static void test_the_export_shows_how_it_goes_together(void) {
+    const char *dir = "tests/tmp_asm";
+    wipe_dir(dir);
+
+    Mechanism m;
+    build_everything(&m);
+    PrintParams p = print_default_params();
+    char report[512];
+    check_true("the mechanism exports", print3d_export(&m, p, dir, report, sizeof report));
+
+    Mesh3 assembled, exploded;
+    check_true("an assembled view is written", read_stl("tests/tmp_asm/assembly.stl", &assembled));
+    check_true("and an exploded one", read_stl("tests/tmp_asm/assembly_exploded.stl", &exploded));
+    /* Parts touch in an assembly, so coincident faces make an edge appear four
+     * times rather than two. That is not a hole; what would be a hole is an
+     * edge with no partner at all. */
+    check_true("the assembled view is made of closed solids",
+                assembled.tri_count > 0 && mesh3d_shells_are_closed(&assembled));
+    check_true("but it is not one watertight shell, because its parts touch",
+                !mesh3d_is_closed(&assembled));
+    check_true("it holds more triangles than any single part",
+                assembled.tri_count > 1000);
+    check_true("and the exploded view holds exactly the same parts",
+                exploded.tri_count == assembled.tri_count);
+
+    /* Heights: the baseplate hangs below zero, the parts stand above it, and
+     * nothing is left sitting at the origin because it was never placed. */
+    double lo = 1e18, hi = -1e18;
+    for (int v = 0; v < assembled.tri_count * 3; v++) {
+        double z = assembled.verts[v].z;
+        if (z < lo) lo = z;
+        if (z > hi) hi = z;
+    }
+    check_true("the baseplate hangs below the datum", lo < -p.thickness);
+    check_true("and the stack rises above it", hi > p.thickness);
+
+    /* Pulling it apart must actually pull it apart. */
+    double elo = 1e18, ehi = -1e18;
+    for (int v = 0; v < exploded.tri_count * 3; v++) {
+        double z = exploded.verts[v].z;
+        if (z < elo) elo = z;
+        if (z > ehi) ehi = z;
+    }
+    check_true("the exploded view is taller than the assembled one",
+                (ehi - elo) > (hi - lo) * 2.0);
+
+    /* Every part should be somewhere over the mechanism, not stacked at the
+     * origin: the assembly's footprint must cover the joints it was built
+     * from. */
+    double xlo = 1e18, xhi = -1e18;
+    for (int v = 0; v < assembled.tri_count * 3; v++) {
+        double x = assembled.verts[v].x;
+        if (x < xlo) xlo = x;
+        if (x > xhi) xhi = x;
+    }
+    double jlo = 1e18, jhi = -1e18;
+    for (int i = 0; i < m.connector_count; i++) {
+        if (!m.connectors[i].alive) continue;
+        double x = m.connectors[i].pos.x;
+        if (x < jlo) jlo = x;
+        if (x > jhi) jhi = x;
+    }
+    check_true("the assembly spans the whole mechanism, so parts were really "
+                "placed rather than piled on the origin",
+                xlo <= jlo + 1e-6 && xhi >= jhi - 1e-6);
+
+    /* A pin at a joint that is not anchored cannot be headed under the
+     * baseplate, because the plate is solid there. Its head belongs in the
+     * standoff gap above the plate instead -- and the assembled view is where
+     * that shows up, since nothing about the parts on their own says it. */
+    double base_top = 0.0;
+    int checked_moving = 0, checked_anchor = 0;
+    for (int i = 0; i < m.connector_count; i++) {
+        if (!m.connectors[i].alive) continue;
+        Vec2 at = m.connectors[i].pos;
+        double lowest_here = 1e18;
+        for (int v = 0; v < assembled.tri_count * 3; v++) {
+            Vec2 q = { assembled.verts[v].x, assembled.verts[v].y };
+            /* Wide enough to catch the pin's own surface and the holes it
+             * passes through (radius ~1.5 to 1.9), narrow enough to miss the
+             * plate outlines around them (radius 3.7 and up). */
+            if (vec2_dist(q, at) > 2.0) continue;
+            if (assembled.verts[v].z < lowest_here) lowest_here = assembled.verts[v].z;
+        }
+        if (lowest_here > 1e17) continue;
+        if (m.connectors[i].is_anchor) {
+            /* An anchor's pin is meant to go down through the plate. */
+            check_true_quiet(lowest_here < base_top - 1e-9);
+            checked_anchor++;
+        } else {
+            check_true_quiet(lowest_here > base_top - 1e-9);
+            checked_moving++;
+        }
+    }
+    check_true("both kinds of joint were looked at", checked_moving > 0 && checked_anchor > 0);
+    check_true("a moving joint's pin stays above the baseplate while an anchored "
+                "one reaches down through it", true);
+
+    /* Turning it off leaves the parts but not the two views. */
+    const char *plain = "tests/tmp_asm_off";
+    wipe_dir(plain);
+    p.assembly = false;
+    check_true("asm=off still exports", print3d_export(&m, p, plain, report, sizeof report));
+    Mesh3 none;
+    check_true("but writes no assembled view",
+                !read_stl("tests/tmp_asm_off/assembly.stl", &none));
+
+    mesh3d_free(&assembled);
+    mesh3d_free(&exploded);
+    mechanism_free(&m);
+    wipe_dir(dir);
+    wipe_dir(plain);
+}
+
 int main(void) {
     test_scene_round_trip_preserves_the_mechanism();
     test_a_damaged_file_costs_nothing();
@@ -3262,6 +3481,8 @@ int main(void) {
     test_a_link_plate_has_a_hole_at_every_pin();
     test_parts_that_share_a_pin_are_stacked_apart();
     test_a_geneva_slot_reaches_the_pin();
+    test_meshed_gears_are_phased_to_interleave();
+    test_the_export_shows_how_it_goes_together();
     test_print_options_are_read_and_clamped();
     test_a_scene_from_before_gears_had_teeth_still_opens();
 

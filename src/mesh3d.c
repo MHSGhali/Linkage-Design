@@ -466,7 +466,7 @@ static int edge_count(const Edge *edges, int n, int a, int b) {
     return count;
 }
 
-bool mesh3d_is_closed(const Mesh3 *m) {
+static bool edges_all_matched(const Mesh3 *m, bool strict) {
     if (!m || m->tri_count <= 0) return false;
     int vn = m->tri_count * 3;
 
@@ -501,14 +501,24 @@ bool mesh3d_is_closed(const Mesh3 *m) {
 
     bool closed = true;
     for (int i = 0; i < en && closed; i++) {
-        if (edge_count(edges, en, edges[i].a, edges[i].b) != 1) closed = false;
-        else if (edge_count(edges, en, edges[i].b, edges[i].a) != 1) closed = false;
+        int forward = edge_count(edges, en, edges[i].a, edges[i].b);
+        int back = edge_count(edges, en, edges[i].b, edges[i].a);
+        if (forward != back) closed = false;
+        else if (strict && forward != 1) closed = false;
     }
 
     free(sorted);
     free(id);
     free(edges);
     return closed;
+}
+
+bool mesh3d_is_closed(const Mesh3 *m) {
+    return edges_all_matched(m, true);
+}
+
+bool mesh3d_shells_are_closed(const Mesh3 *m) {
+    return edges_all_matched(m, false);
 }
 
 /* --- Binary STL ---------------------------------------------------------- */
