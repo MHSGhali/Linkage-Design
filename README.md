@@ -12,8 +12,8 @@ program designs a machine that traces it** — either a neat four-bar linkage,
 or, for shapes no linkage can manage, a chain of rotating arms that will
 redraw anything you can draw.
 Every link's length is shown live in the canvas, traced points are plotted
-against time, and the mechanism can be exported as a ready-to-run Blender
-Python script for 3D printing.
+against time, and the mechanism can be exported either as a ready-to-run
+Blender Python script or as a folder of printable STL parts.
 
 ## Build
 
@@ -117,6 +117,9 @@ terminal for anyone running it from one.
     connector takes a colour of its own; its path is drawn in the canvas and
     its x and y are plotted against time below (see **The motion plot**).
     Both reset each time you press `R`.
+  - `Shift+E`: write a folder of printable STL parts — gears with real teeth,
+    plates with pin holes, a baseplate and the pins to join them (see
+    **Printing it** below).
   - `E`: export the mechanism to a ready-to-run Blender Python script. You are
     asked for the file name, and told if one of that name already exists (see
     **Exporting to Blender** below).
@@ -253,11 +256,13 @@ rim** — and that mark is a connector like any other, so TRACE plots its path
 and the time-series panel shows it. The mark sits *on* the pitch circle rather
 than somewhere inside it, so tracing a wheel draws a circle of the wheel's own
 radius: the trace is the gear, not a smaller circle of no significance. It
-exports to Blender as a disc, meshed or not.
+exports to Blender as a disc, meshed or not, and to STL as a real involute
+gear of its own tooth count.
 
 A wheel is also a body with **a size of its own**, not a share of the gap
 between two centres. Click anywhere on its face to select it and `+`/`-`
-resize that wheel alone.
+resize that wheel alone — a whole tooth at a time, since that is what a wheel's
+size is (see **Printing it**). The number beside a wheel is its tooth count.
 
 ### Building a gear train
 
@@ -297,7 +302,7 @@ A joint is a thing you can click, not just a rule you declared once. Click a
 Geneva wheel's rim or its locking disc, or a slider's rail, and that joint is
 selected. Then:
 
-- `+`/`-` change **a Geneva's slot count** (and, on a wheel, its radius). The
+- `+`/`-` change **a Geneva's slot count** (and, on a wheel, its tooth count). The
   same keys still change motor speed and cam lift when one of those is what's
   selected.
 - DELETE removes it and leaves the bars standing. Deleting a wheel takes any
@@ -305,9 +310,9 @@ selected. Then:
 
 A Geneva's proportions are still read off the geometry before every solve: its
 crank radius follows its centre distance and slot count, and a rack's pitch
-radius is simply how far the pinion's centre stands off the bar, so sliding the
-bar retimes it. What is drawn on the canvas — each radius, the slot count — is
-what the solver uses.
+radius is the whole number of teeth nearest how far the pinion's centre stands
+off the bar, so sliding the bar retimes it a tooth at a time. What is drawn on
+the canvas — each size, the slot count — is what the solver uses.
 
 ## Designing from a path
 
@@ -487,9 +492,102 @@ Convention: **1 world unit = 1 mm** — the script sets the scene's display
 units to millimeters accordingly. Rod radius is a constant
 (`ROD_RADIUS_MM`) at the top of the generated script, since this 2D tool
 doesn't track link thickness; edit it before running if you want a
-different diameter. This gets the mechanism's skeleton into Blender for you
-to build real printable geometry around (fillets, pin holes, wall
-thickness, etc.).
+different diameter. This gets the mechanism's skeleton into Blender to look
+at and to render. For geometry you can actually print and assemble — real
+teeth, pin holes, a baseplate — use `Shift+E` instead; see **Printing it**.
+
+## Printing it
+
+`E` writes an animation. **`Shift+E` writes the machine**: a folder of binary
+STL parts you can print, plus a `MANIFEST.txt` saying what each one is and how
+the pile goes together. You are asked for a folder name, and you can put print
+settings on the same line:
+
+```
+gearbox m=1.5 t=4 pin=3 fit=m3
+```
+
+| key | what it sets | default |
+| --- | --- | --- |
+| `m=` | gear module, mm of pitch diameter per tooth | the mechanism's own |
+| `pin=` | nominal pin or screw diameter | 3.0 |
+| `t=` | how thick a plate, gear or cam is printed | 3.0 |
+| `clr=` | running clearance added to a turning hole | 0.4 |
+| `gap=` | air between one layer and the next | 0.4 |
+| `wall=` | material left around a hole | 2.0 |
+| `bl=` | backlash shaved off each gear's teeth | 0.15 |
+| `pa=` | pressure angle, degrees | 20 |
+| `fit=` | `pin` for printed pins, `m3` for M3 hardware | `pin` |
+| `base=` | `on` or `off` for the baseplate | `on` |
+
+Nonsense values are clamped rather than refused; an unknown key stops the
+export and says which one it was. Every setting actually used is written at the
+top of the manifest.
+
+### Gears have whole teeth now
+
+Two gears mesh only if they share a module and have whole tooth counts, and
+then they mesh at exactly one centre distance — `module * (Na + Nb) / 2`. A
+pair drawn a third of a tooth apart looks fine on screen and prints as two
+wheels that jam or never touch. So **a wheel's size is now a tooth count**:
+`+`/`-` step it a whole tooth at a time, meshing sets the centre distance
+exactly, and the number beside a wheel is its tooth count rather than its
+radius. The canvas draws the real involute outline, from the same generator the
+STL export extrudes, so the mesh you judge by eye is the mesh that prints.
+
+A pitch radius is `module * teeth / 2`, so at the default module of 2 a 30 mm
+wheel is a 30-tooth wheel. Below 14 teeth the flanks get short and the manifest
+says so; below 8 a 20-degree involute has no usable flank left and the wheel is
+refused.
+
+### What comes out
+
+- **`link_N.stl`** — a plate covering the link's pins: a dogbone for two, a
+  rounded plate for three or more, with a running-fit hole at each pin. Where
+  a motor drives the body, that hole is a press fit instead, so a shaft turns
+  it.
+- **`gear_N.stl`** — a real involute spur gear, correct tooth count, with a
+  bore.
+- **`rack_N.stl`** — a rack on the pinion's module, with two slots to slide on.
+- **`cam_N.stl`** and **`roller_N.stl`** — the cam's actual cut surface (the
+  pitch curve already inset by the roller), with a bore and, where there is
+  room, a key pin so it turns with its shaft rather than on it.
+- **`geneva_wheel_N.stl`** and **`geneva_driver_N.stl`** — a slotted wheel and
+  its crank arm. It indexes correctly; it is **not** locked between steps,
+  because the locking disc and its matching rim scallops need a second plane
+  this exporter does not generate. The manifest says so.
+- **`rail_N.stl`** — a slider's rail as a slotted bar, with a mounting hole
+  past each end.
+- **`baseplate.stl`** — the ground plate, with a hole at every anchor. This is
+  the part that actually holds the gear centres the right distance apart, so
+  it is the one to print carefully.
+- **`pin_*.stl`** / **`cap_*.stl`** / **`spacer_*.stl`** — the fasteners, cut
+  to the lengths the stack needs. In `fit=m3` mode the pins are replaced by a
+  shopping list in the manifest.
+
+### Layers, so nothing prints into itself
+
+Two bodies that share a pin cannot both sit at z = 0, and two gears that mesh
+*must*. So meshed groups are contracted to one node, nodes that share a joint
+are joined, and the result is greedily coloured — the colour is the layer. Any
+empty layer in a pin's stack gets a spacer washer, so nothing rubs and nothing
+floats. Parts are written flat at z = 0 ready for the bed; the manifest records
+which layer each belongs on.
+
+### Watertightness
+
+Every solid is checked before it is written: each edge must be shared by
+exactly two triangles wound opposite ways. A part that fails is skipped and
+reported rather than handed to a slicer that would quietly print something
+else. `make test` covers this end to end — it exports a mechanism with gears, a
+four-bar and a slider, reads every STL back and checks each one.
+
+The load-bearing test is `test_printed_gears_actually_mesh`: it takes the two
+outlines the exporter would print, places them at the centre distance the
+manifest states, and turns them through several teeth, asserting that they
+never overlap (or the printed pair jams) and stay within a backlash of contact
+(or there is no drive at all, just two discs spinning past each other).
+
 
 ## How it works
 
@@ -513,7 +611,11 @@ Gravity is a Verlet integration step applied to free connectors before that
 same Gauss-Newton solve, which then projects them back onto the rigid-link
 constraint manifold — so gravity is just an external force on
 otherwise-unconstrained degrees of freedom, not a separate physics engine.
-`src/export.c` writes the Blender script; undo/redo (in `src/main.c`) is a
+`src/gearing.c` owns involute tooth geometry -- the one place tooth shape is
+decided, shared by the model, the canvas and the export. `src/mesh3d.c` turns
+flat outlines into watertight prisms (ear clipping with hole bridging, then
+extrusion) and writes binary STL. `src/print3d.c` builds the parts, assigns
+layers and writes the manifest. `src/export.c` writes the Blender script; undo/redo (in `src/main.c`) is a
 pair of bounded stacks of full `mechanism_clone()` snapshots — one pushed
 before each edit, the other filled by undoing and discarded by the next edit.
 

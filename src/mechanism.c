@@ -1,5 +1,7 @@
 #include "mechanism.h"
 
+#include "gearing.h"
+
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,6 +12,9 @@
 int mechanism_pair_index(int i, int j, int k) {
     return i * (2 * k - i - 1) / 2 + (j - i - 1);
 }
+
+/* Defined down with the other wheel code; the mesh refresh needs it first. */
+static int teeth_for_radius(const Mechanism *m, double radius);
 
 static void *grow(void *arr, int *capacity, int count, size_t elem_size) {
     if (count < *capacity) return arr;
@@ -38,6 +43,7 @@ void mechanism_init(Mechanism *m) {
     m->genevas = NULL;
     m->geneva_count = 0;
     m->geneva_capacity = 0;
+    m->gear_module = MECHANISM_DEFAULT_GEAR_MODULE;
 }
 
 void mechanism_free(Mechanism *m) {
@@ -60,6 +66,7 @@ void mechanism_free(Mechanism *m) {
 }
 
 void mechanism_clone(const Mechanism *src, Mechanism *dst) {
+    dst->gear_module = src->gear_module;
     dst->connector_count = src->connector_count;
     dst->connector_capacity = src->connector_count;
     dst->connectors = (src->connector_count > 0) ? malloc((size_t)src->connector_count * sizeof(Connector)) : NULL;
@@ -317,6 +324,7 @@ int mechanism_add_link(Mechanism *m, const int *connector_ids, int count) {
     l->driven_externally = false;
     l->frozen_pivot_pos = (Vec2){ 0.0, 0.0 };
     l->wheel_radius = 0.0;
+    l->wheel_teeth = 0;
     l->selected = false;
     l->alive = true;
 
@@ -619,8 +627,17 @@ void mechanism_refresh_joint_sizes(Mechanism *m) {
             if (len < 1e-9) continue;
             double r = fabs(vec2_cross(d, vec2_sub(m->connectors[g->driver_center_id].pos, b0)) / len);
             if (r > 1e-6) {
-                g->driver_radius = r;
-                if (link_ok(m, g->driver_link_id)) m->links[g->driver_link_id].wheel_radius = r;
+                /* The pinion is a whole number of teeth like any other wheel,
+                 * so its radius steps rather than sliding: the rack's pitch
+                 * line is then a half-tooth or so off the bar you drew, which
+                 * is where the printed rack's teeth actually go. */
+                int teeth = teeth_for_radius(m, r);
+                double snapped = gearing_pitch_radius(m->gear_module, teeth);
+                g->driver_radius = snapped;
+                if (link_ok(m, g->driver_link_id)) {
+                    m->links[g->driver_link_id].wheel_radius = snapped;
+                    m->links[g->driver_link_id].wheel_teeth = teeth;
+                }
             }
             continue;
         }
@@ -634,7 +651,13 @@ void mechanism_refresh_joint_sizes(Mechanism *m) {
         if (!(ra > 1e-6) || !(rb > 1e-6)) continue;
         g->driver_radius = ra;
         g->driven_radius = rb;
-        g->ratio = rb / ra;
+        /* The ratio is a count of teeth, not a quotient of measurements: two
+         * wheels of 24 and 12 turn at exactly 2:1, not at 1.9997:1. Reading it
+         * off the radii would put that rounding error into the motion, and the
+         * printed pair would not have it. */
+        int ta = mechanism_wheel_teeth(m, g->driver_link_id);
+        int tb = mechanism_wheel_teeth(m, g->driven_link_id);
+        g->ratio = (ta > 0 && tb > 0) ? (double)tb / (double)ta : rb / ra;
 
         /* Two wheels of fixed size mesh at exactly one distance, so the driven
          * one slides along the line of centres until they touch. Dragging it
@@ -826,23 +849,40 @@ int mechanism_wheel_mark(const Mechanism *m, int link_id) {
     return -1;
 }
 
+/* The whole number of teeth nearest `radius`, within the sizes a wheel is
+ * allowed to be. Every wheel size in the mechanism comes through here, which
+ * is what keeps a mesh printable: a pair is either the same module and whole
+ * teeth, or it is two discs that only look like gears. */
+static int teeth_for_radius(const Mechanism *m, double radius) {
+    /* gearing_teeth_for_radius already holds the count inside the printable
+     * range, which is the only limit a wheel has. */
+    return gearing_teeth_for_radius(m->gear_module, radius);
+}
+
 int mechanism_add_wheel(Mechanism *m, Vec2 centre, double radius) {
     if (!(radius > 1e-6)) return -1;
+    int teeth = teeth_for_radius(m, radius);
+    double snapped = gearing_pitch_radius(m->gear_module, teeth);
     int c = mechanism_add_connector(m, centre, true);
-    int mark = mechanism_add_connector(m, (Vec2){ centre.x, centre.y - radius }, false);
+    int mark = mechanism_add_connector(m, (Vec2){ centre.x, centre.y - snapped }, false);
     int ids[2] = { c, mark };
     int link = mechanism_add_link(m, ids, 2);
     if (link < 0) return -1;
-    m->links[link].wheel_radius = radius;
+    m->links[link].wheel_radius = snapped;
+    m->links[link].wheel_teeth = teeth;
     return link;
 }
 
-void mechanism_set_wheel_radius(Mechanism *m, int link_id, double radius) {
+/* Cuts a wheel to `teeth` and walks its rim mark out to match. Everything that
+ * changes a wheel's size ends up here, so a wheel's radius is never anything
+ * but module * teeth / 2. */
+static void apply_wheel_teeth(Mechanism *m, int link_id, int teeth) {
     int centre = -1;
     if (!(mechanism_gear_wheel_radius(m, link_id, &centre) > 0.0) || centre < 0) return;
-    if (radius < MECHANISM_WHEEL_MIN_RADIUS) radius = MECHANISM_WHEEL_MIN_RADIUS;
-    if (radius > MECHANISM_WHEEL_MAX_RADIUS) radius = MECHANISM_WHEEL_MAX_RADIUS;
-    m->links[link_id].wheel_radius = radius;
+    if (teeth < GEARING_MIN_TEETH) teeth = GEARING_MIN_TEETH;
+    if (teeth > GEARING_MAX_TEETH) teeth = GEARING_MAX_TEETH;
+    m->links[link_id].wheel_teeth = teeth;
+    m->links[link_id].wheel_radius = gearing_pitch_radius(m->gear_module, teeth);
 
     /* The mark rides the rim, so it moves out (or in) with the new radius. */
     int mark = mechanism_wheel_mark(m, link_id);
@@ -850,10 +890,44 @@ void mechanism_set_wheel_radius(Mechanism *m, int link_id, double radius) {
         Vec2 d = vec2_sub(m->connectors[mark].pos, m->connectors[centre].pos);
         double len = vec2_len(d);
         Vec2 u = (len > 1e-9) ? vec2_scale(d, 1.0 / len) : (Vec2){ 0.0, -1.0 };
-        m->connectors[mark].pos = vec2_add(m->connectors[centre].pos, vec2_scale(u, radius));
+        m->connectors[mark].pos =
+            vec2_add(m->connectors[centre].pos, vec2_scale(u, m->links[link_id].wheel_radius));
         m->connectors[mark].prev_pos = m->connectors[mark].pos;
         mechanism_refresh_link_rest_lengths(m, link_id);
     }
+}
+
+void mechanism_set_wheel_radius(Mechanism *m, int link_id, double radius) {
+    apply_wheel_teeth(m, link_id, teeth_for_radius(m, radius));
+}
+
+int mechanism_wheel_teeth(const Mechanism *m, int link_id) {
+    if (!mechanism_is_gear_body(m, link_id)) return 0;
+    return m->links[link_id].wheel_teeth;
+}
+
+bool mechanism_set_gear_module(Mechanism *m, double module) {
+    if (!(module > 0.05) || module > 20.0) return false;
+    double previous = m->gear_module;
+    m->gear_module = module;
+    /* Tooth counts are what a wheel is; the module only says how big a tooth
+     * is. So every ratio in the mechanism survives a change here -- the train
+     * simply comes out coarser or finer, and the meshes close up again.
+     *
+     * Note this re-cuts each wheel to the teeth it ALREADY has, rather than
+     * going back through a radius. Going via a radius would run into the
+     * millimetre size limits on a resize, and a wheel that hit one would come
+     * back with a different tooth count -- which is to say a different gear,
+     * and a ratio that silently stopped being the one that was designed. */
+    for (int li = 0; li < m->link_count; li++) {
+        Link *l = &m->links[li];
+        if (!l->alive || !(l->wheel_radius > 0.0)) continue;
+        int teeth = l->wheel_teeth;
+        if (teeth < GEARING_MIN_TEETH) teeth = gearing_teeth_for_radius(previous, l->wheel_radius);
+        apply_wheel_teeth(m, li, teeth);
+    }
+    mechanism_refresh_joint_sizes(m);
+    return true;
 }
 
 /* Turns a mesh round, so what was the driven wheel now drives. */

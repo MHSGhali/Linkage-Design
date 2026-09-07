@@ -5,6 +5,7 @@
 #include "vec2.h"
 #include "cam.h"
 #include "joints.h"
+#include "gearing.h"
 
 /* A joint. is_anchor connectors are fixed to ground and never move. When
  * traced, its position is recorded into `path` once per simulation frame
@@ -64,8 +65,17 @@ typedef struct {
      * still a link -- it is a rigid body that turns about a pivot, which is
      * exactly what a link is -- but it is drawn as a disc, its size is its own
      * property rather than something a mesh dictates, and it exists whether or
-     * not anything is meshed with it. */
+     * not anything is meshed with it.
+     *
+     * `wheel_teeth` is what the wheel actually IS; `wheel_radius` is the cache
+     * `mechanism_gear_wheel_radius` hands out, always exactly
+     * gear_module * wheel_teeth / 2. A gear is a whole number of teeth or it
+     * is not a gear: two wheels whose radii happen to differ by a third of a
+     * tooth look meshed on screen and, printed, either jam or never touch. So
+     * the radius is not a free real number -- every path that sets one goes
+     * through mechanism_set_wheel_radius, which snaps to the tooth grid. */
     double wheel_radius;
+    int wheel_teeth;
 
     bool selected;
     bool alive;
@@ -84,7 +94,17 @@ typedef struct {
     int gear_count, gear_capacity;
     Geneva *genevas;
     int geneva_count, geneva_capacity;
+
+    /* Millimetres of pitch diameter per tooth, shared by every wheel in the
+     * mechanism. Gears mesh only if they agree about this, so it belongs to
+     * the document rather than to any one wheel. Bigger means coarser, fewer,
+     * stronger teeth; smaller means finer ones and a wider choice of ratios. */
+    double gear_module;
 } Mechanism;
+
+/* The module a new mechanism starts with: 2 mm, which prints cleanly on a
+ * hobby FDM machine and gives a 30 mm wheel 30 teeth. */
+#define MECHANISM_DEFAULT_GEAR_MODULE 2.0
 
 /* Condensed upper-triangular pair index for i<j among k items (0-indexed). */
 int mechanism_pair_index(int i, int j, int k);
@@ -214,9 +234,12 @@ void mechanism_delete_geneva(Mechanism *m, int geneva_id);
  * several of them, and it means adding a wheel never disturbs what is already
  * there. */
 
-/* Smallest and largest pitch radius a wheel can be resized to. */
-#define MECHANISM_WHEEL_MIN_RADIUS 15.0
-#define MECHANISM_WHEEL_MAX_RADIUS 400.0
+/* How small and how large a wheel may be, expressed in TEETH rather than in
+ * millimetres -- because a wheel is a tooth count, and a limit in millimetres
+ * would silently change that count whenever the module did, turning a designed
+ * ratio into a different one. See GEARING_MIN_TEETH / GEARING_MAX_TEETH. */
+#define MECHANISM_WHEEL_MIN_TEETH GEARING_MIN_TEETH
+#define MECHANISM_WHEEL_MAX_TEETH GEARING_MAX_TEETH
 
 /* A free-standing wheel at `centre`: an anchored hub, a mark on its rim, and
  * the body joining them. Meshed with nothing. Returns its link id, or -1. */
@@ -244,6 +267,14 @@ bool mechanism_orient_train_from(Mechanism *m, int root_link);
 /* A wheel's pitch radius and the connector at its centre, or 0/-1 if that link
  * is not a wheel. */
 double mechanism_gear_wheel_radius(const Mechanism *m, int link_id, int *center_out);
+
+/* A wheel's tooth count, or 0 if that link is not a wheel. */
+int mechanism_wheel_teeth(const Mechanism *m, int link_id);
+
+/* Changes the module every wheel is cut to. Each wheel keeps its tooth count,
+ * so the whole mechanism scales and every ratio survives; meshes then slide
+ * back into contact at the new centre distances. False on a nonsense module. */
+bool mechanism_set_gear_module(Mechanism *m, double module);
 
 /* True if the link is a gear wheel. A wheel is drawn as a disc with a mark on
  * its rim -- never as a bar -- so the renderer skips its edges. */

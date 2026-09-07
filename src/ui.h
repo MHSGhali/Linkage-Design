@@ -40,6 +40,7 @@ typedef enum {
     UI_GRAVITY,
     UI_CLEAR,
     UI_EXPORT,
+    UI_PRINT,
     UI_RUN,
     UI_PAUSE,
     UI_HELP,

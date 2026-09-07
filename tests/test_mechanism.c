@@ -3,6 +3,7 @@
 #include <string.h>
 #include <math.h>
 #include <stdbool.h>
+#include <dirent.h>
 
 #include "../src/mechanism.h"
 #include "../src/solver.h"
@@ -14,6 +15,9 @@
 #include "../src/templates.h"
 #include "../src/status.h"
 #include "../src/scene.h"
+#include "../src/gearing.h"
+#include "../src/mesh3d.h"
+#include "../src/print3d.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -1874,8 +1878,9 @@ static void test_wheels_are_placed_and_sized_on_their_own(void) {
                fabs(m.links[w].rest_dist[0] - 160.0) < 1e-9);
 
     mechanism_set_wheel_radius(&m, w, 1.0);
-    check_close("a wheel cannot be shrunk to nothing",
-                m.links[w].wheel_radius, MECHANISM_WHEEL_MIN_RADIUS, 1e-12);
+    check_close("a wheel cannot be shrunk below the fewest teeth that can be cut",
+                m.links[w].wheel_radius,
+                gearing_pitch_radius(m.gear_module, MECHANISM_WHEEL_MIN_TEETH), 1e-12);
     mechanism_free(&m);
 }
 
@@ -2634,6 +2639,552 @@ static void test_a_damaged_file_costs_nothing(void) {
                 !scene_load(&m, &params, "Makefile", err, sizeof err));
 }
 
+/* --------------------------------------------------------------------------
+ * Printable output: whole teeth, real holes, watertight solids.
+ *
+ * The point of these is narrow and specific. An STL that looks right in a
+ * viewer can still be unprintable (not a closed solid) or unassemblable (gears
+ * that jam, plates with no holes), and neither shows up by eye. So each of
+ * these asks a question a slicer or a screwdriver would ask.
+ * ----------------------------------------------------------------------- */
+
+/* A wheel whose radius was asked for, and what it actually became. */
+static int build_one_wheel(Mechanism *m, double wanted_radius) {
+    mechanism_init(m);
+    return mechanism_add_wheel(m, (Vec2){ 0, 0 }, wanted_radius);
+}
+
+static void test_wheel_size_snaps_to_whole_teeth(void) {
+    Mechanism m;
+    /* A pitch radius is module * teeth / 2, so at module 2 the radius in
+     * millimetres IS the tooth count, and the sizes a gear can be are a
+     * millimetre apart. 37.3 is not one of them; 37 is. */
+    int w = build_one_wheel(&m, 37.3);
+    check_true("a wheel is placed", w >= 0);
+    check_close("its radius lands on a whole tooth", mechanism_gear_wheel_radius(&m, w, NULL), 37.0, 1e-9);
+    check_true("and it knows how many it has", mechanism_wheel_teeth(&m, w) == 37);
+
+    mechanism_set_wheel_radius(&m, w, 60.4);
+    check_close("resizing snaps too", mechanism_gear_wheel_radius(&m, w, NULL), 60.0, 1e-9);
+    check_true("to the nearest whole tooth", mechanism_wheel_teeth(&m, w) == 60);
+
+    /* The rim mark has to ride the snapped rim, not the radius that was asked
+     * for, or tracing a wheel would draw a circle the wheel is not. */
+    int centre = -1, mark = mechanism_wheel_mark(&m, w);
+    mechanism_gear_wheel_radius(&m, w, &centre);
+    check_close("the rim mark moves out to the snapped radius",
+                 vec2_dist(m.connectors[mark].pos, m.connectors[centre].pos), 60.0, 1e-9);
+    mechanism_free(&m);
+}
+
+static void test_meshed_wheels_sit_at_the_exact_centre_distance(void) {
+    Mechanism m;
+    mechanism_init(&m);
+    int a = mechanism_add_wheel(&m, (Vec2){ 0, 0 }, 40.0);
+    int b = mechanism_add_wheel(&m, (Vec2){ 137.6, 21.3 }, 20.0);   /* nowhere near meshing */
+    check_true("wheels mesh", mechanism_mesh_wheels(&m, a, b) >= 0);
+
+    int ca = -1, cb = -1;
+    mechanism_gear_wheel_radius(&m, a, &ca);
+    mechanism_gear_wheel_radius(&m, b, &cb);
+    int ta = mechanism_wheel_teeth(&m, a), tb = mechanism_wheel_teeth(&m, b);
+    double want = gearing_center_distance(m.gear_module, ta, tb);
+    check_close("the centres end up exactly module*(Na+Nb)/2 apart",
+                 vec2_dist(m.connectors[ca].pos, m.connectors[cb].pos), want, 1e-9);
+    check_close("which for 40 and 20 teeth at module 2 is 60 mm", want, 60.0, 1e-12);
+
+    /* The ratio is a count, not a measurement: 2:1 has to be 2, not 1.9998. */
+    check_close("and the ratio is exactly the tooth ratio",
+                 m.gears[0].ratio, (double)tb / (double)ta, 0.0);
+    mechanism_free(&m);
+}
+
+static void test_changing_the_module_keeps_every_ratio(void) {
+    Mechanism m;
+    mechanism_init(&m);
+    int a = mechanism_add_wheel(&m, (Vec2){ 0, 0 }, 36.0);
+    int b = mechanism_add_wheel(&m, (Vec2){ 90, 0 }, 18.0);
+    mechanism_mesh_wheels(&m, a, b);
+    int ta = mechanism_wheel_teeth(&m, a), tb = mechanism_wheel_teeth(&m, b);
+
+    check_true("a finer module is accepted", mechanism_set_gear_module(&m, 1.0));
+    check_true("the driver keeps its tooth count", mechanism_wheel_teeth(&m, a) == ta);
+    check_true("so does the driven wheel", mechanism_wheel_teeth(&m, b) == tb);
+    check_close("the wheels are half the size", mechanism_gear_wheel_radius(&m, a, NULL), 18.0, 1e-9);
+
+    int ca = -1, cb = -1;
+    mechanism_gear_wheel_radius(&m, a, &ca);
+    mechanism_gear_wheel_radius(&m, b, &cb);
+    check_close("and they are back in contact at the new centre distance",
+                 vec2_dist(m.connectors[ca].pos, m.connectors[cb].pos),
+                 gearing_center_distance(1.0, ta, tb), 1e-9);
+    check_true("a nonsense module is refused", !mechanism_set_gear_module(&m, 0.0));
+    mechanism_free(&m);
+}
+
+static void test_gear_outline_is_a_gear(void) {
+    for (int teeth = GEARING_MIN_TEETH; teeth <= 60; teeth += 13) {
+        GearSpec s = { 2.0, teeth, GEARING_PRESSURE_ANGLE, 0.15, 8 };
+        int cap = gearing_outline_capacity(&s);
+        Vec2 *p = malloc((size_t)cap * sizeof(Vec2));
+        int n = gearing_tooth_outline(&s, p, cap);
+        check_true_quiet(n > 0);
+
+        double rf = gearing_root_radius(&s), ra = gearing_tip_radius(&s);
+        double rp = gearing_pitch_radius(2.0, teeth);
+        int crossings = 0;
+        bool in_band = true;
+        for (int i = 0; i < n; i++) {
+            double r = vec2_len(p[i]);
+            if (r < rf - 1e-9 || r > ra + 1e-9) in_band = false;
+            /* One tooth per outward crossing of the pitch circle. */
+            if (vec2_len(p[i]) <= rp && vec2_len(p[(i + 1) % n]) > rp) crossings++;
+        }
+        check_true_quiet(in_band);
+        check_true_quiet(crossings == teeth);
+        /* Anticlockwise, and no zero-length edges to trip the triangulator. */
+        check_true_quiet(mesh3d_signed_area(p, n) > 0.0);
+        free(p);
+    }
+    check_true("every gear outline stays between its root and tip circles, has "
+                "exactly its tooth count, and runs anticlockwise", true);
+
+    GearSpec bad = { 2.0, 3, GEARING_PRESSURE_ANGLE, 0.15, 8 };
+    Vec2 scratch[64];
+    check_true("a gear with too few teeth to cut is refused",
+                gearing_tooth_outline(&bad, scratch, 64) == 0);
+}
+
+/* Is q inside the closed polygon p? Crossing number, which is all this needs. */
+static bool point_in_poly(const Vec2 *p, int n, Vec2 q) {
+    bool in = false;
+    for (int i = 0, j = n - 1; i < n; j = i++) {
+        if (((p[i].y > q.y) != (p[j].y > q.y)) &&
+            (q.x < (p[j].x - p[i].x) * (q.y - p[i].y) / (p[j].y - p[i].y) + p[i].x)) in = !in;
+    }
+    return in;
+}
+
+static double point_to_poly_distance(const Vec2 *p, int n, Vec2 q) {
+    double best = 1e18;
+    for (int i = 0, j = n - 1; i < n; j = i++) {
+        Vec2 ab = vec2_sub(p[i], p[j]);
+        double len2 = vec2_dot(ab, ab);
+        double t = (len2 > 1e-18) ? vec2_dot(vec2_sub(q, p[j]), ab) / len2 : 0.0;
+        if (t < 0.0) t = 0.0;
+        if (t > 1.0) t = 1.0;
+        double d = vec2_dist(q, vec2_add(p[j], vec2_scale(ab, t)));
+        if (d < best) best = d;
+    }
+    return best;
+}
+
+/* The one that decides whether any of this was worth doing: take the two
+ * outlines the exporter would print, put them at the centre distance the
+ * manifest states, and turn them against each other through several teeth.
+ * They must never overlap (or the printed pair jams solid) and they must come
+ * within a backlash of touching (or the pair has no drive at all, just two
+ * discs spinning past each other). */
+static void test_printed_gears_actually_mesh(void) {
+    const int cases[][2] = { { 12, 30 }, { 8, 8 }, { 17, 17 }, { 20, 41 }, { 13, 60 } };
+    double worst_overlap = 0.0;
+    double loosest_contact = 0.0;
+    bool all_ok = true;
+
+    for (int ci = 0; ci < 5; ci++) {
+        int na_teeth = cases[ci][0], nb_teeth = cases[ci][1];
+        double module = 2.0, backlash = 0.15;
+        GearSpec sa = { module, na_teeth, GEARING_PRESSURE_ANGLE, backlash, 10 };
+        GearSpec sb = { module, nb_teeth, GEARING_PRESSURE_ANGLE, backlash, 10 };
+        int capa = gearing_outline_capacity(&sa), capb = gearing_outline_capacity(&sb);
+        Vec2 *a = malloc((size_t)capa * sizeof(Vec2)), *b = malloc((size_t)capb * sizeof(Vec2));
+        Vec2 *wa = malloc((size_t)capa * sizeof(Vec2)), *wb = malloc((size_t)capb * sizeof(Vec2));
+        int na = gearing_tooth_outline(&sa, a, capa), nb = gearing_tooth_outline(&sb, b, capb);
+
+        double centre = gearing_center_distance(module, na_teeth, nb_teeth);
+        double rpa = gearing_pitch_radius(module, na_teeth);
+        /* A tooth space of B must face A. B carries a tooth on its own +x
+         * axis, and the point of B nearest A sits at local angle pi -- which
+         * is already a space centre when B has an odd number of teeth, and a
+         * tooth centre when it has an even one. */
+        double phase = (nb_teeth % 2 == 0) ? M_PI / (double)nb_teeth : 0.0;
+
+        double overlap = 0.0, closest = 1e18;
+        for (int step = 0; step < 240; step++) {
+            double turn = (double)step / 240.0 * 2.0 * (2.0 * M_PI / (double)na_teeth);
+            double turn_b = -turn * (double)na_teeth / (double)nb_teeth + phase;
+            for (int i = 0; i < na; i++) wa[i] = vec2_rotate(a[i], turn);
+            for (int i = 0; i < nb; i++) {
+                wb[i] = vec2_add(vec2_rotate(b[i], turn_b), (Vec2){ centre, 0.0 });
+            }
+            for (int i = 0; i < na; i++) {
+                if (point_in_poly(wb, nb, wa[i])) {
+                    double d = point_to_poly_distance(wb, nb, wa[i]);
+                    if (d > overlap) overlap = d;
+                }
+            }
+            for (int i = 0; i < nb; i++) {
+                if (point_in_poly(wa, na, wb[i])) {
+                    double d = point_to_poly_distance(wa, na, wb[i]);
+                    if (d > overlap) overlap = d;
+                }
+            }
+            /* How near the flanks come, measured only around the mesh point. */
+            for (int i = 0; i < na; i++) {
+                if (fabs(vec2_len(a[i]) - rpa) > module) continue;
+                if (wa[i].x < rpa * 0.3) continue;
+                double d = point_to_poly_distance(wb, nb, wa[i]);
+                if (d < closest) closest = d;
+            }
+        }
+        if (overlap > worst_overlap) worst_overlap = overlap;
+        if (closest > loosest_contact) loosest_contact = closest;
+        if (overlap > 1e-6 || closest > 2.0 * backlash) all_ok = false;
+        free(a); free(b); free(wa); free(wb);
+    }
+
+    if (!all_ok) {
+        printf("      (worst overlap %.6f mm, loosest contact %.6f mm)\n",
+                worst_overlap, loosest_contact);
+    }
+    check_true("printed gear pairs turn through their teeth without ever overlapping, "
+                "and stay within a backlash of contact", all_ok);
+}
+
+/* --- Reading the exported parts back ------------------------------------- */
+
+static bool read_stl(const char *path, Mesh3 *out) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    unsigned char header[80];
+    unsigned int tris = 0;
+    if (fread(header, 1, 80, f) != 80 || fread(&tris, 4, 1, f) != 1) { fclose(f); return false; }
+    mesh3d_init(out);
+    for (unsigned int t = 0; t < tris; t++) {
+        float v[12];
+        unsigned short attr;
+        if (fread(v, 4, 12, f) != 12 || fread(&attr, 2, 1, f) != 1) { fclose(f); return false; }
+        mesh3d_add_tri(out, (Vec3){ v[3], v[4], v[5] }, (Vec3){ v[6], v[7], v[8] },
+                        (Vec3){ v[9], v[10], v[11] });
+    }
+    bool ok = (out->tri_count == (int)tris && tris > 0);
+    fclose(f);
+    return ok;
+}
+
+static void wipe_dir(const char *dir) {
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.') continue;
+        char path[1024];
+        snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
+        remove(path);
+    }
+    closedir(d);
+    remove(dir);
+}
+
+/* A mechanism with one of everything the exporter knows how to make. */
+static void build_everything(Mechanism *m) {
+    mechanism_init(m);
+    /* A meshed pair. */
+    int big = mechanism_add_wheel(m, (Vec2){ 0, 0 }, 40.0);
+    int small = mechanism_add_wheel(m, (Vec2){ 90, 0 }, 20.0);
+    mechanism_mesh_wheels(m, big, small);
+    mechanism_toggle_driven(m, big, 60.0);
+
+    /* A four-bar hanging off to one side: a ternary coupler and two binaries. */
+    int g1 = mechanism_add_connector(m, (Vec2){ 200, 0 }, true);
+    int g2 = mechanism_add_connector(m, (Vec2){ 320, 0 }, true);
+    int p1 = mechanism_add_connector(m, (Vec2){ 230, 40 }, false);
+    int p2 = mechanism_add_connector(m, (Vec2){ 300, 70 }, false);
+    int p3 = mechanism_add_connector(m, (Vec2){ 260, 95 }, false);
+    int crank[2] = { g1, p1 };
+    int coupler[3] = { p1, p2, p3 };
+    int rocker[2] = { p2, g2 };
+    mechanism_add_link(m, crank, 2);
+    mechanism_add_link(m, coupler, 3);
+    mechanism_add_link(m, rocker, 2);
+
+    /* A slider on ground. */
+    int ra = mechanism_add_connector(m, (Vec2){ 200, -80 }, true);
+    int rb = mechanism_add_connector(m, (Vec2){ 320, -80 }, true);
+    int pin = mechanism_add_connector(m, (Vec2){ 260, -80 }, false);
+    mechanism_add_slider(m, pin, ra, rb);
+}
+
+static void test_every_exported_part_is_a_printable_solid(void) {
+    const char *dir = "tests/tmp_parts";
+    wipe_dir(dir);
+
+    Mechanism m;
+    build_everything(&m);
+    char report[512] = { 0 };
+    check_true("the mechanism exports", print3d_export(&m, print_default_params(), dir,
+                                                        report, sizeof report));
+
+    DIR *d = opendir(dir);
+    check_true("and left a folder behind", d != NULL);
+    int stls = 0, unclosed = 0, unreadable = 0;
+    bool saw_gear = false, saw_link = false, saw_base = false, saw_rail = false, saw_pin = false;
+    if (d) {
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL) {
+            const char *dot = strrchr(e->d_name, '.');
+            if (!dot || strcmp(dot, ".stl") != 0) continue;
+            stls++;
+            if (strncmp(e->d_name, "gear_", 5) == 0) saw_gear = true;
+            if (strncmp(e->d_name, "link_", 5) == 0) saw_link = true;
+            if (strncmp(e->d_name, "baseplate", 9) == 0) saw_base = true;
+            if (strncmp(e->d_name, "rail_", 5) == 0) saw_rail = true;
+            if (strncmp(e->d_name, "pin_", 4) == 0) saw_pin = true;
+
+            char path[1024];
+            snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
+            Mesh3 mesh;
+            if (!read_stl(path, &mesh)) { unreadable++; continue; }
+            /* A printed pin is a head and a shaft, two solids the slicer
+             * unions, so it is exempt from being one closed shell. */
+            if (strncmp(e->d_name, "pin_", 4) != 0 && !mesh3d_is_closed(&mesh)) {
+                printf("      %s is not watertight\n", e->d_name);
+                unclosed++;
+            }
+            mesh3d_free(&mesh);
+        }
+        closedir(d);
+    }
+
+    check_true("it wrote some STLs", stls > 0);
+    check_true("every one of them could be read back", unreadable == 0);
+    check_true("and every solid part is watertight -- a slicer will take it", unclosed == 0);
+    check_true("a gear came out", saw_gear);
+    check_true("so did the link plates", saw_link);
+    check_true("and the baseplate that holds the anchors apart", saw_base);
+    check_true("and the slider's rail", saw_rail);
+    check_true("and the pins to join it all up", saw_pin);
+
+    mechanism_free(&m);
+    wipe_dir(dir);
+}
+
+static void test_a_link_plate_has_a_hole_at_every_pin(void) {
+    const char *dir = "tests/tmp_holes";
+    wipe_dir(dir);
+
+    Mechanism m;
+    mechanism_init(&m);
+    int a = mechanism_add_connector(&m, (Vec2){ 0, 0 }, true);
+    int b = mechanism_add_connector(&m, (Vec2){ 70, 0 }, false);
+    int c = mechanism_add_connector(&m, (Vec2){ 30, 50 }, false);
+    int ids[3] = { a, b, c };
+    mechanism_add_link(&m, ids, 3);
+
+    PrintParams p = print_default_params();
+    char report[512];
+    check_true("a ternary link exports", print3d_export(&m, p, dir, report, sizeof report));
+
+    Mesh3 mesh;
+    check_true("its plate can be read back", read_stl("tests/tmp_holes/link_0.stl", &mesh));
+
+    /* Every pin should have a ring of vertices around it at the running-fit
+     * radius: that ring IS the hole. Without it the plate is a solid slab and
+     * nothing can be pinned to it. */
+    double hole_r = (p.pin_diameter + p.clearance) * 0.5;
+    int found = 0;
+    for (int k = 0; k < 3; k++) {
+        Vec2 pin = m.connectors[ids[k]].pos;
+        int on_ring = 0;
+        for (int v = 0; v < mesh.tri_count * 3; v++) {
+            Vec2 q = { mesh.verts[v].x, mesh.verts[v].y };
+            if (fabs(vec2_dist(q, pin) - hole_r) < 1e-3) on_ring++;
+        }
+        if (on_ring >= 8) found++;
+    }
+    check_true("there is a hole of the right size at all three pins", found == 3);
+
+    /* And the plate actually covers them: the outline is the hull of the pins
+     * grown by a wall, so the material reaches past every pin. */
+    double reach = 0.0;
+    for (int v = 0; v < mesh.tri_count * 3; v++) {
+        Vec2 q = { mesh.verts[v].x, mesh.verts[v].y };
+        double d = vec2_dist(q, m.connectors[b].pos);
+        if (d > reach) reach = d;
+    }
+    check_true("and the plate extends beyond the outermost pin", reach > hole_r);
+
+    mesh3d_free(&mesh);
+    mechanism_free(&m);
+    wipe_dir(dir);
+}
+
+/* Reads the layer each named part was put on out of the manifest. Returns -1
+ * if that part is not listed. */
+static int manifest_layer(const char *dir, const char *part) {
+    char path[1024];
+    snprintf(path, sizeof path, "%s/MANIFEST.txt", dir);
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    char line[512];
+    int layer = -1;
+    while (fgets(line, sizeof line, f)) {
+        char name[128];
+        if (sscanf(line, " %127s", name) != 1) continue;
+        if (strcmp(name, part) != 0) continue;   /* the manifest names parts without ".stl" */
+        const char *at = strstr(line, "layer ");
+        if (at) layer = atoi(at + 6);
+        break;
+    }
+    fclose(f);
+    return layer;
+}
+
+static void test_parts_that_share_a_pin_are_stacked_apart(void) {
+    const char *dir = "tests/tmp_layers";
+    wipe_dir(dir);
+
+    Mechanism m;
+    build_everything(&m);
+    char report[512];
+    check_true("the mechanism exports", print3d_export(&m, print_default_params(), dir,
+                                                        report, sizeof report));
+
+    /* The four-bar's crank (link_2), coupler (link_3) and rocker (link_4) are
+     * pinned to each other; two bodies on one pin at the same height would be
+     * two bodies in the same place. */
+    int crank = manifest_layer(dir, "link_2");
+    int coupler = manifest_layer(dir, "link_3");
+    int rocker = manifest_layer(dir, "link_4");
+    check_true("the crank was placed on a layer", crank >= 0);
+    check_true("so was the coupler", coupler >= 0);
+    check_true("so was the rocker", rocker >= 0);
+    check_true("the crank and the coupler share a pin, so they are on different layers",
+                crank != coupler);
+    check_true("and so are the coupler and the rocker", coupler != rocker);
+
+    /* Meshing gears are the opposite case: they must share a plane or their
+     * teeth never touch. */
+    int g0 = manifest_layer(dir, "gear_0");
+    int g1 = manifest_layer(dir, "gear_1");
+    check_true("both gears were placed", g0 >= 0 && g1 >= 0);
+    check_true("meshed gears are on the SAME layer", g0 == g1);
+
+    mechanism_free(&m);
+    wipe_dir(dir);
+}
+
+static void test_print_options_are_read_and_clamped(void) {
+    PrintParams p = print_default_params();
+    char err[256];
+
+    check_true("a settings line is accepted",
+                print_parse_options(&p, "m=1.5 pin=2 t=4 clr=0.3 fit=m3 base=off", err, sizeof err));
+    check_close("the module is taken", p.module, 1.5, 1e-12);
+    check_close("so is the pin diameter", p.pin_diameter, 2.0, 1e-12);
+    check_close("and the thickness", p.thickness, 4.0, 1e-12);
+    check_close("and the clearance", p.clearance, 0.3, 1e-12);
+    check_true("fit=m3 switches to hardware", p.m3_hardware);
+    check_true("base=off drops the baseplate", !p.baseplate);
+
+    PrintParams q = print_default_params();
+    check_true("nonsense values are clamped rather than refused",
+                print_parse_options(&q, "t=9999 clr=-5", err, sizeof err));
+    check_true("thickness is held to something printable", q.thickness <= 20.0);
+    check_true("and clearance cannot go negative", q.clearance >= 0.0);
+
+    PrintParams r = print_default_params();
+    check_true("an unknown key is refused", !print_parse_options(&r, "wobble=3", err, sizeof err));
+    check_true("and it says which one", strstr(err, "wobble") != NULL);
+    check_close("leaving the settings untouched", r.thickness, print_default_params().thickness, 0.0);
+
+    check_true("a value that is not a number is refused",
+                !print_parse_options(&r, "t=thick", err, sizeof err));
+    check_true("an empty settings line is fine",
+                print_parse_options(&r, "", err, sizeof err));
+}
+
+static void test_a_scene_from_before_gears_had_teeth_still_opens(void) {
+    /* Format 1: the L record stopped at the wheel radius, and 37.3 was a
+     * radius nothing could be cut to. */
+    const char *path = "tests/tmp_v1.linkage";
+    FILE *f = fopen(path, "w");
+    fprintf(f, "LINKAGE 1\n" "P 0 0\n" "C 0 0 1 0\n" "C 0 -37.3 0 0\n"
+                "L 2 0 1 1 0 -1 0 37.3\n");
+    fclose(f);
+
+    Mechanism m;
+    mechanism_init(&m);
+    SolverParams params = solver_default_params();
+    char err[256] = { 0 };
+    check_true("a format-1 file still opens", scene_load(&m, &params, path, err, sizeof err));
+    check_true("its wheel is recognised", mechanism_is_gear_body(&m, 0));
+    check_true("and given the tooth count nearest the radius it recorded",
+                mechanism_wheel_teeth(&m, 0) == 37);
+    check_close("so its radius is now one a gear can actually be",
+                 mechanism_gear_wheel_radius(&m, 0, NULL), 37.0, 1e-9);
+
+    /* Round-tripping through format 2 keeps both. */
+    const char *out = "tests/tmp_v2.linkage";
+    check_true("it saves again", scene_save(&m, &params, out, err, sizeof err));
+    Mechanism back;
+    mechanism_init(&back);
+    check_true("and reopens", scene_load(&back, &params, out, err, sizeof err));
+    check_true("with its tooth count intact", mechanism_wheel_teeth(&back, 0) == 37);
+    check_close("and the module it was drawn at", back.gear_module, m.gear_module, 1e-12);
+
+    mechanism_free(&m);
+    mechanism_free(&back);
+    remove(path);
+    remove(out);
+}
+
+/* A Geneva's slot has to be deep enough for the driver's pin to reach the
+ * point of closest approach, or the wheel never indexes. Nothing about that
+ * shows up in a watertightness check: a slot rounded off the wrong way is a
+ * perfectly good solid, just one that jams. So measure it. */
+static void test_a_geneva_slot_reaches_the_pin(void) {
+    const char *dir = "tests/tmp_geneva";
+    wipe_dir(dir);
+
+    Mechanism m;
+    mechanism_init(&m);
+    int driver = mechanism_add_wheel(&m, (Vec2){ 0, 0 }, 30.0);
+    int wheel = mechanism_add_wheel(&m, (Vec2){ 90, 0 }, 40.0);
+    mechanism_toggle_driven(&m, driver, 60.0);
+    int gid = mechanism_add_geneva(&m, driver, m.links[driver].connector_ids[0],
+                                    wheel, m.links[wheel].connector_ids[0], 6);
+    check_true("a Geneva is made", gid >= 0);
+
+    PrintParams p = print_default_params();
+    char report[512];
+    check_true("it exports", print3d_export(&m, p, dir, report, sizeof report));
+
+    Mesh3 mesh;
+    check_true("its wheel can be read back", read_stl("tests/tmp_geneva/geneva_wheel_0.stl", &mesh));
+
+    const Geneva *gv = &m.genevas[gid];
+    double rim = mechanism_geneva_wheel_radius(gv);
+    double pin_r = (p.pin_diameter + p.clearance) * 0.5;
+    /* The pin's centre comes as close as centre_distance - crank_radius, so
+     * the material has to stop a pin's radius short of that. */
+    double want_bottom = gv->center_distance - gv->crank_radius - pin_r;
+
+    double furthest = 0.0, nearest_in_body = 1e18;
+    for (int v = 0; v < mesh.tri_count * 3; v++) {
+        double r = vec2_len((Vec2){ mesh.verts[v].x, mesh.verts[v].y });
+        if (r > furthest) furthest = r;
+        if (r > pin_r * 2.0 && r < nearest_in_body) nearest_in_body = r;  /* skip the bore */
+    }
+    check_close("the wheel's rim is where the geometry says", furthest, rim, 1e-3);
+    check_close("and its slots bottom out exactly where the pin reaches",
+                 nearest_in_body, want_bottom, 1e-3);
+
+    mesh3d_free(&mesh);
+    mechanism_free(&m);
+    wipe_dir(dir);
+}
+
 int main(void) {
     test_scene_round_trip_preserves_the_mechanism();
     test_a_damaged_file_costs_nothing();
@@ -2702,6 +3253,17 @@ int main(void) {
     test_fourier_handles_an_open_stroke();
     test_fourier_rejects_useless_input();
     test_arm_chain_simulates_and_traces_the_path();
+    test_wheel_size_snaps_to_whole_teeth();
+    test_meshed_wheels_sit_at_the_exact_centre_distance();
+    test_changing_the_module_keeps_every_ratio();
+    test_gear_outline_is_a_gear();
+    test_printed_gears_actually_mesh();
+    test_every_exported_part_is_a_printable_solid();
+    test_a_link_plate_has_a_hole_at_every_pin();
+    test_parts_that_share_a_pin_are_stacked_apart();
+    test_a_geneva_slot_reaches_the_pin();
+    test_print_options_are_read_and_clamped();
+    test_a_scene_from_before_gears_had_teeth_still_opens();
 
     if (failures == 0) {
         printf("\nAll tests passed.\n");

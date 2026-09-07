@@ -68,6 +68,9 @@ static const ButtonSpec BUTTON_SPECS[] = {
       "Wipe the traced paths and the plot. Works while running.", false },
     { UI_EXPORT,  "EXPORT",  "E",
       "Write the motion out as a Blender script, ready to run and play.", false },
+    { UI_PRINT,   "PRINT",   "+E",
+      "Write a folder of STL parts you can print and bolt together: gears with real "
+      "teeth, plates with pin holes, a baseplate and the pins to join them.", false },
     { UI_RUN,     "RUN",     "R",
       "Start or stop the simulation. Stopping puts every part back where it started.", false },
     { UI_HELP,    "HELP",    "H",
@@ -243,6 +246,10 @@ void ui_apply_state(Toolbar *t, UiState s) {
             b->active = false;
             break;
         case UI_EXPORT:
+            b->enabled = s.editing;
+            b->active = false;
+            break;
+        case UI_PRINT:
             b->enabled = s.editing;
             b->active = false;
             break;

@@ -60,3 +60,6 @@ dkms.conf
 
 # Generated Blender export (created by pressing E in the app)
 /linkage_export.py
+# Generated STL parts (created by pressing Shift+E in the app)
+/linkage_parts/
+/*_parts/

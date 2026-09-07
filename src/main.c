@@ -11,6 +11,8 @@
 #include "solver.h"
 #include "render.h"
 #include "export.h"
+#include "print3d.h"
+#include "gearing.h"
 #include "ui.h"
 #include "synth.h"
 #include "templates.h"
@@ -49,6 +51,8 @@
 #define GENEVA_MAX_SLOTS 12
 #define TOOLTIP_DELAY_MS 350       /* dwell before a tooltip appears */
 #define DEFAULT_WHEEL_RADIUS 80.0
+/* Involute points per flank when drawing a wheel on the canvas. */
+#define CANVAS_FLANK_SAMPLES 3
 #define WHEEL_RESIZE_STEP 1.15       /* per +/- press */
 #define CAM_LIFT_SCALE 1.12          /* per +/- press */
 #define CAM_TIMING_STEP (5.0 * M_PI / 180.0)
@@ -139,6 +143,7 @@ typedef enum {
     PROMPT_SAVE,
     PROMPT_OPEN,
     PROMPT_EXPORT,
+    PROMPT_PRINT,       /* a folder of STL parts, plus optional key=value settings */
     PROMPT_OVERWRITE,   /* "that file exists" */
     PROMPT_QUIT         /* "you have unsaved changes" */
 } PromptKind;
@@ -152,7 +157,8 @@ typedef struct {
 } Prompt;
 
 static bool prompt_takes_typing(PromptKind k) {
-    return k == PROMPT_SAVE || k == PROMPT_OPEN || k == PROMPT_EXPORT;
+    return k == PROMPT_SAVE || k == PROMPT_OPEN || k == PROMPT_EXPORT ||
+            k == PROMPT_PRINT;
 }
 
 typedef enum { APP_EDIT, APP_RUNNING } AppState;
@@ -572,6 +578,40 @@ static void app_export_to(App *a, const char *path) {
     }
 }
 
+/* The typed line is a folder name followed by any number of key=value
+ * settings -- "gearbox m=1.5 t=4 fit=m3" -- so print settings can be tuned
+ * without a panel of their own. */
+static void app_print3d_to(App *a, const char *typed) {
+    char line[APP_PATH_MAX];
+    snprintf(line, sizeof line, "%s", typed);
+
+    char *opts = line;
+    while (*opts && *opts != ' ' && *opts != '\t') opts++;
+    if (*opts) { *opts = '\0'; opts++; }
+
+    PrintParams params = print_default_params();
+    /* The mechanism was drawn at a particular module; print it at that unless
+     * asked otherwise, so the teeth on the bed are the teeth on the canvas. */
+    params.module = a->mech.gear_module;
+
+    char err[256] = { 0 };
+    if (!print_parse_options(&params, opts, err, sizeof err)) {
+        app_message(a, STATUS_ERROR, "%s", err);
+        return;
+    }
+
+    char dir[APP_PATH_MAX];
+    resolve_path(line, dir, sizeof dir);
+
+    char report[512] = { 0 };
+    if (print3d_export(&a->mech, params, dir, report, sizeof report)) {
+        app_message(a, STATUS_INFO, "%s", report);
+    } else {
+        app_message(a, STATUS_ERROR, "%s",
+                     report[0] ? report : "Nothing could be written -- is there anything to print?");
+    }
+}
+
 /* What a prompt does when Return is pressed. */
 static void prompt_commit(App *a) {
     PromptKind kind = a->prompt.kind;
@@ -610,6 +650,9 @@ static void prompt_commit(App *a) {
         }
         break;
     }
+    case PROMPT_PRINT:
+        app_print3d_to(a, typed);
+        break;
     case PROMPT_OVERWRITE:
         app_export_to(a, pending);
         break;
@@ -1342,6 +1385,7 @@ static const KeyNote EXTRA_KEYS[] = {
     { "[ ]",           "SHIFT A SELECTED CAM'S TIMING" },
     { ".",             "STEP ONE FRAME WHILE PAUSED" },
     { "< >",           "RUN SLOWER OR FASTER" },
+    { "SHIFT+E",       "PRINTABLE STL PARTS, NOT A BLENDER SCRIPT" },
     { "SHIFT+CMD+S",   "SAVE UNDER A NEW NAME" },
     { "ESC",           "CANCEL, OR CLEAR THE SELECTION" },
 };
@@ -1663,6 +1707,23 @@ static void app_export(App *a) {
                  "TYPE A FILE NAME, RETURN TO WRITE IT, ESC TO CANCEL", suggestion);
 }
 
+/* A folder, not a file: one STL per part, plus the manifest that says how they
+ * go together. */
+static void app_print3d(App *a) {
+    char suggestion[APP_PATH_MAX];
+    if (a->current_path[0]) {
+        snprintf(suggestion, sizeof suggestion, "%s", path_basename(a->current_path));
+        char *dot = strrchr(suggestion, '.');
+        if (dot) *dot = '\0';
+        size_t len = strlen(suggestion);
+        snprintf(suggestion + len, sizeof suggestion - len, "_parts");
+    } else {
+        snprintf(suggestion, sizeof suggestion, "linkage_parts");
+    }
+    prompt_open(a, PROMPT_PRINT, "PRINT STL PARTS INTO FOLDER",
+                 "FOLDER, THEN OPTIONS: M= PIN= T= CLR= GAP= WALL= BL= PA= FIT=PIN|M3", suggestion);
+}
+
 static void app_save(App *a) {
     /* Once it has a name, SAVE means save. Without one, ask for it. */
     if (a->current_path[0]) {
@@ -1806,6 +1867,7 @@ static void app_dispatch(App *a, UiAction action) {
         app_message(a, STATUS_INFO, "Traces cleared.");
         break;
     case UI_EXPORT:  app_export(a); break;
+    case UI_PRINT:   app_print3d(a); break;
     case UI_RUN:     app_toggle_run(a); break;
     case UI_PAUSE:   app_toggle_pause(a); break;
     case UI_HELP:    a->help_open = !a->help_open; break;
@@ -1911,7 +1973,7 @@ static UiAction action_for_key(SDL_Keycode k, bool cmd, bool shift) {
     case SDLK_b:         return UI_ARMS;
     case SDLK_v:         return UI_VARY;
     case SDLK_t:         return UI_TRACE;
-    case SDLK_e:         return UI_EXPORT;
+    case SDLK_e:         return shift ? UI_PRINT : UI_EXPORT;
     case SDLK_f:         return UI_FIT;
     case SDLK_c:         return UI_CLEAR;
     case SDLK_h:         return UI_HELP;
@@ -2008,7 +2070,13 @@ static void draw_mechanism(SDL_Renderer *ren, const Mechanism *m, DragMode drag_
 
     /* Wheels are drawn from the bodies themselves, not from the meshes, so a
      * wheel put down on its own shows up straight away and is there to be
-     * sized and moved before anything is connected to it. */
+     * sized and moved before anything is connected to it.
+     *
+     * Room for the biggest wheel's outline, rebuilt each frame like the
+     * traces are. Coarser than the exported profile: on screen a flank is a
+     * few pixels, and the whole point is the tooth COUNT being visible. */
+    static Vec2 tooth_scratch[GEARING_MAX_TEETH * (2 * CANVAS_FLANK_SAMPLES + 9) + 8];
+    static Vec2 tooth_screen[GEARING_MAX_TEETH * (2 * CANVAS_FLANK_SAMPLES + 9) + 8];
     for (int li = 0; li < m->link_count; li++) {
         int centre = -1;
         double r = mechanism_gear_wheel_radius(m, li, &centre);
@@ -2022,13 +2090,46 @@ static void draw_mechanism(SDL_Renderer *ren, const Mechanism *m, DragMode drag_
         else { cr = 120; cg = 130; cb = 145; }                   /* loose, not meshed yet */
 
         Vec2 c0 = world_to_screen(m->connectors[centre].pos, view_pan, view_zoom);
-        /* Dashed means "something else turns this one" -- the same fact the
-         * olive colour carries, said a second way. */
-        if (l->driven_externally) render_dashed_circle(ren, c0, r * view_zoom, cr, cg, cb, 255);
-        else render_circle_outline(ren, c0, r * view_zoom, cr, cg, cb, 255);
+        /* The teeth themselves, from the same generator the STL export
+         * extrudes -- so the mesh you judge by eye is the mesh that prints.
+         * They are drawn at the wheel's live rotation, so a running train
+         * shows its teeth going through each other's spaces. */
+        int teeth = mechanism_wheel_teeth(m, li);
+        int mark = mechanism_wheel_mark(m, li);
+        double spin = 0.0;
+        if (mark >= 0 && m->connectors[mark].alive) {
+            Vec2 d = vec2_sub(m->connectors[mark].pos, m->connectors[centre].pos);
+            if (vec2_len(d) > 1e-9) spin = atan2(d.y, d.x);
+        }
+        GearSpec spec = { m->gear_module, teeth, GEARING_PRESSURE_ANGLE, 0.0,
+                          CANVAS_FLANK_SAMPLES };
+        int cap = gearing_outline_capacity(&spec);
+        bool drew_teeth = false;
+        if (cap > 0 && cap <= (int)(sizeof tooth_scratch / sizeof tooth_scratch[0])) {
+            int n = gearing_tooth_outline(&spec, tooth_scratch, cap);
+            if (n > 2) {
+                for (int i = 0; i < n; i++) {
+                    Vec2 p = vec2_add(m->connectors[centre].pos, vec2_rotate(tooth_scratch[i], spin));
+                    tooth_screen[i] = world_to_screen(p, view_pan, view_zoom);
+                }
+                tooth_screen[n] = tooth_screen[0];
+                render_polyline(ren, tooth_screen, n + 1, cr, cg, cb, 255);
+                drew_teeth = true;
+            }
+        }
+
+        /* The pitch circle stays as a faint guide -- it is where two wheels
+         * touch, which the tooth outline itself does not show. Dashed means
+         * "something else turns this one", the same fact the olive colour
+         * carries, said a second way. */
+        if (l->driven_externally) render_dashed_circle(ren, c0, r * view_zoom, cr, cg, cb, drew_teeth ? 90 : 255);
+        else render_circle_outline(ren, c0, r * view_zoom, cr, cg, cb, drew_teeth ? 90 : 255);
+
+        /* The tooth count, not the radius: it is what decides whether two
+         * wheels can mesh and what ratio they give. */
         double dh = label_height(view_zoom);
         render_number(ren, (Vec2){ c0.x + 5.0, c0.y - r * view_zoom - dh - 4.0 },
-                      0.0, dh, r, cr, cg, cb, 255);
+                      0.0, dh, teeth > 0 ? (double)teeth : r, cr, cg, cb, 255);
     }
 
     /* A rack's pitch line, which belongs to the mesh rather than to a body. */
@@ -2383,6 +2484,7 @@ int main(void) {
     printf("  Press H in the window for every key and what it does.\n");
     printf("  Every command is also a button down the left edge, with its key on it.\n");
     printf("  Cmd/Ctrl+S saves the mechanism, Cmd/Ctrl+O opens one, E exports it to Blender.\n");
+    printf("  Shift+E writes a folder of STL parts to print and bolt together.\n");
     printf("  Anything the program has to say now appears on the canvas as well as here.\n");
 
     App app;

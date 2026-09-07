@@ -76,8 +76,10 @@ bool scene_save(const Mechanism *m, const SolverParams *params, const char *path
 
     fprintf(f, "LINKAGE %d\n", SCENE_FORMAT_VERSION);
     fprintf(f, "# A Linkage Design mechanism. C pins, L bodies, S sliders,\n");
-    fprintf(f, "# G gears, V Geneva wheels, M cams, P world settings.\n");
+    fprintf(f, "# G gears, V Geneva wheels, M cams, P world settings,\n");
+    fprintf(f, "# T the gear module every wheel is cut to.\n");
     fprintf(f, "P " REAL " " REAL "\n", params->gravity.x, params->gravity.y);
+    fprintf(f, "T " REAL "\n", m->gear_module);
 
     for (int i = 0; i < m->connector_count; i++) {
         const Connector *c = &m->connectors[i];
@@ -93,10 +95,10 @@ bool scene_save(const Mechanism *m, const SolverParams *params, const char *path
         for (int k = 0; k < l->connector_count; k++) {
             fprintf(f, " %d", idmap_of(&cmap, l->connector_ids[k]));
         }
-        fprintf(f, " %d %d %d " REAL " " REAL "\n",
+        fprintf(f, " %d %d %d " REAL " " REAL " %d\n",
                  l->rigid ? 1 : 0, l->is_driven ? 1 : 0,
                  idmap_of(&cmap, l->pivot_connector_id),
-                 l->motor_speed_deg_s, l->wheel_radius);
+                 l->motor_speed_deg_s, l->wheel_radius, l->wheel_teeth);
     }
 
     for (int i = 0; i < m->slider_count; i++) {
@@ -207,6 +209,11 @@ bool scene_load(Mechanism *m, SolverParams *params, const char *path,
             if (sscanf(line, " P %lf %lf", &gx, &gy) != 2) { problem = "world settings"; break; }
             loaded_params.gravity = (Vec2){ gx, gy };
 
+        } else if (kind == 'T') {
+            double module = 0.0;
+            if (sscanf(line, " T %lf", &module) != 1) { problem = "the gear module"; break; }
+            loaded.gear_module = module;
+
         } else if (kind == 'C') {
             double x = 0.0, y = 0.0;
             int anchor = 0, traced = 0;
@@ -233,17 +240,23 @@ bool scene_load(Mechanism *m, SolverParams *params, const char *path,
                 }
                 p += used;
             }
-            int rigid = 1, driven = 0, pivot = -1;
+            int rigid = 1, driven = 0, pivot = -1, teeth = 0;
             double speed = 0.0, wheel_radius = 0.0;
-            if (!bad && sscanf(p, " %d %d %d %lf %lf",
-                                &rigid, &driven, &pivot, &speed, &wheel_radius) != 5) {
-                bad = true;
+            if (!bad) {
+                /* Format 1 stopped at the wheel radius. Read the tooth count
+                 * when it is there and work it out from the radius when it is
+                 * not, so a file written before gears had teeth still opens. */
+                int fields = sscanf(p, " %d %d %d %lf %lf %d",
+                                     &rigid, &driven, &pivot, &speed, &wheel_radius, &teeth);
+                if (fields < 5) bad = true;
+                else if (fields == 5) teeth = 0;
             }
             int lid = bad ? -1 : mechanism_add_link(&loaded, ids, n);
             free(ids);
             if (bad || lid < 0) { problem = "a body"; break; }
 
             loaded.links[lid].wheel_radius = wheel_radius;
+            loaded.links[lid].wheel_teeth = teeth;
             if (!rigid) mechanism_set_rigid(&loaded, lid, false);
             /* set_driven_about rather than toggle_driven: a motor may sit on a
              * pivot that something else moves, which is what an arm chain is. */
@@ -320,6 +333,16 @@ bool scene_load(Mechanism *m, SolverParams *params, const char *path,
         mechanism_free(&loaded);
         fail(err, err_size, "%s is damaged: could not read %s on line %d.", path, problem, line_no);
         return false;
+    }
+
+    /* A format-1 file recorded a wheel's radius but not its tooth count, and a
+     * radius on its own is not a gear. Put each such wheel on the nearest whole
+     * tooth -- which also walks its rim mark out to the snapped radius, so what
+     * reopens is a mechanism that could be printed. */
+    for (int li = 0; li < loaded.link_count; li++) {
+        const Link *l = &loaded.links[li];
+        if (!l->alive || !(l->wheel_radius > 0.0) || l->wheel_teeth > 0) continue;
+        mechanism_set_wheel_radius(&loaded, li, l->wheel_radius);
     }
 
     /* Pitch radii, crank radii and the like follow from where the parts are. */

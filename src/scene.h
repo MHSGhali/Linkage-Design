@@ -24,7 +24,7 @@
  * rebuilt on load by the same calls that build a mechanism by hand.
  */
 
-#define SCENE_FORMAT_VERSION 1
+#define SCENE_FORMAT_VERSION 2
 #define SCENE_EXTENSION ".linkage"
 
 /* Writes `m` (and the parts of `params` that belong to the document, i.e.
