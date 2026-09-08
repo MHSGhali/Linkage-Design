@@ -653,8 +653,13 @@ static void prompt_commit(App *a) {
         ensure_extension(path, sizeof path, ".py");
         /* EXPORT used to write over whatever was there without a word. */
         if (scene_file_exists(path)) {
+            /* The name is being shown, not used, so a path too long for the
+             * title is cut to fit rather than making the question unaskable.
+             * The explicit precision is also what lets the compiler see the
+             * bound: GCC's -Wformat-truncation knows path_basename points
+             * into a 1024-byte buffer and rejects the unbounded form. */
             char title[160];
-            snprintf(title, sizeof title, "%s ALREADY EXISTS", path_basename(path));
+            snprintf(title, sizeof title, "%.120s ALREADY EXISTS", path_basename(path));
             prompt_open(a, PROMPT_OVERWRITE, title,
                          "PRESS Y TO WRITE OVER IT, ESC TO KEEP IT", NULL);
             snprintf(a->prompt.pending, sizeof a->prompt.pending, "%s", path);
