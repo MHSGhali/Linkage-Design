@@ -1,0 +1,5 @@
+# Every file in this repository is owned by @MHSGhali, so main's protection
+# rule ("require review from Code Owners") resolves to: only Mark can approve.
+# Adding a collaborator later gives them write access but still not the power
+# to approve a merge into main, unless they are also added here.
+* @MHSGhali
