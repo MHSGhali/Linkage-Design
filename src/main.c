@@ -3055,12 +3055,26 @@ static void capture_frame_the_motion(App *a, int frames) {
         for (int i = 0; i < a->mech.connector_count; i++) {
             if (!a->mech.connectors[i].alive) continue;
             Vec2 p = a->mech.connectors[i].pos;
-            /* A wheel reaches a radius beyond its centre; a pin reaches
-             * nothing, and its radius is zero. */
+            /* A pin reaches nothing beyond itself, but anything drawn as a
+             * body around a centre does: a gear wheel, a Geneva wheel, a cam
+             * at full lift. Miss one and it is drawn off the edge of the
+             * picture -- which is what happened to the Geneva. */
             double r = 0.0;
             for (int li = 0; li < a->mech.link_count; li++) {
                 const Link *l = &a->mech.links[li];
                 if (l->alive && l->wheel_radius > r && l->pivot_connector_id == i) r = l->wheel_radius;
+            }
+            for (int gi = 0; gi < a->mech.geneva_count; gi++) {
+                const Geneva *gv = &a->mech.genevas[gi];
+                if (!gv->alive || gv->wheel_center_id != i) continue;
+                double gr = mechanism_geneva_wheel_radius(gv);
+                if (gr > r) r = gr;
+            }
+            for (int ci = 0; ci < a->mech.cam_count; ci++) {
+                const Cam *c = &a->mech.cams[ci];
+                if (!c->alive || c->center_connector_id != i) continue;
+                double cr = c->base_radius + c->lift + c->roller_radius;
+                if (cr > r) r = cr;
             }
             if (p.x - r < x0) x0 = p.x - r;
             if (p.y - r < y0) y0 = p.y - r;
@@ -3097,15 +3111,109 @@ static void capture_list_templates(void) {
     for (int i = 0; i < templates_count(); i++) {
         fprintf(stderr, "  %s\n", templates_get(i)->name);
     }
+    fprintf(stderr, "Other subjects:\n"
+                     "  gear      a meshed gear pair, motor and all\n"
+                     "  geneva    a Geneva wheel indexing round\n"
+                     "  slider    a slider-crank\n"
+                     "  arms      a star drawn, and the chain of arms built to redraw it\n"
+                     "  linkage   an oval drawn, and the four-bar fitted to it\n"
+                     "  gallery   the template gallery panel\n"
+                     "  help      the key list panel\n"
+                     "  empty     the empty canvas\n");
 }
 
-static int run_capture(const char *template_name, int frames, const char *dir) {
-    int index = capture_template_index(template_name);
-    if (index < 0) {
-        fprintf(stderr, "--capture: no template called \"%s\".\n", template_name);
-        capture_list_templates();
-        return 1;
+/* A closed five-pointed star, in world units around `centre`. The arms tool
+ * is the thing worth showing off -- no linkage traces a star -- so the demo
+ * capture draws one the same way a hand would, as a stroke. */
+static void capture_star_stroke(App *a, Vec2 centre, double radius) {
+    const int points = 5;
+    const int per_edge = 24;
+    a->path_stroke_count = 0;
+    for (int i = 0; i <= points * 2; i++) {
+        double r0 = (i % 2 == 0) ? radius : radius * 0.42;
+        double r1 = ((i + 1) % 2 == 0) ? radius : radius * 0.42;
+        double a0 = -M_PI / 2.0 + (double)i * M_PI / points;
+        double a1 = -M_PI / 2.0 + (double)(i + 1) * M_PI / points;
+        for (int k = 0; k < per_edge; k++) {
+            double t = (double)k / per_edge;
+            Vec2 p0 = vec2_add(centre, vec2_scale(vec2_from_angle(a0), r0));
+            Vec2 p1 = vec2_add(centre, vec2_scale(vec2_from_angle(a1), r1));
+            stroke_push(&a->path_stroke, &a->path_stroke_count, &a->path_stroke_capacity,
+                         vec2_add(vec2_scale(p0, 1.0 - t), vec2_scale(p1, t)));
+        }
     }
+}
+
+/* An oval, which is the sort of curve a four-bar coupler point CAN trace --
+ * the point of the linkage tool being that it uses five parts where the arms
+ * tool would use dozens. */
+static void capture_oval_stroke(App *a, Vec2 centre, double radius) {
+    a->path_stroke_count = 0;
+    for (int i = 0; i < 120; i++) {
+        double t = (double)i * 2.0 * M_PI / 120.0;
+        Vec2 p = { centre.x + cos(t) * radius, centre.y + sin(t) * radius * 0.55 };
+        stroke_push(&a->path_stroke, &a->path_stroke_count, &a->path_stroke_capacity, p);
+    }
+}
+
+/* What a capture is a picture OF. Most subjects are template names; the rest
+ * are the things a template cannot show -- the two path tools, and the panels
+ * that only exist while a key is held down. Returns false if the name means
+ * nothing, and whether the subject moves (a still is one frame of a panel;
+ * everything else runs). */
+static bool capture_build_subject(App *a, const char *subject, bool *moves) {
+    *moves = true;
+
+    if (strcmp(subject, "help") == 0) {
+        a->help_open = true;
+        *moves = false;
+        return true;
+    }
+    if (strcmp(subject, "gallery") == 0) {
+        a->gallery_open = true;
+        *moves = false;
+        return true;
+    }
+    if (strcmp(subject, "empty") == 0) {
+        *moves = false;
+        return true;
+    }
+    /* Pressed with nothing selected, each of these draws a whole working
+     * assembly -- which is exactly the behaviour worth showing. */
+    if (strcmp(subject, "gear") == 0) {
+        /* Not app_add_gear: pressed with nothing selected that builds the
+         * default pair, which is a big reduction -- correct, but at the size
+         * a README shows it, a large empty wheel with a speck meshed to it.
+         * Two comparable wheels show the teeth actually rolling through each
+         * other, which is the point. */
+        Vec2 c = app_view_centre(a);
+        int big = mechanism_add_wheel(&a->mech, (Vec2){ c.x - 70.0, c.y }, 70.0);
+        int small = mechanism_add_wheel(&a->mech, (Vec2){ c.x + 75.0, c.y }, 45.0);
+        mechanism_mesh_wheels(&a->mech, big, small);
+        mechanism_toggle_driven(&a->mech, big, 60.0);
+        return true;
+    }
+    if (strcmp(subject, "geneva") == 0) { app_add_geneva(a); return true; }
+    if (strcmp(subject, "slider") == 0) { app_add_slider(a); return true; }
+
+    if (strcmp(subject, "arms") == 0) {
+        capture_star_stroke(a, app_view_centre(a), 190.0);
+        app_synthesize_arms(a);
+        return true;
+    }
+    if (strcmp(subject, "linkage") == 0) {
+        capture_oval_stroke(a, app_view_centre(a), 190.0);
+        app_synthesize_linkage(a);
+        return true;
+    }
+
+    int index = capture_template_index(subject);
+    if (index < 0) return false;
+    app_insert_template(a, index);
+    return true;
+}
+
+static int run_capture(const char *subject, int frames, const char *dir) {
     if (frames < 1) frames = 1;
 
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
@@ -3131,10 +3239,27 @@ static int run_capture(const char *template_name, int frames, const char *dir) {
 
     App app;
     app_init(&app, win, ren, CAPTURE_W, CAPTURE_H);
-    app_insert_template(&app, index);
+
+    bool moves = true;
+    if (!capture_build_subject(&app, subject, &moves)) {
+        fprintf(stderr, "--capture: no template or subject called \"%s\".\n", subject);
+        capture_list_templates();
+        app_shutdown(&app);
+        SDL_DestroyRenderer(ren);
+        SDL_DestroyWindow(win);
+        SDL_Quit();
+        return 1;
+    }
+
     app_fit_view(&app, true);
-    app_start_run(&app);
-    capture_frame_the_motion(&app, frames + CAPTURE_SETTLE_FRAMES);
+    if (moves) {
+        app_start_run(&app);
+        capture_frame_the_motion(&app, frames + CAPTURE_SETTLE_FRAMES);
+    } else {
+        /* A panel is a still: one frame, and nothing said in the corner of it. */
+        frames = 1;
+        status_init(&app.status);
+    }
 
     SDL_Surface *shot = SDL_CreateRGBSurfaceWithFormat(0, CAPTURE_W, CAPTURE_H, 32, SDL_PIXELFORMAT_ARGB8888);
     int written = 0;
@@ -3162,7 +3287,7 @@ static int run_capture(const char *template_name, int frames, const char *dir) {
         SDL_FreeSurface(shot);
     }
 
-    printf("captured %d frame(s) of \"%s\" into %s\n", written, templates_get(index)->name, dir);
+    printf("captured %d frame(s) of \"%s\" into %s\n", written, subject, dir);
 
     app_shutdown(&app);
     SDL_DestroyRenderer(ren);
@@ -3174,8 +3299,8 @@ static int run_capture(const char *template_name, int frames, const char *dir) {
 static void print_usage(const char *argv0) {
     fprintf(stderr,
         "usage: %s                                    run the editor\n"
-        "       %s --capture <template> <n> <dir>     render n frames of a template to <dir>\n"
-        "       %s --list-templates                   name every template\n",
+        "       %s --capture <subject> <n> <dir>      render n frames of a subject to <dir>\n"
+        "       %s --list-templates                   name every subject\n",
         argv0, argv0, argv0);
 }
 
